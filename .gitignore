@@ -61,3 +61,6 @@ benchmarks/runs/
 internal docs/
 docs/plans/
 __pycache__/
+
+# Reliability harness run outputs (bench/instruments/reliability)
+bench/instruments/reliability/runs/
