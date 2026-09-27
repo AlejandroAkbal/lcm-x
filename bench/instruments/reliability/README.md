@@ -17,8 +17,8 @@ uv run --no-project python bench/instruments/reliability/run_matrix.py \
 ```
 - Hosts file: `--hosts-file`, else `$LCM_RELIABILITY_HOSTS`, else the host-prep lane's file; see
   `hosts.example.json`. A host whose path, lexical or resolved, is under the live `~/.hermes` is refused.
-- Host identity is verified before any cell runs: `git rev-parse HEAD` == sha with no modified tracked file for
-  a git tree; for an exported tree, `tree-manifest.json` next to it (written at host prep by
+- Host identity is verified before any cell runs: `git rev-parse HEAD` == sha with no modified, untracked or
+  ignored-`*.py` file (every git command must succeed) for a git tree; for an exported tree, `tree-manifest.json` next to it (written at host prep by
   `python hosts.py --write-manifest <src> --sha <sha> --git-repo <repo>`, which proves the tree equals
   `git archive <sha>`) must match the sha and the tree's current hash. An unverified host's cells are ERROR.
 - Each ref is exported once with `git archive` into `<out>/plugins/<sha12>/`; the plugin dir name,
@@ -41,7 +41,9 @@ Tools execute for real (`lcm_*`, `todo`, `read_file` on files inside the cell di
 Faults (`os._exit` crash after a compaction commit, after a rotation, between on_session_end and
 on_session_start, mid tool call; a clean exit; an ACP cancel + re-send; an injected publication failure)
 end a phase; the runner starts the next phase (a fresh host process on the same HERMES_HOME).
-A gateway cell reloads the state.db transcript every turn and restarts at the tip after a rotation.
+A gateway cell reloads the state.db transcript every turn and restarts at the tip after a rotation, and builds
+its agent with a stable `gateway_session_key` (`rel:<cell>:chat1`), which the host forwards to LCM as
+`conversation_id` (cited per host; recorded in phase-*.json).
 Every emulated host shape is located at run time in the host tree and recorded as `file:line`
 (`citations` in phase-A.json); a shape that cannot be cited makes the cell UNSUPPORTED, as does a fault
 whose trigger never fires at that host sha.
@@ -64,7 +66,9 @@ the host reported `interrupted`. Any other assistant row is surplus.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
   (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
   re-invoked once after a cleanup-only `sanitized`) does not end in error, conflict or exception; an
-  exception from the selected entry point fails with no fallback. Ending `sanitized`/noop is INCONCLUSIVE.
+  exception from the selected entry point fails with no fallback. It publishes only on a host result
+  `compressed` from this invocation AND an engine compress() pass inside it that committed; `sanitized`,
+  `skipped`, `lock_skipped` or no fresh engine pass is INCONCLUSIVE.
 - **B5** depth-0 message-sourced summary nodes grow after every LCM pass; every host-native pass has its own
   host `commit_status: committed` telemetry line in the same turn; published passes (LCM or host-native,
   the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes.
