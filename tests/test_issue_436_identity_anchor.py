@@ -5,6 +5,8 @@ a host list in, stored rows / relations / summary coverage out."""
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 import hermes_lcm.engine as lcm_engine
@@ -61,6 +63,15 @@ def _relations(engine: LCMEngine) -> list[tuple]:
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_relations'").fetchone():
         return []
     return conn.execute("SELECT store_id, kind, related_store_id, ordinal FROM message_relations ORDER BY relation_id").fetchall()
+
+
+def _state_db(tmp_path, sessions: list[tuple[str, str | None, str | None]]) -> None:
+    """The host's state.db next to lcm.db: (id, parent_session_id, end_reason)."""
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT)")
+    conn.executemany("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", sessions)
+    conn.commit()
+    conn.close()
 
 
 def _assert_claims_are_in_the_input(engine: LCMEngine, captured: list[str]) -> list[int]:
@@ -122,6 +133,43 @@ def test_b_summary_never_claims_a_row_whose_text_is_not_in_its_input(tmp_path, s
         assert engine._last_compression_status == "compacted"  # R pending forever would stall publication
         u_id = next(int(row["store_id"]) for row in _rows(engine) if row["content"] == u["content"])
         assert u_id in _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()
+
+
+def test_c_same_conversation_sibling_session_gets_no_carry(tmp_path, summaries):
+    """A session that merely shares the conversation id is not a compression child: its replay of
+    the other session's rows gets no carry, and its publication claims only its own rows."""
+    _state_db(tmp_path, [("A", None, "user_exit"), ("B", None, None)])
+    history = [SYSTEM, *_turns(1, 4, 0.0)]
+    engine = _engine(tmp_path, "A")
+    try:
+        engine.ingest(history)
+        a_ids = {int(row["store_id"]) for row in _rows(engine, "A")}
+        engine.on_session_start("B", platform="cli", context_length=200_000, conversation_id="conv")
+        live = [*history, *_turns(10, 4, 600.0)]
+        engine.ingest(live)
+        assert engine._load_compression_carry_ranges() == []
+        engine.compress(live)
+        claimed = _assert_claims_are_in_the_input(engine, summaries)
+        assert not a_ids & set(claimed)
+        assert len(_rows(engine, "B")) == len(live) - 1  # B keeps its own copy of every host row
+    finally:
+        engine.shutdown()
+
+
+def test_c_positive_control_a_verified_compression_child_inherits_its_parents_rows(tmp_path):
+    _state_db(tmp_path, [("P", None, "compression"), ("C", "P", None)])
+    history = [SYSTEM, *_turns(1, 4, 0.0)]
+    engine = _engine(tmp_path, "P")
+    try:
+        engine.ingest(history)
+        engine.on_session_start("C", platform="cli", context_length=200_000, conversation_id="conv")
+        engine.ingest([*history, *_turns(10, 1, 600.0)])
+        assert [str(row["content"]) for row in _rows(engine, "C")] == [
+            m["content"] for m in _turns(10, 1, 600.0)
+        ]
+        assert {source for source, _a, _b in engine._load_compression_carry_ranges()} == {"P"}
     finally:
         engine.shutdown()
 

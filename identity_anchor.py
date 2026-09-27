@@ -16,11 +16,13 @@ R2 a merge survivor is recognised only by an exact, unique, ordered decompositio
 occurrences, or by a relation LCM itself recorded when it saw that composite; R3 a survivor holding
 a stored head and a new remainder stores the remainder once (its own stamp unknown) with the relation.
 R4 (coverage bound to the summarizer input) lives in compaction's input loop.
+R7 carry comes only from the verified compression-ancestor chain, never from a sibling session.
 
 ``LCM_IDENTITY_ANCHOR`` (default on): ``0``/``false``/``no``/``off`` restores the pre-#436 ingest exactly.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -32,6 +34,7 @@ from .store import _normalize_observed_at
 
 logger = logging.getLogger(__name__)
 
+_CARRY_PREFIX = "identity_anchor_carry"
 _RECENT_CAP = 16  # rows this process stored lately: the R5 current-turn window
 _POOL_WINDOW = 256  # store ids either side of a stamp donor searched for a composite's constituents
 _MAX_DECOMPOSITIONS = 3
@@ -73,7 +76,7 @@ def _decompositions(content: str, texts: set, *, partial: bool) -> list:
 class IdentityAnchorMixin:
     """Mixed into LCMEngine; reads ``self._store``, the reconcile identity helpers and ``_state_db_path``."""
 
-    # -- lineage --------------------------------------------------------------
+    # -- lineage (R7) --------------------------------------------------------
 
     def _identity_anchor_chain(self) -> list[str]:
         """The bound session's verified compression ancestors, nearest first: host state.db
@@ -108,6 +111,64 @@ class IdentityAnchorMixin:
         self._identity_anchor_chain_cache = (session_id, chain)
         return chain
 
+    def _identity_anchor_carry_key(self) -> str:
+        return f"{_CARRY_PREFIX}:{self._session_id}"
+
+    def _identity_anchor_carry_ranges(self) -> list:
+        """Durable anchor carry, revalidated on every load: a source must still be a verified ancestor,
+        and only rows above the frontier (not yet covered) stay publishable."""
+        if not identity_anchor_enabled() or not self._session_id:
+            return []
+        try:
+            payload = self._store.read_metadata_json(self._identity_anchor_carry_key())
+        except Exception:
+            return []
+        if not isinstance(payload, list) or not payload:
+            return []
+        chain, frontier = set(self._identity_anchor_chain()), int(self._last_compacted_store_id or 0)
+        return [
+            (str(source), max(int(start), frontier), int(end))
+            for source, start, end in (item for item in payload if isinstance(item, list) and len(item) == 3)
+            if str(source) in chain and int(end) > frontier
+        ]
+
+    def _register_identity_anchor_carry(self, rows) -> None:
+        """R7: publish eligibility for parent rows this session replays: only verified ancestors' rows
+        above the frontier, in ranges that never span a row that was not recognised. Durable first."""
+        chain, frontier = set(self._identity_anchor_chain()), int(self._last_compacted_store_id or 0)
+        wanted: dict[str, set[int]] = defaultdict(set)
+        for row in rows:
+            owner, store_id = str(row.get("session_id") or ""), int(row["store_id"])
+            if owner in chain and store_id > frontier:
+                wanted[owner].add(store_id)
+        if not wanted:
+            return
+        current = self._load_compression_carry_ranges()
+        added = []
+        for owner, ids in wanted.items():
+            ids = {i for i in ids if not any(s == owner and a < i <= b for s, a, b in current)}
+            if not ids:
+                continue
+            run = None
+            for row in self._store.get_range(owner, start_id=min(ids), end_id=max(ids), limit=100000):
+                store_id = int(row["store_id"])
+                if store_id in ids:
+                    run = (store_id - 1 if run is None else run[0], store_id)
+                elif run is not None:
+                    added.append((owner, *run))
+                    run = None
+            if run is not None:
+                added.append((owner, *run))
+        if added:
+            try:
+                stored = self._store.read_metadata_json(self._identity_anchor_carry_key())
+            except Exception:
+                stored = None
+            previous = [tuple(item) for item in stored if isinstance(item, list)] if isinstance(stored, list) else []
+            merged = self._coalesce_compression_carry_ranges(previous + added)
+            self._store.write_metadata_json([self._identity_anchor_carry_key()], json.dumps([list(i) for i in merged]))
+            logger.info("LCM identity-anchor carry from verified ancestors: session=%s ranges=%s", self._session_id, added)
+
     # -- R1-R5 pre-match -----------------------------------------------------
 
     def _identity_is_lcm_scaffold(self, message, *, verified: bool = False) -> bool:
@@ -130,7 +191,7 @@ class IdentityAnchorMixin:
         remainders to store, the relations to record and the R5 backfills. ``audit_from``: the host
         changed its list before the cursor from there (a positional cursor no longer proves those rows
         stored): a stamped row there that no stored occurrence explains moves ``plan["cursor"]`` back."""
-        plan: Dict[str, Any] = {"replayed": set(), "remainders": {}, "relations": [], "backfill": [],
+        plan: Dict[str, Any] = {"replayed": set(), "remainders": {}, "relations": [], "carry": [], "backfill": [],
                                 "cursor": cursor}
         self._identity_anchor_text_memo: dict[int, str] = {}
         n = len(messages)
@@ -198,6 +259,13 @@ class IdentityAnchorMixin:
             if idx in plan["replayed"]:
                 del plan["remainders"][idx]
         plan["replayed"] = {idx for idx in plan["replayed"] if idx >= plan["cursor"]}
+        plan["carry"] = [row for idx in plan["replayed"] | set(plan["remainders"]) for row in matched.get(idx, ())]
+        if plan["replayed"] and any(str(row.get("session_id")) in chain for row in plan["carry"]):
+            # A rotation child resuming onto its ancestors' rows: LCM's own DAG-verified carrier heading
+            # the list is compress() output, not a host message (R8).
+            for idx in range(plan["cursor"], min(plan["replayed"])):
+                if self._identity_is_lcm_scaffold(identity_messages[idx], verified=True):
+                    plan["replayed"].add(idx)
         return plan
 
     def _identity_anchor_audit(self, messages, identity_messages, cursor, start, stamps, identity_at, consumed, plan) -> None:
@@ -498,8 +566,8 @@ class IdentityAnchorMixin:
     # -- writes ----------------------------------------------------------------
 
     def _identity_anchor_commit(self, plan, remainder_ids: Optional[dict] = None) -> None:
-        """Record what the pre-match proved: relation groups (witnesses, alternate stamps, remainders)
-        and the R5 backfills."""
+        """Record what the pre-match proved: relation groups (witnesses, alternate stamps, remainders),
+        the R5 backfills and the R7 carry. Relations are durable before the carry that relies on them."""
         if remainder_ids is None:
             groups = [[(int(group[0]["store_id"]), "alt_stamp", None, None, stamp)] if kind == "alt_stamp"
                       else _composite_relation(group, stamp) for kind, stamp, group, _extra in plan["relations"]]
@@ -510,6 +578,8 @@ class IdentityAnchorMixin:
             self._store.add_message_relations(groups)
         for store_id, stamp in plan["backfill"] if remainder_ids is None else ():
             self._store.backfill_observed_at(store_id, stamp)
+        if remainder_ids is None and plan["carry"]:
+            self._register_identity_anchor_carry(plan["carry"])
 
     def _identity_anchor_remember(self, stored) -> None:
         """R5 current-turn window: (session, identity, store_id, observed_at) of user rows just stored."""
