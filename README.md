@@ -130,9 +130,10 @@ Stable release identity and the continuing `main` development line are
 separate proof planes; do not describe an arbitrary `main` checkout as the
 installed stable product.
 
-`main` and the `v0.24.2` tag identify themselves as
-`hermes-lcm-x v0.24.2 (15 tools)` — the post-v0.24.1 fix train (compaction retry resume, replay binding of superseded outputs, forced-overflow recovery, the Anthropic tool-schema fix #550), released as `v0.24.2`.
-The next identity bump is the forward bump for the next release, never a restamp
+The `main` line now identifies itself as
+`hermes-lcm-x v0.24.3 (15 tools)` — a leaf chunk never splits a parallel tool-call group (#559) — on top of the
+`v0.24.2` release tag, which identifies itself as `hermes-lcm-x v0.24.2 (15 tools)`.
+This is the forward bump for the next patch release, never a restamp
 of any past commit's own recorded identity (#385 fixed the earlier drift).
 
 Eva has accepted exact stable v0.23.1 with hosted `voyage-4-large`,
@@ -253,7 +254,7 @@ On the `main` line, typical output is:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm-x v0.24.2 (15 tools)
+  ✓ hermes-lcm-x v0.24.3 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm-x
