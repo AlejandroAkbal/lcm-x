@@ -55,7 +55,8 @@ The expected assistant rows come from the provider log, not the host result: exa
 completed non-cancel attempt (a reply the host dropped is a deficit), plus the host's own cited failed-turn copy
 (`agent/turn_failure_copy.py` `FAILED_TURN_NOTICE`/`PARTIAL_FAILED_TURN_NOTICE`, exact text) only on an attempt
 the host reported `interrupted`. Any other assistant row is surplus.
-- **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as expected,
+- **B1** every `[Tnn]` user tag (`[A-Z]\d{2,3}`: T100-T103 on 100-turn cells) and `reply to Tnn` sits in
+  exactly as many stored rows as expected,
   and every stored `continue` row is followed by the reply of its own turn (position-bound).
 - **B2** multiset-v1 (port of the gauntlet's `lossless_bar_multiset.py`), per session lineage: per (role,
   sha256(content with only leading/trailing whitespace stripped, the host's ACP prompt strip
@@ -73,14 +74,16 @@ the host reported `interrupted`. Any other assistant row is surplus.
   `skipped`, `lock_skipped` or no fresh engine pass is INCONCLUSIVE.
 - **B5** depth-0 message-sourced summary nodes grow after every LCM pass; every host-native pass has its own
   host `commit_status: committed` telemetry line in the same turn; published passes (LCM or host-native,
-  the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes.
+  the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes;
+  every message-sourced node covers >= 1 stored message (`empty_source_nodes`), only of its own lineage.
 - **B6** (tool cells) no message-sourced summary covers part of a tool group (#559 invariant); zero host
   orphan-tool-result drops; every planned call (name, id, args) ran for real at the cited host dispatch hook
   (`model_tools.handle_function_call` with its call id, or the context engine's `handle_tool_call` via
   `agent/tool_executor.py`, bound by name + args) with a successful, complete result (`read_file`: the whole
   file; `expect.min_chars` where a cell asks for a large result), and no unplanned dispatch. Tool rows are in B2:
   `(call id, name, args)` per tool-call entry and `(call id, sha256 of the result the next provider request
-  carried)` per result row, stored vs expected as a multiset. A planned call the host never dispatched is
+  carried)` per result row, stored vs expected as a multiset; a `tool_calls` value that is not a JSON list of objects
+  is a `malformed_tool_calls` surplus key. A planned call the host never dispatched is
   UNSUPPORTED.
 - **B7** (native cells) no `native recovery did not produce a usable summary`, no host
   `summary_generation_aborted`, at most one native attempt per turn.
@@ -153,8 +156,9 @@ Triggers: daily schedule and `workflow_dispatch` (effective once on main), and `
 `hosts.ci.json` (pinned shas): eva-0.21.5 and customer-0.21.2 on Python 3.11, upstream-main on 3.14. `ci.py prep`
 fetches the sha and installs it editable with `[acp,edge-tts,bedrock,vertex,anthropic]` (the harness verifies git HEAD
 and cites source); R1 all cells and R2 acp-process all cells run with `--plugin-ref HEAD`; MATRIX.md is the job
-summary and results are uploaded. `ci.py gate` fails on any ERROR, or on a FAIL in the G-REL-1 cell set unless the
-cell targets an open issue. Linux has no `sandbox-exec`: there containment is the proxy sink plus the socket guard.
+summary and results are uploaded. `ci.py gate` fails on any ERROR, on a FAIL in the G-REL-1 cell set unless the
+cell targets an open issue, and on an empty set or any missing, duplicate or unexpected row per (host, transport,
+plugin sha) against that transport's `--cells all` list. Linux has no `sandbox-exec`: there containment is the proxy sink plus the socket guard.
 
 ### Claim boundary
 R2 proves the plugin's behaviour through a real `hermes acp` process on the pinned host shas, with every model route
