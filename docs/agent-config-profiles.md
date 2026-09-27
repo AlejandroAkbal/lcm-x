@@ -23,7 +23,8 @@ each feature does and why, see [Feature overview](features-overview.md).
      (`LCM_EXPANSION_REASONING_EFFORT`); other keys under `lcm:` are ignored
      and reported by `/lcm doctor`;
    - when neither `LCM_CONTEXT_THRESHOLD` nor `lcm.context_threshold` is set,
-     LCM inherits the Hermes global `compression.threshold`.
+     LCM inherits the Hermes global `compression.threshold`, unless
+     `compression.enabled` is false; then LCM uses its own default.
 3. **Summarization inherits Hermes auxiliary routing.** Rollup builds and
    compaction summaries go through the auxiliary model unless you override
    `LCM_SUMMARY_MODEL` — so a fully-local Hermes (local auxiliary model) makes
