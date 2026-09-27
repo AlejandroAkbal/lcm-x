@@ -28,8 +28,9 @@ import logging
 import os
 import sqlite3
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
+from .fresh_tail import tool_group_safe_end
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .store import _normalize_observed_at
 
@@ -317,19 +318,30 @@ class IdentityAnchorMixin:
         """R2/R3/R5 for one unmatched user row: a recorded witness, an exact unique decomposition,
         the H1 unstable current-turn stamp, else a held head plus a new remainder. Else: new."""
         content = identity[1]
-        donors = [row for row, _forms in by_stamp.get(stamp, ())
-                  if row.get("role") == "user" and int(row["store_id"]) not in consumed]
+        stamped = [row for row, _forms in by_stamp.get(stamp, ()) if row.get("role") == "user"]
+        donors = [row for row in stamped if int(row["store_id"]) not in consumed]
+        # R2 witness: a composite LCM itself saw at this stamp, or its rewritten survivor (U alone).
+        for group in self._identity_anchor_witnesses(stamped, stamp):
+            texts = [self._identity_text(row) for row in group]
+            if content == "\n\n".join(texts):
+                view = group
+            else:
+                view = [row for row, text in zip(group, texts) if text == content and row.get("observed_at") != stamp]
+                if len(view) != 1 or texts.count(content) != 1:
+                    continue
+            if all(int(row["store_id"]) not in consumed for row in view):
+                return self._identity_anchor_take(idx, view, consumed, matched, plan)
+            # #563: the witnessed composite (or its survivor) is a VIEW of stored occurrences even where
+            # the host view also carries them on their own (H2 re-flushes the survivor as a new row):
+            # a replay, never a new occurrence; each witnessed form explains one view occurrence.
+            form = (tuple(int(row["store_id"]) for row in group), tuple(int(row["store_id"]) for row in view))
+            if form not in plan.setdefault("witnessed", set()):
+                plan["witnessed"].add(form)
+                matched[idx] = list(view)
+                plan["replayed"].add(idx)
+                return None
         if not donors:
             return self._identity_anchor_constituent_copy(idx, identity, stamp, consumed, matched, plan)
-        # R2 witness: a composite LCM itself saw at this stamp, or its rewritten survivor (U alone).
-        for group in self._identity_anchor_witnesses(donors, stamp):
-            texts = [self._identity_text(row) for row in group]
-            free = all(int(row["store_id"]) not in consumed for row in group)
-            if free and content == "\n\n".join(texts):
-                return self._identity_anchor_take(idx, group, consumed, matched, plan)
-            later = [row for row, text in zip(group, texts) if text == content and row.get("observed_at") != stamp]
-            if len(later) == 1 and int(later[0]["store_id"]) not in consumed and texts.count(content) == 1:
-                return self._identity_anchor_take(idx, later, consumed, matched, plan)
         if "\n\n" not in content:
             return
         pool = self._identity_anchor_pool(donors, consumed)
@@ -499,7 +511,7 @@ class IdentityAnchorMixin:
 
     # -- R4: coverage bound to the summarizer input ----------------------------
 
-    def _identity_anchor_summary_input(self, chunk, full_map, view=()) -> Optional[list]:
+    def _identity_anchor_summary_input(self, chunk, full_map, view=(), raw_chunk=()) -> Optional[list]:
         """The summarizer input for ``chunk`` built TOGETHER with what each input row may claim:
         ``[(input_row, [store_id, ...]), ...]``, or None (today's input and mapping).
         - A live composite LCM recorded (R2 witness) claims its constituents: their text is in it.
@@ -515,8 +527,7 @@ class IdentityAnchorMixin:
         carry = self._load_compression_carry_ranges()
 
         def owned(row) -> bool:
-            store_id, owner = int(row["store_id"]), str(row.get("session_id") or "")
-            return owner == self._session_id or any(owner == s and a < store_id <= b for s, a, b in carry)
+            return self._identity_anchor_owned(row, carry)
 
         claimed: set[int] = set()
         claims: dict[int, list] = {}
@@ -524,7 +535,16 @@ class IdentityAnchorMixin:
         scope = [str(self._session_id), *self._identity_anchor_chain()]
         for message in chunk:
             stamp = _normalize_observed_at(message.get("timestamp"))
-            if message.get("role") != "user" or id(message) in full_map or stamp is None:
+            if id(message) in full_map or stamp is None:
+                continue
+            # #563: a live row the ordered mapper left unmapped (the host put it after a row stored
+            # later) claims its R1-key occurrence; its own bytes are this input row.
+            store_id = self._identity_anchor_key_occurrence(message, mapped | claimed, carry)
+            if store_id is not None:
+                claimed.add(store_id)
+                claims[id(message)] = [store_id]
+                continue
+            if message.get("role") != "user":
                 continue
             donors = [row for row in self._store.find_rows_by_observed_at(str(self._conversation_id or ""), scope, [stamp])
                       if row.get("role") == "user"]
@@ -544,6 +564,14 @@ class IdentityAnchorMixin:
                        if owned(row) and int(row["store_id"]) > frontier and int(row["store_id"]) not in mapped | claimed]
                 claimed.update(ids)
                 claims[id(message)] = ids
+        # #563: a claim never jumps a row a live row after this chunk maps (a later pass publishes that
+        # row; the claim would leave a hole below it). The claim stays pending: gap-fill rehydrates it.
+        inside = {id(message) for message in [*chunk, *raw_chunk]}
+        bound = min((full_map[id(message)] for message in view if id(message) in full_map
+                     and id(message) not in inside and full_map[id(message)] > frontier), default=None)
+        if bound is not None and any(store_id > bound for store_id in claimed):
+            claims = {key: [store_id for store_id in ids if store_id < bound] for key, ids in claims.items()}
+            claimed = {store_id for ids in claims.values() for store_id in ids}
         last = max([full_map[id(m)] for m in chunk if id(m) in full_map] + list(claimed), default=0)
         gaps = []
         if last > frontier:
@@ -576,6 +604,76 @@ class IdentityAnchorMixin:
                 out.append(({"role": "user", "content": row.get("content") or ""}, [int(row["store_id"])]))
             out.append((message, claims.get(id(message), [])))
         return out
+
+    def _identity_anchor_owned(self, row, carry) -> bool:
+        store_id, owner = int(row["store_id"]), str(row.get("session_id") or "")
+        return owner == self._session_id or any(owner == s and a < store_id <= b for s, a, b in carry)
+
+    def _identity_anchor_key_occurrence(self, message, taken, carry) -> Optional[int]:
+        """#563: the owned occurrence above the frontier, in store order, that carries ``message``'s R1
+        key (host stamp + full payload identity) and that is not ``taken`` (mapped or claimed)."""
+        stamp = _normalize_observed_at(message.get("timestamp"))
+        identity = self._message_replay_identity(message, strip_carrier=False) if stamp is not None else None
+        if identity is None or _lossy(identity):
+            return None
+        frontier = int(self._last_compacted_store_id or 0)
+        for row in self._store.find_rows_by_observed_at(
+            str(self._conversation_id or ""), [str(self._session_id), *self._identity_anchor_chain()], [stamp]
+        ):
+            store_id = int(row["store_id"])
+            if (store_id > frontier and store_id not in taken and self._identity_anchor_owned(row, carry)
+                    and identity in self._stored_row_forms(row)):
+                return store_id
+        return None
+
+    def _identity_anchor_covered_view(self, message, full_map) -> bool:
+        """#563: a live user row that no store row maps and whose text is exactly a recorded composite
+        (R2 witness) or its survivor, every constituent already covered (at or below the frontier)."""
+        stamp = _normalize_observed_at(message.get("timestamp"))
+        if message.get("role") != "user" or id(message) in full_map or stamp is None:
+            return False
+        frontier = int(self._last_compacted_store_id or 0)
+        donors = [row for row in self._store.find_rows_by_observed_at(
+            str(self._conversation_id or ""), [str(self._session_id), *self._identity_anchor_chain()], [stamp]
+        ) if row.get("role") == "user"]
+        content = self._message_replay_identity(message, strip_carrier=False)[1]
+        for group in self._identity_anchor_witnesses(donors, stamp) if donors else ():
+            texts = [self._identity_text(row) for row in group]
+            view = group if content == "\n\n".join(texts) else [row for row, text in zip(group, texts) if text == content]
+            if view and all(int(row["store_id"]) <= frontier for row in view):
+                return True
+        return False
+
+    def _identity_anchor_extend_chunk(self, chunk, candidates) -> list:
+        """#563: two leaf-chunk ends that can never publish, on H2's merge-turn views and re-flushes.
+        - Only live views of covered history (a witnessed composite or its survivor, constituents at
+          or below the frontier): they claim nothing, and oldest-first selection picks them again on
+          every pass. The chunk takes the views after them and the oldest raw row (or its tool group);
+          the views' text stays in the input and claims nothing (their coverage exists).
+        - A following live row whose stored occurrence precedes one the chunk covers (the host put a
+          row it re-flushed later before it): coverage would skip that occurrence. The chunk takes it."""
+        if not chunk or len(chunk) >= len(candidates) or not identity_anchor_enabled():
+            return chunk
+        full_map, self._identity_anchor_text_memo = self._current_compress_store_ids_by_message_id or {}, {}
+        end = len(chunk)
+        if all(self._identity_anchor_covered_view(message, full_map) for message in chunk):
+            while end < len(candidates) and self._identity_anchor_covered_view(candidates[end], full_map):
+                end += 1
+            if end >= len(candidates):
+                return chunk
+            end += len(self._select_oldest_leaf_chunk(list(candidates[end:]), 1))
+        taken, carry = set(full_map.values()), self._load_compression_carry_ranges()
+        top = max((full_map[id(message)] for message in candidates[:end] if id(message) in full_map), default=0)
+        while end < len(candidates):
+            store_id = full_map.get(id(candidates[end]))
+            if store_id is None:
+                store_id = self._identity_anchor_key_occurrence(candidates[end], taken, carry)
+                taken.add(store_id or 0)
+            if store_id is None or store_id >= top:
+                break
+            end += 1
+        end = max(len(chunk), tool_group_safe_end(candidates, end)) if end > len(chunk) else end
+        return list(candidates[:end])
 
     # -- writes ----------------------------------------------------------------
 

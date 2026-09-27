@@ -376,3 +376,56 @@ def test_r6_an_unstamped_same_object_rewrite_keeps_both_versions(tmp_path):
         assert (ids["edited"], "supersedes", ids["draft"], None) in _relations(engine)
     finally:
         engine.shutdown()
+
+
+# -- G-REL-1 residuals ---------------------------------------------------------------------------------
+
+def _h2_merge_turn_history(engine) -> tuple[list[dict], dict]:
+    """H2 (0.21.5) after a crash turn: R has no reply, the merge turn's live list holds C = R + "\\n\\n"
+    + U under R's stamp (the witness). The durable list then re-flushes the survivor (U under R's
+    stamp) and C as rows of their own, and the rotation turn's prompt X twice (the child's copy, then
+    the turn flush) -- after LCM already stored X's reply."""
+    head = _turns(1, 3, 0.0)
+    r, u = _u("[R] crash-turn prompt" + PAD, 500.0), _u("[U] merge-turn prompt" + PAD, 510.0)
+    c, reply = _u(r["content"] + "\n\n" + u["content"], 500.0), _a("reply to U", 511.0)
+    x, reply_x = _u("[X] rotation-turn prompt" + PAD, 600.0), _a("reply to X", 601.0)
+    engine.ingest([*head, r, u])
+    engine.ingest([*head, c, reply])
+    live = [*head, r, u, _u(u["content"], 500.0), reply, *_turns(10, 1, 520.0), dict(c), *_turns(11, 2, 540.0), x]
+    engine.ingest(live)
+    engine.ingest([*live, reply_x])
+    live = [*live, dict(x), reply_x, *_turns(20, 3, 700.0)]
+    engine.ingest(live)
+    return live, {"r": r, "u": u, "c": c, "x": x}
+
+
+def _sweep_engine(tmp_path) -> LCMEngine:
+    """Over threshold with one-row leaf chunks: every pass publishes the oldest raw row (or tool group)."""
+    config = LCMConfig(fresh_tail_count=2, leaf_chunk_tokens=1, threshold_full_sweep_enabled=True,
+                       database_path=str(tmp_path / "lcm.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("S", platform="cli", context_length=4_000, conversation_id="conv")
+    return engine
+
+
+def test_563_h2_merge_turn_views_are_replays_and_never_brick_publication(tmp_path, summaries):
+    """#563: the witnessed composite and its survivor are views of stored R and U (never new rows);
+    a leaf chunk of views alone, or one the host re-ordered around X's re-flush, still publishes."""
+    engine = _sweep_engine(tmp_path)
+    try:
+        live, m = _h2_merge_turn_history(engine)
+        texts = [str(row["content"]) for row in _rows(engine)]
+        assert texts.count(m["r"]["content"]) == 1 and texts.count(m["u"]["content"]) == 1
+        assert m["c"]["content"] not in texts
+        statuses = []
+        for turn in range(30, 34):  # leaf chunks of one row: each pass meets the views and X's re-flush
+            live = engine.compress(live)
+            statuses.append(engine._last_compression_status)
+            live = [*live, *_turns(turn, 1, 1000.0 + turn * 10)]
+            engine.ingest(live)
+        assert "error" not in statuses and "compacted" in statuses, engine._last_compression_noop_reason
+        stored = [int(row["store_id"]) for row in _rows(engine)]
+        assert int(engine._last_compacted_store_id or 0) >= stored[-6]
+        _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()

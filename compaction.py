@@ -1627,6 +1627,7 @@ class CompactionMixin:
             if not to_compact:
                 noop_reason = "no eligible leaf chunk selected"
                 break
+            to_compact = self._identity_anchor_extend_chunk(to_compact, candidate_raw)  # #563
 
             selected_raw_chunk = to_compact
             sources = {}
@@ -1634,7 +1635,7 @@ class CompactionMixin:
             anchor_claims: dict[int, list[int]] = {}  # #436 R4: id(input row) -> the store ids its text covers
             selected_input = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
             anchored_input = self._identity_anchor_summary_input(
-                selected_input, self._current_compress_store_ids_by_message_id, working_messages
+                selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk
             )
             for message, claims in anchored_input or [(message, []) for message in selected_input]:
                 remainder = self._generated_context_carrier_remainder(message)
