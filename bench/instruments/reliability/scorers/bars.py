@@ -5,6 +5,11 @@ kept after its persist override and consecutive-user merge), so the bars compare
 host, never with LCM itself. An attempt with no stored reply whose prompt the next attempt of the same
 session folded into a composite row (and no other held row still carries its tag) is superseded by that
 composite: that is the host merge (agent/agent_runtime_helpers.py ``_merge_consecutive_users``).
+
+B1/B2 are scored per session lineage: the chat lineage is S0 and its compression children (state.db
+``parent_session_id``), each cron fire is its own lineage. A row stored under the wrong lineage is a loss in
+one and a surplus in the other. A cell that cannot prove its scenario ran (tool dispatch, native attempts,
+tool groups) is UNSUPPORTED, never PASS.
 """
 from __future__ import annotations
 
@@ -31,13 +36,70 @@ def attempts(events: list[dict]) -> list[dict]:
         if e["event"] in ("user_sent", "retry"):
             a = {"tag": e["tag"], "prefix": e.get("session_prefix", "T"), "content": e["content"],
                  "persist": e["persist"] if e.get("persist") is not None else e["content"],
-                 "held": None, "reply": None, "user_tags": {}, "ended": False}
+                 "held": None, "reply": None, "user_tags": {}, "ended": False, "turn": e.get("turn")}
             out.append(a)
             open_[e["tag"]] = a
         elif e["event"] == "turn_end" and e["tag"] in open_:
             a = open_.pop(e["tag"])
-            a.update(held=a["persist"] if e.get("held_same") else e.get("held"), reply=e.get("reply"), user_tags=e.get("user_tags") or {}, ended=True)
+            a.update(held=a["persist"] if e.get("held_same") else e.get("held"), reply=e.get("reply"), user_tags=e.get("user_tags") or {},
+                     ended=True, end=e)
     return out
+
+
+def lineage(cell_dir: Path):
+    """store session id -> lineage: "chat" for S0 and its compression descendants, else the root session."""
+    parents, state = {}, cell_dir / "db" / "state.db"
+    if state.exists():
+        con = sqlite3.connect(f"file:{state}?mode=ro", uri=True)
+        try:
+            parents = dict(con.execute("select id, parent_session_id from sessions"))
+        finally:
+            con.close()
+
+    def group(sid):
+        seen = set()
+        while parents.get(sid) and sid not in seen:
+            seen.add(sid)
+            sid = parents[sid]
+        return "chat" if sid == "S0" else sid
+    return group
+
+
+def attempt_group(a: dict, group) -> str:
+    return "chat" if a["prefix"] == "T" else group((a.get("end") or {}).get("session") or f"cron_job_{int(a['tag'][1:]):02d}")
+
+
+def continue_positions(seq: list[tuple[str, str]], reply_pat: str) -> Counter:
+    """For every 'continue' user row, the reply tag of the row right after it (None if not a reply)."""
+    out = Counter()
+    for i, (role, text) in enumerate(seq):
+        if role == "user" and multiset.norm(text) == "continue":
+            nxt = seq[i + 1] if i + 1 < len(seq) else None
+            m = re.search(reply_pat, nxt[1] or "") if nxt and nxt[0] == "assistant" else None
+            out[m.group(1) if m else None] += 1
+    return out
+
+
+def scenario_gaps(cell: dict, events: list[dict], atts: list[dict], tg: dict) -> list[str]:
+    """What the cell was meant to exercise and did not: each gap makes the cell UNSUPPORTED."""
+    gaps = []
+    if cell.get("tool_plan"):
+        for a in atts:
+            end = a.get("end") or {}
+            if a["prefix"] != "T" or not a["ended"] or end.get("failed") or end.get("kind") == "cancel":
+                continue
+            want = sum(len(g["calls"]) for g in cell["tool_plan"] if isinstance(g["turns"], list) and a["turn"] in g["turns"])
+            planned, answered = end.get("tools_planned", 0), end.get("tools_answered", 0)
+            if (want and planned != want) or answered != planned:
+                gaps.append(f"{a['tag']}: tool calls expected {want}, dispatched {planned}, results seen {answered}")
+        if "B6" in (cell.get("bars") or ALL_BARS) and not tg["groups"]:
+            gaps.append("B6: no tool-call group was stored, so the split check had nothing to check")
+    if cell.get("native_recovery"):
+        tried = sum(e.get("native_attempts", 0) for e in events if e["event"] == "turn_end") + \
+            sum(1 for e in events if e["event"] == "compaction" and e.get("compression_status") == "host_native")
+        if not tried:
+            gaps.append("native cell with zero native recovery attempts")
+    return gaps
 
 
 def expected_items(atts: list[dict]) -> list[tuple[str, str]]:
@@ -73,30 +135,47 @@ def score(cell: dict, cell_dir: Path) -> dict:
     finally:
         con.close()
     atts = attempts(events)
-    items = expected_items(atts)
+    group = lineage(cell_dir)
+    groups = sorted({attempt_group(a, group) for a in atts} | {group(sid) for _s, sid, _r, _c in stored})
+    per = {g: (expected_items([a for a in atts if attempt_group(a, group) == g]),
+               [r for r in stored if group(r[1]) == g]) for g in groups}
     applicable = [b for b in cell.get("bars") or ALL_BARS
                   if (b != "B6" or cell.get("tool_plan")) and (b != "B7" or cell.get("native_recovery"))
                   and (b != "B5" or cell.get("min_compactions", 5) > 0)]
     failed, numbers = {}, {}
 
     user_pat, reply_pat = r"\[([A-Z]\d\d)\] user turn", r"reply to ([A-Z]\d\d)\b"
-    want_u = tag_counts([t for r, t in items if r == "user"], user_pat)
-    want_a = tag_counts([t for r, t in items if r == "assistant"], reply_pat)
-    have_u = tag_counts([c for _s, _sid, r, c in stored if r == "user"], user_pat)
-    have_a = tag_counts([c for _s, _sid, r, c in stored if r == "assistant"], reply_pat)
-    b1 = {k: {"expected": want_u[k], "stored": have_u[k]} for k in set(want_u) | set(have_u) if want_u[k] != have_u[k]}
-    b1.update({f"reply {k}": {"expected": want_a[k], "stored": have_a[k]}
-               for k in set(want_a) | set(have_a) if want_a[k] != have_a[k]})
-    numbers["B1"] = {"user_tags": len(want_u), "reply_tags": len(want_a), "mismatched": len(b1),
-                     "per_session": {p: sum(1 for k in b1 if k.split()[-1].startswith(p)) for p in
-                                     sorted({a["prefix"] for a in atts})}}
+    b1, b1_tags, b1_per, b2_parts = {}, [0, 0], {}, {}
+    for g, (items, rows) in per.items():
+        label = "" if g == "chat" else f"{g}:"
+        want_u = tag_counts([t for r, t in items if r == "user"], user_pat)
+        want_a = tag_counts([t for r, t in items if r == "assistant"], reply_pat)
+        have_u = tag_counts([c for _s, _sid, r, c in rows if r == "user"], user_pat)
+        have_a = tag_counts([c for _s, _sid, r, c in rows if r == "assistant"], reply_pat)
+        mism = {f"{label}{k}": {"expected": want_u[k], "stored": have_u[k]} for k in set(want_u) | set(have_u) if want_u[k] != have_u[k]}
+        mism.update({f"reply {label}{k}": {"expected": want_a[k], "stored": have_a[k]}
+                     for k in set(want_a) | set(have_a) if want_a[k] != have_a[k]})
+        want_c = continue_positions(items, reply_pat)
+        have_c = continue_positions([(r, c) for _s, _sid, r, c in rows if r in ("user", "assistant")], reply_pat)
+        if want_c != have_c:
+            mism[f"{label}continue"] = {"expected_replies_after": dict(want_c), "stored_replies_after": dict(have_c)}
+        b1.update(mism)
+        b1_tags[0] += len(want_u)
+        b1_tags[1] += len(want_a)
+        b1_per[g] = len(mism)
+        b2_parts[g] = multiset.score(items, rows)
+    numbers["B1"] = {"user_tags": b1_tags[0], "reply_tags": b1_tags[1], "mismatched": len(b1), "per_session": b1_per}
     if b1:
         failed["B1"] = dict(sorted(b1.items())[:30])
-    ms = multiset.score(items, stored)
-    numbers["B2"] = {k: ms[k] for k in ("expected_items", "missing_keys", "deficit_rows", "duplicated_keys",
-                                        "surplus_rows", "stored_rows_not_expected")}
-    if ms["verdict"] != "PASS":
-        failed["B2"] = {**numbers["B2"], "missing": ms["missing"][:5], "duplicated": ms["duplicated"][:5]}
+    keys = ("expected_items", "missing_keys", "deficit_rows", "duplicated_keys", "surplus_rows",
+            "stored_rows_not_expected", "split_keys")
+    numbers["B2"] = {k: sum(m[k] for m in b2_parts.values()) for k in keys}
+    numbers["B2"]["per_session"] = {g: m["verdict"] for g, m in b2_parts.items()}
+    if any(m["verdict"] != "PASS" for m in b2_parts.values()):
+        bad = {g: m for g, m in b2_parts.items() if m["verdict"] != "PASS"}
+        failed["B2"] = {**numbers["B2"], "missing": [dict(e, session=g) for g, m in bad.items() for e in m["missing"]][:5],
+                        "duplicated": [dict(e, session=g) for g, m in bad.items() for e in m["duplicated"]][:5],
+                        "extra": [dict(e, session=g) for g, m in bad.items() for e in m["extra"]][:5]}
     conflicts = sum(p.get("log_counts", {}).get("publication_invariant_conflict", 0) for p in phases)
     numbers["B3"] = {"publication_invariant_conflict": conflicts}
     if conflicts:
@@ -139,5 +218,9 @@ def score(cell: dict, cell_dir: Path) -> dict:
     inconclusive = {b: v for b, v in inconclusive.items() if b in applicable}
     numbers["diagnostic"]["native_rejections"] = dict(Counter(e.get("rejection") for e in events
                                                               if e["event"] == "compaction" and e.get("rejection")))
+    gaps = scenario_gaps(cell, events, atts, tg)
+    if gaps:
+        return {"verdict": "UNSUPPORTED", "reason": "scenario not proven: " + "; ".join(gaps[:5]),
+                "applicable_bars": applicable, "failed_bars": failed, "inconclusive_bars": inconclusive, "numbers": numbers}
     return {"verdict": "FAIL" if failed else "INCONCLUSIVE" if inconclusive else "PASS", "applicable_bars": applicable,
             "failed_bars": failed, "inconclusive_bars": inconclusive, "numbers": numbers}

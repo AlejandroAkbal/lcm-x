@@ -67,7 +67,7 @@ def unfired_reason(cell: dict, fired: set, citations: dict) -> str | None:
 
 
 def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
-             keep_dbs: str = "fail", lcm_env: dict | None = None) -> dict:
+             keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None) -> dict:
     if lcm_env:  # a global override wins over the cell's tuning and is part of the cell record
         cell = {**cell, "lcm_env": {**cell["lcm_env"], **lcm_env}, "global_lcm_env": lcm_env}
         if "LCM_NATIVE_RECOVERY" in lcm_env:
@@ -86,7 +86,11 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
            "OPENROUTER_API_KEY": "test-key", "TMPDIR": str(d / "home"),
            **cell["lcm_env"], "LCM_NATIVE_RECOVERY": "true" if cell["native_recovery"] else "false"}
     rec = {"cell": cell["id"], "host": host_name, "host_sha": host["sha"], "plugin_ref": plugin["ref"],
-           "plugin_sha": plugin["sha"], "targets": cell["targets"], "dir": str(d)}
+           "plugin_sha": plugin["sha"], "targets": cell["targets"], "dir": str(d), "host_identity": identity}
+    if not identity or "error" in identity:  # the host tree is not proven to be the configured sha
+        rec.update(verdict="ERROR", reason=f"host identity not verified: {(identity or {}).get('error')}")
+        (d / "verdict.json").write_text(json.dumps(rec, indent=1, default=str))
+        return rec
     started, start_turn, last, phases_run = time.time(), 1, {}, []
     for phase in PHASES:
         try:
@@ -128,6 +132,8 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
             scored = bars.score(cell, d)
             rec.update(verdict=scored["verdict"], failed_bars=scored["failed_bars"], numbers=scored["numbers"],
                        inconclusive_bars=scored["inconclusive_bars"])
+            if scored.get("reason"):
+                rec["reason"] = scored["reason"]
         except Exception as exc:  # a scorer failure is a harness ERROR, never a PASS
             rec.update(verdict="ERROR", reason=f"scoring failed: {exc!r}")
     (d / "verdict.json").write_text(json.dumps(rec, indent=1, default=str))
@@ -161,17 +167,30 @@ def main(argv=None) -> int:
     if any(not k.startswith("LCM_") for k in lcm_env):
         ap.error("--lcm-env keys must start with LCM_")
     hosts = H.load(H.hosts_file(a.hosts_file), None if a.hosts == "all" else a.hosts.split(","))
+    identities = {}
+    for name, host in hosts.items():
+        try:
+            identities[name] = H.verify(name, host)
+        except (ValueError, OSError) as exc:
+            identities[name] = {"error": str(exc)}
     selected = C.select(a.cells)
     plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins") for ref in a.plugin_ref.split(",")]
     out.mkdir(parents=True, exist_ok=True)
     (out / "run.json").write_text(json.dumps({"argv": sys.argv, "hosts": hosts, "plugins": plugins, "lcm_env": lcm_env,
-                                              "cells": [c["id"] for c in selected]}, indent=1))
+                                              "host_identity": identities, "cells": [c["id"] for c in selected]}, indent=1))
     jobs = [(c, h, hosts[h], p) for p in plugins for h in hosts for c in selected]
     started, results = time.time(), []
     with ThreadPoolExecutor(max_workers=a.jobs) as pool, open(out / "results.jsonl", "w") as sink:
-        futures = [pool.submit(run_cell, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env) for c, h, hd, p in jobs]
+        futures = {pool.submit(run_cell, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env,
+                               identities[h]): (c, h, p) for c, h, hd, p in jobs}
         for fut in as_completed(futures):
-            rec = fut.result()
+            try:
+                rec = fut.result()
+            except Exception as exc:  # any job failure becomes one bounded ERROR record, never a lost cell
+                c, h, p = futures[fut]
+                rec = {"cell": c["id"], "host": h, "host_sha": hosts[h]["sha"], "plugin_ref": p["ref"],
+                       "plugin_sha": p["sha"], "targets": c["targets"], "verdict": "ERROR",
+                       "reason": f"harness job failed: {exc!r}"[:500]}
             results.append(rec)
             sink.write(json.dumps(rec, default=str) + "\n")
             sink.flush()

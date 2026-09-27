@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bench.instruments.reliability import cells, hosts, plugin_tree  # noqa: E402
+from bench.instruments.reliability import cells, hosts, plugin_tree, probe  # noqa: E402
 from bench.instruments.reliability.scorers import bars, dupes, multiset  # noqa: E402
 
 U = "[T{:02d}] user turn {}: alpha beta end."
@@ -27,25 +29,32 @@ def turn_events(t, *, reply=True, held=None, tags=None):
              "reply": R.format(t, t) if reply else None, "user_tags": tags or {f"T{t:02d}": 1}}]
 
 
-def make(tmp_path, *, rows, events, nodes=(), phase=None, **cell_kw):
+def make(tmp_path, *, rows, events, nodes=(), phase=None, sids=None, parents=None, **cell_kw):
     d = tmp_path / "cell"
     (d / "db").mkdir(parents=True)
+    if parents is not None:
+        con = sqlite3.connect(d / "db" / "state.db")
+        con.execute("create table sessions (id text primary key, parent_session_id text)")
+        con.executemany("insert into sessions values (?,?)", parents.items())
+        con.commit()
+        con.close()
     con = sqlite3.connect(d / "db" / "lcm.db")
     con.execute("create table messages (store_id integer primary key, session_id text, role text, content text,"
                 " tool_calls text, tool_call_id text, ingested_at real)")
     con.execute("create table summary_nodes (node_id integer primary key, session_id text, depth integer,"
                 " source_ids text, source_type text, created_at real)")
     for i, (role, content, *rest) in enumerate(rows, 1):
-        con.execute("insert into messages values (?,?,?,?,?,?,?)", (i, "S0", role, content, *(rest + [None, None])[:2], i * 10.0))
+        sid = sids[i - 1] if sids else "S0"
+        con.execute("insert into messages values (?,?,?,?,?,?,?)", (i, sid, role, content, *(rest + [None, None])[:2], i * 10.0))
     for i, ids in enumerate(nodes, 1):
         con.execute("insert into summary_nodes values (?,?,?,?,?,?)", (i, "S0", 0, json.dumps(ids), "messages", 1.0))
     con.commit()
     con.close()
     comp = [{"phase": "A", "turn": i + 1, "event": "compaction", "compression_status": "compacted", "depth0_nodes": i + 1}
-            for i in range(cell_kw.pop("passes", 2))]
+            for i in range(cell_kw.pop("passes", 2))] + cell_kw.pop("extra_events", [])
     (d / "transcript.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events + comp))
     base = {"phase": "A", "log_counts": {}, "counters": {"failed": [], "orphan_drops": 0, "native_max": 1},
-            "compactions_logged": len(comp), "final_check": {"published": True}}
+            "compactions_logged": sum(e["compression_status"] == "compacted" for e in comp), "final_check": {"published": True}}
     (d / "phase-A.json").write_text(json.dumps({**base, **(phase or {})}))
     cell = {"id": "t", "tool_plan": [], "native_recovery": False, "min_compactions": 2, "final_compaction_check": True,
             "bars": list(cells.BARS), **cell_kw}
@@ -137,19 +146,89 @@ def test_b6_split_group_and_orphans(tmp_path):
     assert orphan["failed_bars"]["B6"]["host_orphan_drops"] == 1
 
 
+def native_events(n=3):
+    events = clean_events(n)
+    for e in events:
+        if e["event"] == "turn_end":
+            e["native_attempts"] = 1
+    return events
+
+
 def test_b7_native_health(tmp_path):
-    ok = make(tmp_path, rows=clean_rows(), events=clean_events(), native_recovery=True)
+    ok = make(tmp_path, rows=clean_rows(), events=native_events(), native_recovery=True)
     assert ok["verdict"] == "PASS" and "B7" in ok["applicable_bars"]
-    bad = make(tmp_path / "b", rows=clean_rows(), events=clean_events(), native_recovery=True,
+    bad = make(tmp_path / "b", rows=clean_rows(), events=native_events(), native_recovery=True,
                phase={"log_counts": {"summary_generation_aborted": 1}, "counters": {"failed": [], "native_max": 2}})
     assert bad["failed_bars"]["B7"]["summary_generation_aborted"] == 1
     assert bad["failed_bars"]["B7"]["max_native_attempts_per_turn"] == 2
 
 
-def test_multiset_split_assistant_and_normalisation():
+def test_multiset_normalisation_passes_and_a_split_reply_fails():  # R1.2 F1: a split is surplus, never PASS
+    assert multiset.score([("user", "a  b\n")], [(1, "S", "user", "a b")])["verdict"] == "PASS"
     out = multiset.score([("user", "a  b\n"), ("assistant", "one two")],
                          [(1, "S", "user", "a b"), (2, "S", "assistant", "one"), (3, "S", "assistant", "two")])
-    assert out["verdict"] == "PASS" and len(out["split_assistant_turns"]) == 1
+    assert out["verdict"] == "FAIL" and out["split_keys"] == 1 and out["surplus_rows"] == 2
+
+
+def test_f1_stored_only_key_fails_b2(tmp_path):
+    out = make(tmp_path, rows=clean_rows() + [("user", "synthetic row nobody sent")], events=clean_events())
+    assert out["numbers"]["B2"]["stored_rows_not_expected"] == 1 and out["numbers"]["B2"]["surplus_rows"] == 1
+    assert "B2" in out["failed_bars"] and "B1" not in out["failed_bars"]
+
+
+def test_f2_native_pass_needs_its_own_host_commit(tmp_path):
+    native = [{"phase": "A", "turn": 3, "event": "compaction", "compression_status": "host_native"}]
+    final = [{"phase": "A", "turn": 3, "event": "compaction", "compression_status": "host_native", "final": True}]
+    unproven = make(tmp_path, rows=clean_rows(), events=clean_events(), extra_events=native + final)
+    assert unproven["failed_bars"]["B5"]["native_passes_without_host_commit"] == ["A:T3"]
+    events = clean_events()
+    events[-1]["host_commits"] = 1  # turn 3's turn_end saw one host "committed" telemetry line
+    proven = make(tmp_path / "p", rows=clean_rows(), events=events, extra_events=native + final, passes=1, min_compactions=2)
+    assert proven["verdict"] == "PASS", proven["failed_bars"]
+    assert proven["numbers"]["B5"]["published"] == 2  # the final forced pass is B4 evidence, not counted here
+
+
+def test_f3_unproven_scenarios_are_unsupported(tmp_path):
+    events = clean_events()
+    events[1].update(tools_planned=2, tools_answered=1)
+    calls = json.dumps([{"id": "c1"}, {"id": "c2"}])
+    rows = clean_rows(1) + [("assistant", "", calls), ("tool", "a", None, "c1"), ("tool", "b", None, "c2")] + clean_rows(3)[2:]
+    plan = {"tool_plan": [{"turns": [1], "calls": [{"name": "x"}, {"name": "y"}]}]}
+    short = make(tmp_path, rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], **plan)
+    assert short["verdict"] == "UNSUPPORTED" and "results seen 1" in short["reason"]
+    events[1].update(tools_answered=2)
+    assert make(tmp_path / "ok", rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], **plan)["verdict"] == "PASS"
+    no_groups = make(tmp_path / "g", rows=clean_rows(), events=events, **plan)
+    assert no_groups["verdict"] == "UNSUPPORTED" and "no tool-call group" in no_groups["reason"]
+    no_native = make(tmp_path / "n", rows=clean_rows(), events=clean_events(), native_recovery=True)
+    assert no_native["verdict"] == "UNSUPPORTED" and "zero native" in no_native["reason"]
+
+
+def test_f3_continue_rows_are_position_bound(tmp_path):
+    events = clean_events(3)
+    events[2]["content"] = events[2]["persist"] = events[3]["held"] = "continue"
+    rows = [("user", U.format(1, 1)), ("assistant", R.format(1, 1)), ("user", "continue"), ("assistant", R.format(2, 2)),
+            ("user", U.format(3, 3)), ("assistant", R.format(3, 3))]
+    assert make(tmp_path, rows=rows, events=events)["verdict"] == "PASS"
+    moved = [rows[0], rows[1], rows[3], rows[2], rows[4], rows[5]]  # same multiset, continue after the wrong reply
+    out = make(tmp_path / "m", rows=moved, events=events)
+    assert "continue" in out["failed_bars"]["B1"] and "B2" not in out["failed_bars"]
+
+
+def test_f4_rows_are_scored_per_session_lineage(tmp_path):
+    k = "[K01] user turn 1: alpha beta end."
+    events = clean_events(2) + [
+        {"phase": "A", "turn": 1, "event": "user_sent", "tag": "K01", "session_prefix": "K", "content": k, "persist": k},
+        {"phase": "A", "turn": 1, "event": "turn_end", "tag": "K01", "session_prefix": "K", "held": k,
+         "reply": "reply to K01: noted item 1.", "user_tags": {"K01": 1}, "session": "cron_job_01"}]
+    rows = clean_rows(2) + [("user", k), ("assistant", "reply to K01: noted item 1.")]
+    right = ["S0", "S0", "child", "child", "cron_job_01", "cron_job_01"]  # turn 2 after a rotation to "child"
+    ok = make(tmp_path, rows=rows, events=events, sids=right, parents={"S0": None, "child": "S0", "cron_job_01": None})
+    assert ok["verdict"] == "PASS", ok["failed_bars"]
+    swapped = ["S0", "S0", "cron_job_01", "cron_job_01", "child", "child"]  # same global multiset, lineages swapped
+    out = make(tmp_path / "s", rows=rows, events=events, sids=swapped, parents={"S0": None, "child": "S0", "cron_job_01": None})
+    assert {"B1", "B2"} <= set(out["failed_bars"])
+    assert out["numbers"]["B2"]["per_session"] == {"chat": "FAIL", "cron_job_01": "FAIL"}
 
 
 def test_dupes_counts_a_multi_origin_burst_after_compaction(tmp_path):
@@ -191,6 +270,49 @@ def test_hosts_loader_refuses_the_live_hermes_dir(tmp_path):
     path.write_text(json.dumps({"hosts": {"x": {**good, "src": str(live / "hermes-agent")}}}))
     with pytest.raises(ValueError, match="under the live"):
         hosts.load(path, hermes_dir=live)
+
+
+def test_f5_symlinked_live_path_and_tree_manifest(tmp_path):
+    live, outside = tmp_path / ".hermes", tmp_path / "outside"
+    (live / "hermes-agent").mkdir(parents=True)
+    outside.mkdir()
+    (live / "link").symlink_to(outside)  # lexically under the live dir, resolves outside it
+    (tmp_path / "back").symlink_to(live / "hermes-agent")  # lexically outside, resolves into it
+    assert hosts.under_real_hermes(live / "link", hermes_dir=live)
+    assert hosts.under_real_hermes(tmp_path / "back", hermes_dir=live)
+    assert not hosts.under_real_hermes(outside, hermes_dir=live)
+    repo, src = tmp_path / "repo", tmp_path / "export"
+    repo.mkdir()
+    (repo / "a.py").write_text("A = 1\n")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "x"], check=True)
+    sha = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    (src / "tree").mkdir(parents=True)
+    (src / "tree" / "a.py").write_text("A = 1\n")
+    hosts.write_manifest(src / "tree", sha, repo)
+    assert hosts.verify("x", {"src": str(src / "tree"), "sha": sha})["method"] == "tree-manifest"
+    (src / "tree" / "a.py").write_text("A = 2\n")
+    with pytest.raises(ValueError, match="tree hash"):
+        hosts.verify("x", {"src": str(src / "tree"), "sha": sha})
+
+
+def test_f6_final_check_never_falls_back_from_the_selected_api(monkeypatch):
+    fallback = []
+
+    def compress_now(*_a, **_k):
+        raise ImportError("failure inside the selected path")
+    for name, attrs in {"agent": {}, "agent.conversation_compression_manual": {"compress_now": compress_now,
+                                                                            "parse_compress_args": lambda s: s},
+                        "agent.conversation_compression": {"finalize_context_engine_compression_notification": print},
+                        "acp_adapter": {}, "acp_adapter.commands": {"_estimate_tokens": lambda *a: 1}}.items():
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(**attrs))
+    agent = types.SimpleNamespace(context_compressor=types.SimpleNamespace(_last_compression_status="compacted"),
+                                  _compress_context=lambda *a, **k: fallback.append(1) or (a[0], None))
+    out = probe.final_check(agent, [], probe.io.StringIO())
+    assert out["outcome"] == "failed" and "failure inside" in out["exception"]
+    assert out["entry"] == "compress_now" and not fallback and len(out["attempts"]) == 1
 
 
 def test_plugin_identity_is_read_from_the_tree(tmp_path):

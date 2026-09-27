@@ -2,8 +2,9 @@
 
 Key = (role, sha256(NFC(whitespace-collapsed content))) over non-empty user/assistant rows. Per key the
 stored row count must equal the expected (transcript) count: fewer = loss (deficit), more = duplicates
-(surplus). Repeated identical items are fine as long as the multiplicity matches. Split assistant
-answers (one reply stored as two adjacent rows) are reported apart, as in the source.
+(surplus). Repeated identical items are fine as long as the multiplicity matches. A stored-only key is
+surplus and fails; a split assistant answer (one reply stored as two adjacent rows) is reported apart, as in
+the source, and fails too (its fragments are stored-only keys).
 """
 from __future__ import annotations
 
@@ -52,18 +53,20 @@ def score(expected: list[tuple[str, str]], stored_rows: list[tuple]) -> dict:
         elif have > n:
             duplicated.append(entry)
     extra = [{"role": k[0], "copies": len(v), "store_ids": v[:6]} for k, v in stored.items() if k not in want]
+    # Every stored-only key and every split reply is surplus: no host transform licenses them.
     return {
         "instrument": "multiset-v1",
-        "verdict": "PASS" if not missing and not duplicated else "FAIL",
+        "verdict": "PASS" if not (missing or duplicated or extra or split) else "FAIL",
         "expected_items": sum(want.values()),
         "distinct_keys": len(want),
         "missing_keys": len(missing),
         "deficit_rows": sum(e["expected"] - e["stored"] for e in missing),
         "duplicated_keys": len(duplicated),
-        "surplus_rows": sum(e["stored"] - e["expected"] for e in duplicated),
+        "surplus_rows": sum(e["stored"] - e["expected"] for e in duplicated) + sum(e["copies"] for e in extra),
         "missing": missing[:40],
         "duplicated": duplicated[:40],
         "split_assistant_turns": split,
+        "split_keys": len(split),
         "stored_rows_not_expected": len(extra),
         "extra": extra[:20],
     }

@@ -19,15 +19,26 @@ def nodes_report(db_path) -> dict:
 
 
 def growth(events: list[dict], logged_publications: int, min_compactions: int) -> dict:
-    """Depth-0 message nodes grow after every LCM pass; published passes (LCM or host-native) >= min;
-    logged ``LCM compaction #`` lines == LCM passes in the ledger."""
-    passes = [e for e in events if e.get("event") == "compaction"]
+    """The per-published-pass ledger. An LCM pass proves itself by depth-0 message-node growth; a host-native
+    pass (LCM writes no node) proves itself only by a host ``commit_status: committed`` telemetry line in the
+    same turn (``host_commits`` on that turn's turn_end/crash events). Published passes >= min; logged
+    ``LCM compaction #`` lines == LCM passes. The final forced compaction is B4 evidence, not a pass here."""
+    passes = [e for e in events if e.get("event") == "compaction" and not e.get("final")]
     published = [e for e in passes if e.get("compression_status") in ("compacted", "host_native")]
     lcm = [e for e in passes if e.get("compression_status") == "compacted"]  # native passes add no LCM nodes
     counts = [e.get("depth0_nodes") for e in lcm]
     stalls = [i for i in range(1, len(counts)) if counts[i] is None or counts[i - 1] is None or counts[i] <= counts[i - 1]]
     if counts and (counts[0] is None or counts[0] < 1):
         stalls.insert(0, 0)
+    commits, natives = {}, {}
+    for e in events:
+        key = (e.get("phase"), e.get("session_prefix", "T"), e.get("turn"))
+        if e.get("event") in ("turn_end", "crash") and e.get("host_commits") is not None:
+            commits[key] = commits.get(key, 0) + e["host_commits"]
+        if e.get("event") == "compaction" and e.get("compression_status") == "host_native" and not e.get("final"):
+            natives[key] = natives.get(key, 0) + 1
+    unproven = sorted(f"{k[0]}:{k[1]}{k[2]}" for k, n in natives.items() if commits.get(k, 0) < n)
     return {"published": len(published), "lcm_published": len(lcm), "logged": logged_publications,
             "min_compactions": min_compactions, "depth0_sequence": counts, "non_growing_passes": stalls,
-            "ok": not stalls and len(published) >= min_compactions and logged_publications == len(lcm)}
+            "native_passes_without_host_commit": unproven,
+            "ok": not stalls and not unproven and len(published) >= min_compactions and logged_publications == len(lcm)}

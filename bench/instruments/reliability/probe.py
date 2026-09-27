@@ -42,7 +42,16 @@ ANCHORS = {  # shape -> (host file, text on the cited line)
     "summary_aborted": ("agent/context_compressor.py", '"summary_generation_aborted"'),
     "cron_agent": ("cron/scheduler.py", 'platform="cron"'),
     "cron_close": ("cron/scheduler.py", "agent.close()"),
+    "commit_telemetry": ("agent/conversation_compression.py", "context compression attempt telemetry: %s"),
 }
+FAULT_CITES = {  # the host code path each fault or scenario relies on; uncitable -> the cell is UNSUPPORTED
+    "crash_after_compaction_before_reply": ["user_merge"],
+    "crash_mid_tool_call": ["user_merge"],
+    "crash_after_rotation_before_child_row": ["rotation_start"],
+    "crash_between_session_end_and_start": ["rotation_end", "rotation_start"],
+    "cancel_then_retry": ["acp_cancel", "acp_retry"],
+}
+COMMITTED = '"commit_status":"committed"'
 LOG_COUNTS = {
     "publication_invariant_conflict": "publication_invariant_conflict",
     "commit_logged": "as a compaction commit",
@@ -141,11 +150,14 @@ def main():
             os.fsync(fh.fileno())
         fired.add(kind)
         out["fired"] = out.get("fired", []) + [kind]
-        event(turn=turn, event="crash" if kind.startswith("crash") else kind, fault=kind, **extra)
+        event(turn=turn, event="crash" if kind.startswith("crash") else kind, fault=kind, session_prefix=cur.get("prefix", "T"),
+              host_commits=buf.getvalue().count(COMMITTED) - cur["commits0"], **extra)
 
     needed = {"acp": ["acp_persist"] + (["acp_restore"] if phase != "A" else []),
               "gateway": ["gateway_transcript", "gateway_user_text", "gateway_run"]}[cell["transport"]]
-    needed += ["acp_cancel", "acp_retry"] if "cancel_then_retry" in faults else []
+    needed += [k for f in faults for k in FAULT_CITES.get(f, [])]
+    needed += ["orphan_drop"] if cell.get("tool_plan") else []
+    needed += ["commit_telemetry", "summary_aborted"] if cell.get("native_recovery") else []
     needed += ["acp_compress"] if cell.get("final_compaction_check", True) else []
     needed += ["cron_agent", "cron_close"] if cell.get("cron_every") else []
     if missing := [k for k in needed if not out["citations"][k]]:
@@ -190,7 +202,8 @@ def main():
         return f"Stub summary #{n_summ['c']} covers " + " ".join("U" + x for x in tags) + ".\nExpand for details about: stub", 1
 
     window = int(cell["window"])
-    cur = {"turn": 0, "step": 0, "native": 0, "sess": "S0", "ended": None}
+    cur = {"turn": 0, "step": 0, "native": 0, "sess": "S0", "ended": None, "final": False, "commits0": 0,
+           "issued": set(), "seen": set()}
 
     def build(session_id, platform):
         with patch("agent.process_bootstrap.OpenAI"):
@@ -241,7 +254,8 @@ def main():
         status = getattr(self, "_last_compression_status", None)
         if status in ("compacted", "host_native"):  # a committed pass: LCM's own or the host-native summary
             counters["compacted_turns"].append(cur["turn"])
-        event(turn=cur["turn"], event="compaction", session=getattr(self, "_session_id", None),
+        event(turn=cur["turn"], event="compaction", session=getattr(self, "_session_id", None), final=cur["final"],
+              session_prefix=cur.get("prefix", "T"),
               compression_status=status, noop_reason=getattr(self, "_last_compression_noop_reason", None),
               depth0_nodes=depth0() if status == "compacted" else None,
               rejection=rejection(self), native_attempts=cur["native"])
@@ -322,8 +336,10 @@ def main():
         for t in ([first] if phase != "A" else []) if group["turns"] == "restart" else group["turns"]:
             plan.setdefault(t, []).append(group["calls"])
 
-    def response(content, prompt_tokens, calls=None, t=0):
-        tcs = [SimpleNamespace(id=f"call_{t:02d}_{k}", type="function", function=SimpleNamespace(
+    def response(content, prompt_tokens, calls=None, t=0, key=""):
+        ids = [f"call_{key}_{k}" for k in range(len(calls or []))]
+        cur["issued"] |= set(ids)
+        tcs = [SimpleNamespace(id=ids[k], type="function", function=SimpleNamespace(
             name=c["name"], arguments=json.dumps(c.get("args", {})).replace("{files}", str(files))))
             for k, c in enumerate(calls or [])] or None
         msg = SimpleNamespace(content="" if tcs else content, tool_calls=tcs)
@@ -344,6 +360,7 @@ def main():
                 fire("crash_after_compaction_before_reply", t)
                 finish("crash", next_turn=t + 1, turn=t)
             step, cur["step"] = cur["step"], cur["step"] + 1
+            cur["seen"] |= {m.get("tool_call_id") for m in kw.get("messages") or [] if m.get("role") == "tool"} & cur["issued"]
             sent = sum(len(str(m.get("content") or "")) for m in kw.get("messages") or []) // 4 + 800
             usage = int((sent if asst.get("real_usage") else est) * float(asst.get("usage_scale", 1.0)))
             if cancel and step == 0:  # the ACP cancel lands while the provider call is in flight
@@ -355,7 +372,7 @@ def main():
             if step < len(groups):
                 for c in groups[step]:
                     event(turn=t, event="tool_call", name=c["name"], session_prefix=prefix)
-                return response("", usage, groups[step], t)
+                return response("", usage, groups[step], t, f"{prefix}{t:02d}_{step}")
             return response(reply_text(prefix, t), usage)
         ag.client.chat.completions.create.side_effect = provider
 
@@ -364,7 +381,10 @@ def main():
         msgs = result.get("messages") if isinstance(result.get("messages"), list) else []
         tag = f"[{prefix}{int(cell['user_text'].get('identical_turns', {}).get(str(t), t)):02d}]"
         idx = [i for i, m in enumerate(msgs) if m.get("role") == "user" and isinstance(m.get("content"), str)
-               and (text == "continue" or tag in m["content"])]
+               and (text != "continue" and tag in m["content"])]
+        if text == "continue":  # position-bound: only the turn's own row, the LAST user row, and only if it is it
+            users = [i for i, m in enumerate(msgs) if m.get("role") == "user" and isinstance(m.get("content"), str)]
+            idx = users[-1:] if users and msgs[users[-1]]["content"].strip().endswith("continue") else []
         tags = {}
         for m in msgs:
             if m.get("role") == "user" and isinstance(m.get("content"), str):
@@ -384,7 +404,7 @@ def main():
             text = _attach_interrupted_prompt(text.strip(), text.strip())
         persist = text.strip() if (persist_strip if persist_strip is not None else cell["transport"] == "acp") else text
         est = sum(len(str(m.get("content") or "")) for m in history) // 4 + len(text) // 4 + 800
-        cur.update(turn=t, step=0, native=0)
+        cur.update(turn=t, prefix=prefix, step=0, native=0, commits0=buf.getvalue().count(COMMITTED), issued=set(), seen=set())
         event(turn=t, event="user_sent" if kind != "retry" else "retry", tag=f"{prefix}{t:02d}", role="user",
               session_prefix=prefix, content=text, persist=persist if persist != text else None,
               content_sha256=hashlib.sha256(text.encode()).hexdigest())
@@ -401,7 +421,9 @@ def main():
         event(turn=t, event="turn_end", tag=f"{prefix}{t:02d}", session_prefix=prefix, kind=kind,
               **({"held_same": True} if held == persist else {"held": held}),
               reply=reply_text(prefix, t) if reply_held else None, failed=failed, native_attempts=cur["native"],
-              interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags)
+              interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags,
+              tools_planned=len(cur["issued"]), tools_answered=len(cur["seen"]),
+              host_commits=buf.getvalue().count(COMMITTED) - cur["commits0"])
         return result
 
     def cron_run(k):  # cron/scheduler.py: a fresh platform="cron" agent per fire, no history, closed after
@@ -440,10 +462,11 @@ def main():
                 finish("tip_switch", next_turn=t, tip=tip)
             history = sdb_read.get_messages_as_conversation(tip, repair_alternation=True)
         if cancel and t == cancel["turn"] and "cancel_then_retry" not in fired:
-            fire("cancel_then_retry", t)
             result = run_turn(agent, "T", t, history, kind="cancel")
             history = result["messages"] if isinstance(result.get("messages"), list) else history
-            result = run_turn(agent, "T", t, history, kind="retry")
+            if result.get("interrupted"):  # the fault counts only once the host really interrupted the turn
+                fire("cancel_then_retry", t)
+                result = run_turn(agent, "T", t, history, kind="retry")
         else:
             result = run_turn(agent, "T", t, history)
         if isinstance(result.get("messages"), list):
@@ -453,6 +476,7 @@ def main():
         if cell.get("cron_every") and t % int(cell["cron_every"]) == 0:
             cron_run(t // int(cell["cron_every"]))
     if cell.get("final_compaction_check", True):
+        cur["final"] = True  # its compaction events are B4 evidence, not B5 passes
         out["final_check"] = final_check(agent, history, buf)
     finish("done", next_turn=None)
 
@@ -481,23 +505,26 @@ def final_check(agent, history, buf):
     invocation of the same entry point on the installed history, as a user re-running /compress would."""
     engine, attempts = agent.context_compressor, []
     system = getattr(agent, "_cached_system_prompt", "") or ""
+    try:  # select the API once, BEFORE invoking it; an exception from the selected path fails the check
+        from agent.conversation_compression_manual import compress_now, parse_compress_args
+        from agent.conversation_compression import finalize_context_engine_compression_notification
+        entry = "compress_now"
+    except ImportError:  # older hosts: _cmd_compress calls _compress_context directly
+        from acp_adapter.commands import _estimate_tokens
+        entry = "_compress_context(force=True)"
     for _ in range(2):
         before, rec = buf.getvalue().count("publication_invariant_conflict"), {}
         saved = getattr(agent, "_session_db", None)
         try:
             agent._session_db = None  # "Stable ACP session id: suppress _compress_context's SQLite session split."
-            try:
-                from agent.conversation_compression_manual import compress_now, parse_compress_args
-                from agent.conversation_compression import finalize_context_engine_compression_notification
-                rec["entry"] = "compress_now"
+            rec["entry"] = entry
+            if entry == "compress_now":
                 res = compress_now(agent, history, parse_compress_args(""), system_message=system, task_id="S0")
                 rec["host_status"] = res.status
                 if res.status == "compressed":
                     finalize_context_engine_compression_notification(agent, committed=True)
                     history = list(res.after_messages)
-            except ImportError:  # older hosts: _cmd_compress calls _compress_context directly
-                from acp_adapter.commands import _estimate_tokens
-                rec["entry"] = "_compress_context(force=True)"
+            else:
                 approx = _estimate_tokens(history, agent, system, getattr(agent, "tools", None) or None)
                 history, _ = agent._compress_context(list(history), system, approx_tokens=approx, task_id="S0", force=True)
                 rec["host_status"] = "compressed"
