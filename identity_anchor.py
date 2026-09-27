@@ -17,6 +17,7 @@ occurrences, or by a relation LCM itself recorded when it saw that composite; R3
 a stored head and a new remainder stores the remainder once (its own stamp unknown) with the relation.
 R4 (coverage bound to the summarizer input) lives in compaction's input loop.
 R7 carry comes only from the verified compression-ancestor chain, never from a sibling session.
+R6 (supersede on positive evidence) hooks the host-rewrite capture.
 
 ``LCM_IDENTITY_ANCHOR`` (default on): ``0``/``false``/``no``/``off`` restores the pre-#436 ingest exactly.
 """
@@ -580,6 +581,28 @@ class IdentityAnchorMixin:
             self._store.backfill_observed_at(store_id, stamp)
         if remainder_ids is None and plan["carry"]:
             self._register_identity_anchor_carry(plan["carry"])
+
+    def _note_identity_anchor_version(self, store_id, message) -> None:
+        """R6: this process stored ``store_id`` from ``message`` and now observes the SAME host object
+        with other content: positive evidence of an in-place rewrite. Held until the new version's store."""
+        if identity_anchor_enabled():
+            versions = [entry for entry in getattr(self, "_identity_anchor_versions", ()) if entry[0] is not message]
+            self._identity_anchor_versions = (versions + [(message, int(store_id))])[-_RECENT_CAP:]
+
+    def _identity_anchor_record_versions(self, stored) -> None:
+        """R6: a rewritten host object that this ingest stored as a row of its own is a new version of
+        the row it was stored as before: ``supersedes`` relation, both versions' bytes kept. A version
+        this ingest recognised as stored occurrences (a composite, a replay) records nothing here."""
+        versions = list(getattr(self, "_identity_anchor_versions", ()))
+        groups = []
+        for message, store_id in stored:
+            old = next((entry for entry in versions if entry[0] is message), None)
+            if old is not None:
+                versions.remove(old)
+                groups.append([(int(store_id), "supersedes", old[1], None, _normalize_observed_at(message.get("timestamp")))])
+        self._identity_anchor_versions = versions
+        if groups:
+            self._store.add_message_relations(groups)
 
     def _identity_anchor_remember(self, stored) -> None:
         """R5 current-turn window: (session, identity, store_id, observed_at) of user rows just stored."""

@@ -303,6 +303,24 @@ def test_r5_null_stamp_is_backfilled_only_for_the_proven_occurrence(tmp_path):
         engine.shutdown()
 
 
+def test_r6_an_in_place_rewrite_is_a_new_version_that_supersedes(tmp_path):
+    """The same host object observed before and after with other content: both versions kept, the
+    new one records ``supersedes``. Without that observation a mismatch is a distinct occurrence."""
+    engine = _engine(tmp_path)
+    try:
+        head = [SYSTEM, *_turns(1, 2, 0.0)]
+        prompt = _u("draft prompt" + PAD, 500.0)
+        engine.ingest([*head, prompt])
+        prompt["content"] = "edited prompt" + PAD
+        engine.ingest([*head, prompt, _a("reply", 501.0)])
+        rows = _rows(engine)
+        ids = {str(row["content"]): int(row["store_id"]) for row in rows}
+        assert "draft prompt" + PAD in ids and "edited prompt" + PAD in ids
+        assert (ids["edited prompt" + PAD], "supersedes", ids["draft prompt" + PAD], None) in _relations(engine)
+    finally:
+        engine.shutdown()
+
+
 def test_flag_off_writes_no_identity_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LCM_IDENTITY_ANCHOR", "false")
     engine = _engine(tmp_path)

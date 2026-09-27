@@ -803,6 +803,7 @@ class ReconcileMixin:
             if live == identity:
                 continue
             if _proof_user_identity(live) != _proof_user_identity(identity):
+                self._note_identity_anchor_version(store_id, message)  # #436 R6: a before/after observation
                 del watch[store_id]
                 continue
             try:  # best-effort: a failure keeps the watch for the next ingest, never blocks this one

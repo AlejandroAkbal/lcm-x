@@ -5796,6 +5796,9 @@ class LCMEngine(
                     (self._message_replay_identity(reconcile_messages[idx], strip_carrier=False), store_id, messages[idx])
                     for idx, store_id in stored_at.items() if idx not in anchor_remainders
                 ])
+                self._identity_anchor_record_versions(
+                    [(messages[idx], store_id) for idx, store_id in stored_at.items() if idx not in anchor_remainders]
+                )
             except Exception as exc:
                 logger.warning("LCM identity-anchor relation write failed (%s)", type(exc).__name__)
         # Rollup staleness is driven by summary-node PUBLICATION
