@@ -259,7 +259,7 @@ def test_accounting_matches_requests_to_scripted_steps(tmp_path):
     reqs = [{"rid": 1, "role": "main", "reply": {}, "kind": "normal"},  # "kind" = the scenario's turn kind
             {"rid": 2, "role": "main", "phase": "held", "fault": "hold_until_killed"},
             {"rid": 2, "role": "main", "phase": "client_closed"}, {"rid": 3, "role": "lcm-summary", "reply": {}}]
-    reqs = [{**r, "route": "completion"} for r in reqs]
+    reqs = [{**r, "route": "completion", "method": "POST", "path": "/v1/chat/completions"} for r in reqs]
     (tmp_path / "provider-requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
     events = [{"phase": "A", "event": "emit"}, {"phase": "A", "event": "crash", "fault": "crash_after_compaction_before_reply"}]
     acct = PC.accounting(tmp_path, events)
@@ -384,3 +384,24 @@ def test_unverified_host_never_executes_its_interpreter(tmp_path):
     (venv / "lib" / "python3.11" / "site-packages" / "anthropic-0.87.0.dist-info").mkdir(parents=True)
     (venv / "lib" / "python3.11" / "site-packages" / "anthropic-0.87.0.dist-info" / "METADATA").write_text("Name: anthropic\n")
     assert PC.has_dist(host["python"], "anthropic") and not marker.exists()
+
+
+def test_colliding_suffixes_are_unrouted_and_unexpected(provider):
+    """Regression (R2a.1 delta review): any path ending in /models was served as the catalog and accepted."""
+    con = http.client.HTTPConnection("127.0.0.1", provider.port, timeout=10)
+    for path in ("/rogue/models", "/v1/x/models", "/v1/models/unknown-id", "/v1/models/"):
+        con.request("GET", path)
+        resp = con.getresponse()
+        assert resp.read() and resp.status == 404, path
+    for method, path in (("POST", "/rogue/chat/completions"), ("POST", "/v1/x/messages")):
+        con.request(method, path, "{}")
+        resp = con.getresponse()
+        assert resp.read() and resp.status == 404, path
+    d = provider.log_path.parent
+    (d / "provider-requests.jsonl").write_text(provider.log_path.read_text())
+    acct = PC.accounting(d, [])
+    assert [u["path"] for u in acct["unexpected_requests"]] == ["/rogue/models", "/v1/x/models", "/v1/models/unknown-id",
+                                                                "/v1/models/", "/rogue/chat/completions", "/v1/x/messages"]
+    forged = {"rid": 99, "method": "GET", "path": "/rogue/models", "route": "models"}  # a log line cannot vouch for itself
+    (d / "provider-requests.jsonl").write_text(json.dumps(forged) + "\n")
+    assert not PC.accounting(d, [])["ok"]

@@ -33,6 +33,22 @@ NONCE = re.compile(r'<lcm-summary nonce="([0-9a-f]+)">')
 ROLES = ("main", "lcm-summary", "aux", "aux-title")
 
 
+# The exact endpoints the fake serves; any other method/path is unrouted (404, and the cell ERRORs). The /api/v1 and
+# /anthropic/api/v1 catalog paths are what the hosts actually request (provider-requests.jsonl, R2a.1 runs).
+MODEL_PATHS = frozenset({"/v1/models", "/api/v1/models", "/anthropic/api/v1/models"})
+RETRIEVE_PATHS = frozenset(f"/v1/models/rel/{r}" for r in ROLES)
+COMPLETION_PATHS = {"/v1/chat/completions": "openai", "/v1/messages": "anthropic", "/anthropic/v1/messages": "anthropic"}
+
+
+def route_of(method: str, path: str) -> str:
+    """Exact-match classification, shared by the provider and process_cell.accounting()."""
+    if method == "GET" and (path in MODEL_PATHS or path in RETRIEVE_PATHS):
+        return "models"
+    if method == "POST" and path in COMPLETION_PATHS:
+        return "completion"
+    return "unrouted"
+
+
 def role_of(model: str) -> str:
     return (model or "").rsplit("/", 1)[-1]
 
@@ -94,26 +110,25 @@ class FakeProvider:
                 pass
 
             def do_GET(self):
-                if self.path.split("?")[0].rstrip("/").endswith("/models"):
+                route = route_of("GET", self.path)
+                if route == "models" and self.path in MODEL_PATHS:
                     provider.log(rid=provider.next_rid(), ts=time.time(), method="GET", path=self.path, route="models")
                     # context_length: a /models key the host reads (agent/model_metadata.py); 1M >= every cell window,
                     # so the host never auto-lowers the main threshold to an unknown aux model's default window.
                     data = [{"id": f"rel/{r}", "object": "model", "owned_by": "rel", "context_length": 1_000_000}
                             for r in ROLES]
                     return self.send_json(200, {"object": "list", "data": data})
-                model = self.path.split("?")[0].partition("/models/")[2]
-                if role_of(model) in ROLES:  # a known role's retrieve-model read: logged, answered 404 as it always was
+                if route == "models":  # a served role's retrieve-model read: logged, answered 404 as it always was
                     provider.log(rid=provider.next_rid(), ts=time.time(), method="GET", path=self.path, route="models",
                                  status=404)
-                    return self.send_json(404, {"error": {"message": f"no model detail for {model}"}})
+                    return self.send_json(404, {"error": {"message": f"no model detail at {self.path}"}})
                 self.unrouted()
 
             def do_POST(self):
-                path = self.path.split("?")[0].rstrip("/")
-                if not path.endswith(("/chat/completions", "/messages")):
+                if route_of("POST", self.path) != "completion":
                     return self.unrouted()
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-                return provider.serve(self, body, "openai" if path.endswith("/chat/completions") else "anthropic")
+                return provider.serve(self, body, COMPLETION_PATHS[self.path])
 
             def unrouted(self):
                 """Every other method/path is logged (the accounting makes it an ERROR) and refused."""

@@ -348,7 +348,7 @@ def accounting(d: Path, events: list[dict]) -> dict:
     reqs = read_jsonl(d / "provider-requests.jsonl")
     by_role, by_route, unexpected = {}, {}, []
     for r in {r["rid"]: r for r in reqs}.values():
-        route = r.get("route")
+        route = FP.route_of(r.get("method"), r.get("path"))  # re-derived, not trusted from the log
         by_route[route] = by_route.get(route, 0) + 1
         if route == "completion":
             by_role[r["role"]] = by_role.get(r["role"], 0) + 1
