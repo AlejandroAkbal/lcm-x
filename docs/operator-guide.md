@@ -297,6 +297,7 @@ environment variables:
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
 | `LCM_ABSOLUTE_THRESHOLD_TOKENS` | `0` | If `> 0`, force compaction at this absolute prompt-token count instead of `context_length × LCM_CONTEXT_THRESHOLD`. Cross-model context-health setpoint (common coding default: `130000`) so large windows do not delay compaction and degrade recall |
+| `LCM_MODEL_THRESHOLDS` | empty | Per-model threshold fractions, for example `"glm-5.3:0.115"`. Each key is matched as a substring of the active route's model name (the longest key wins) and takes priority over `LCM_CONTEXT_THRESHOLD`. Also settable as `lcm.model_thresholds` in config.yaml |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Recent messages protected from compaction |
 | `LCM_FRESH_TAIL_MAX_TOKENS` | `0` | Optional token cap for the protected fresh tail (`0` disables it); always retains the newest message and complete assistant/tool-result groups |
 | `LCM_FRESH_TAIL_PRESSURE_YIELD_ENABLED` | `true` | Default-on: when compaction is deadlocked because the count-protected tail covers the whole over-threshold session (#441), the tail yields to a derived token bound so compaction can progress; `false` restores the strict count tail (rollback switch) |
@@ -551,6 +552,20 @@ agents) so a larger window does not silently delay compaction, lower recall, or
 let long sessions accumulate more noise before LCM intervenes. Leave it at `0`
 to keep ratio-based behavior. When the absolute override is active, Codex
 GPT-5.5 ratio auto-raise is suppressed so the absolute setpoint stays pinned.
+
+A single fraction scales the trigger with each route's window. That is fine when
+you want each route to use the same share of its window, but on a profile that
+switches between windows of very different sizes it can put the trigger much
+later than you want. With `LCM_CONTEXT_THRESHOLD=0.75`, a 200k primary route
+triggers at 150k tokens, but a backup route that resolves to a 1,000,000-token
+window triggers at 750k, so compaction does not run there until a prompt reaches
+750k tokens. If you want a smaller prompt budget on that route, either give it
+its own fraction (`LCM_MODEL_THRESHOLDS="glm-5.3:0.115"` gives about 115k on a
+1M window and leaves every other route unchanged), or pin one trigger for every
+route with `LCM_ABSOLUTE_THRESHOLD_TOKENS`. The pin also applies to routes with
+a smaller window, so keep it below the smallest window you use. `/lcm status`
+reports the resolved `context_length`, `threshold_tokens` and
+`context_threshold_source` for the active route.
 
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the

@@ -15,11 +15,16 @@ each feature does and why, see [Feature overview](features-overview.md).
 2. **`~/.hermes/config.yaml`** participates in three narrow, deliberate ways:
    - `plugins.enabled: [hermes-lcm-x]` + `context.engine: lcm-x` activate the
      plugin (see [Operator guide → Activate](operator-guide.md#activate));
-   - `lcm.context_threshold` is the one LCM key supported in YAML (used only
-     when `LCM_CONTEXT_THRESHOLD` is not set; other keys under `lcm:` are
-     ignored and reported by `/lcm doctor`);
-   - when neither is set, LCM inherits the Hermes global
-     `compression.threshold`.
+   - four LCM keys are supported in YAML, each used only when its
+     environment variable is not set: `lcm.context_threshold`
+     (`LCM_CONTEXT_THRESHOLD`), `lcm.model_thresholds`
+     (`LCM_MODEL_THRESHOLDS`), `lcm.summary_reasoning_effort`
+     (`LCM_SUMMARY_REASONING_EFFORT`) and `lcm.expansion_reasoning_effort`
+     (`LCM_EXPANSION_REASONING_EFFORT`); other keys under `lcm:` are ignored
+     and reported by `/lcm doctor`;
+   - when neither `LCM_CONTEXT_THRESHOLD` nor `lcm.context_threshold` is set,
+     LCM inherits the Hermes global `compression.threshold`, unless
+     `compression.enabled` is false; then LCM uses its own default.
 3. **Summarization inherits Hermes auxiliary routing.** Rollup builds and
    compaction summaries go through the auxiliary model unless you override
    `LCM_SUMMARY_MODEL` — so a fully-local Hermes (local auxiliary model) makes
