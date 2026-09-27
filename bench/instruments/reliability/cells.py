@@ -54,7 +54,7 @@ def modes():
 def registry() -> list[dict]:
     crash = {"kind": "crash_after_compaction_before_reply"}
     group559 = [{"name": "read_file", "args": {"path": "{files}/small.txt"}},
-                {"name": "lcm_expand", "args": {"store_id": 1, "max_tokens": 20000}}]
+                {"name": "lcm_expand", "args": {"store_id": 1, "max_tokens": 20000}, "expect": {"min_chars": 10000}}]
     cells = []
     for m, ip in modes():
         cells += [
@@ -74,7 +74,7 @@ def registry() -> list[dict]:
                  tool_plan=[{"turns": list(range(2, 61, 3)), "calls": group559}],
                  doc="#559 shape: one assistant row calls read_file + lcm_expand (large result); lcm_expand ingests mid-turn."),
             cell(f"lcm-tool-mid-turn/{m}", [], in_place=ip,
-                 tool_plan=[{"turns": list(range(4, 61, 4)), "calls": [{"name": "lcm_grep", "args": {"pattern": "alpha"}}]}],
+                 tool_plan=[{"turns": list(range(4, 61, 4)), "calls": [{"name": "lcm_grep", "args": {"query": "alpha"}}]}],
                  doc="A single LCM tool call every fourth turn, no crash."),
             cell(f"cancel-retry/{m}", [493, 544], in_place=ip, faults=[{"kind": "cancel_then_retry", "turn": 22}],
                  doc="ACP cancel (request_hard_interrupt) during the provider call, then the same prompt re-sent: the "

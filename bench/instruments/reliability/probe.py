@@ -43,7 +43,13 @@ ANCHORS = {  # shape -> (host file, text on the cited line)
     "cron_agent": ("cron/scheduler.py", 'platform="cron"'),
     "cron_close": ("cron/scheduler.py", "agent.close()"),
     "commit_telemetry": ("agent/conversation_compression.py", "context compression attempt telemetry: %s"),
+    "failed_turn_notice": ("agent/turn_failure_copy.py", "FAILED_TURN_NOTICE = ("),
+    "tool_dispatch": ("model_tools.py", "def handle_function_call("),
+    "engine_tool_dispatch": ("agent/tool_executor.py", "agent.context_compressor.handle_tool_call(function_name"),
 }
+# Host modules whose executed file must lie in the verified host tree (import provenance).
+HOST_PREFIXES = ("run_agent", "hermes_state", "hermes_cli", "hermes_constants", "agent", "model_tools", "tools",
+                 "acp_adapter", "gateway", "cron")
 FAULT_CITES = {  # the host code path each fault or scenario relies on; uncitable -> the cell is UNSUPPORTED
     "crash_after_compaction_before_reply": ["user_merge"],
     "crash_mid_tool_call": ["user_merge"],
@@ -63,6 +69,51 @@ LOG_COUNTS = {
     "recorded_replaced": "LCM recorded host-replaced rows",
 }
 FILLER = "alpha beta gamma delta "
+
+
+def provenance(cell, extra=()):
+    """Where every loaded host module (and each cited, not yet loaded one) was executed from; a file outside the
+    verified host tree, or the plugin outside its exported tree, is a violation."""
+    import importlib.util
+    src, tree = Path(cell["host_src"]).resolve(), Path(cell["plugin"]["tree"]).resolve()
+    mods, bad = {}, []
+    names = [n for n in list(sys.modules) if n.split(".")[0] in HOST_PREFIXES or n.startswith("hermes_plugins.")]
+    for name in names + [n for n in extra if n not in sys.modules]:
+        try:
+            origin = getattr(sys.modules.get(name), "__file__", None) or (importlib.util.find_spec(name) or SimpleNamespace(origin=None)).origin
+        except (ImportError, ValueError):
+            origin = None
+        if not origin or origin in ("built-in", "frozen"):
+            continue
+        mine = name == cell["plugin"]["module"] or name.startswith(cell["plugin"]["module"] + ".")
+        path, root = Path(origin).resolve(), tree if mine else src
+        mods[name] = str(path)
+        if root not in path.parents:
+            bad.append(f"{name} -> {path}")
+    exe_ok = Path(sys.executable).absolute() == Path(cell["host_python"]).absolute()
+    if not exe_ok:
+        bad.append(f"sys.executable {sys.executable} != {cell['host_python']}")
+    return {"executable": sys.executable, "version": sys.version.split()[0], "modules": len(mods),
+            "core": {k: mods.get(k) for k in ("run_agent", "hermes_state", "hermes_cli.plugins", "model_tools",
+                                              "agent.context_compressor", "agent.conversation_compression")},
+            "cited": {k: mods.get(k) for k in extra}, "violations": bad[:20]}
+
+
+def check_result(name, args, result):
+    """(ok, detail, chars) for one executed tool call: no error payload, and read_file returned the whole file."""
+    text = result if isinstance(result, str) else json.dumps(result, default=str)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and (data.get("error") or data.get("success") is False):
+        return False, f"error: {str(data.get('error'))[:160]}", len(text)
+    if name == "read_file":
+        path = Path(str((args or {}).get("path", "")))
+        want = len(path.read_text().splitlines()) if path.is_file() else None
+        if not isinstance(data, dict) or data.get("truncated") or want is None or data.get("total_lines") != want:
+            return False, f"read_file result incomplete (total_lines {(data or {}).get('total_lines')} of {want})", len(text)
+    return True, "", len(text)
 
 
 def cite(key):
@@ -121,12 +172,20 @@ def main():
     buf = io.StringIO()
     counters = {"compacted_turns": [], "lcm_tool_calls": 0, "orphan_drops": 0, "native_max": 0, "failed": []}
 
+    lock = threading.Lock()
+
     def event(**ev):
-        tfile.write(json.dumps({"phase": phase, **ev}) + "\n")
-        tfile.flush()
-        os.fsync(tfile.fileno())
+        with lock:
+            tfile.write(json.dumps({"phase": phase, **ev}) + "\n")
+            tfile.flush()
+            os.fsync(tfile.fileno())
+    cited_modules = []
 
     def finish(exit_kind, **extra):
+        if "host_src" in cell:  # import provenance: fail closed on any host module run from outside the host tree
+            out["provenance"] = provenance(cell, cited_modules)
+            if out["provenance"]["violations"] and exit_kind not in ("unsupported", "refused"):
+                exit_kind, extra = "error", {"reason": "import provenance: " + "; ".join(out["provenance"]["violations"][:3])}
         log = buf.getvalue()
         out.update(exit=exit_kind, **extra, counters=counters, compactions_logged=len(re.findall(r"LCM compaction #\d+", log)),
                    log_counts={k: log.count(v) for k, v in LOG_COUNTS.items()}, session_count=session_count())
@@ -160,6 +219,8 @@ def main():
     needed += ["commit_telemetry", "summary_aborted"] if cell.get("native_recovery") else []
     needed += ["acp_compress"] if cell.get("final_compaction_check", True) else []
     needed += ["cron_agent", "cron_close"] if cell.get("cron_every") else []
+    needed += ["tool_dispatch", "engine_tool_dispatch"] if cell.get("tool_plan") else []
+    cited_modules += sorted({ANCHORS[k][0][:-3].replace("/", ".") for k in needed})
     if missing := [k for k in needed if not out["citations"][k]]:
         finish("unsupported", reason=f"host shape not citable at this sha: {missing}")
         return
@@ -180,6 +241,16 @@ def main():
     from hermes_state import SessionDB
     from run_agent import AIAgent
     import agent.context_compressor as host_cc
+    import model_tools
+    if (early := provenance(cell, cited_modules)["violations"]) if "host_src" in cell else None:
+        finish("error", reason="import provenance: " + "; ".join(early[:3]))
+        return
+    try:  # the host's own failed-turn boundary copy: the only assistant row the host may write on its own
+        from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+        notices = [FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE] if out["citations"]["failed_turn_notice"] else []
+    except ImportError:
+        notices = []
+    out["failed_turn_notices"] = notices
     home = Path(os.environ["HERMES_HOME"])
     files = cell_dir / "files"
     files.mkdir(exist_ok=True)
@@ -262,14 +333,40 @@ def main():
         return result
     etype.compress = traced_compress
 
+    depth = threading.local()
+
+    def dispatched(run, name, args, call_id, via):
+        """Record one real host tool execution (outermost hook only) and whether its result is a success."""
+        depth.n = getattr(depth, "n", 0) + 1
+        try:
+            result = run()
+        except BaseException as exc:
+            if depth.n == 1:
+                event(turn=cur["turn"], event="tool_dispatch", tag=f"{cur.get('prefix', 'T')}{cur['turn']:02d}", id=call_id,
+                      name=name, args=args, via=via, ok=False, detail=f"raised {exc!r}"[:200], chars=0)
+            raise
+        finally:
+            depth.n -= 1
+        if depth.n == 0:
+            ok, detail, chars = check_result(name, args, result)
+            event(turn=cur["turn"], event="tool_dispatch", tag=f"{cur.get('prefix', 'T')}{cur['turn']:02d}", id=call_id,
+                  name=name, args=args, via=via, ok=ok, detail=detail, chars=chars)
+        return result
+
     def traced_tool(self, name, args, **kwargs):
         counters["lcm_tool_calls"] += 1
         f = faults.get("crash_mid_tool_call")
         if f and "crash_mid_tool_call" not in fired and cur["turn"] == f["turn"]:
             fire("crash_mid_tool_call", cur["turn"], tool=name)
             finish("crash", next_turn=cur["turn"] + 1, turn=cur["turn"])
-        return orig_tool(self, name, args, **kwargs)
+        return dispatched(lambda: orig_tool(self, name, args, **kwargs), name, args, None, out["citations"]["engine_tool_dispatch"])
     etype.handle_tool_call = traced_tool
+    orig_hfc = model_tools.handle_function_call
+
+    def traced_hfc(*a, **kw):
+        name, args = (a[0] if a else kw.get("function_name")), (a[1] if len(a) > 1 else kw.get("function_args"))
+        return dispatched(lambda: orig_hfc(*a, **kw), name, args, kw.get("tool_call_id"), out["citations"]["tool_dispatch"])
+    model_tools.handle_function_call = traced_hfc
 
     def traced_start(self, session_id, *args, **kwargs):
         rotation = kwargs.get("boundary_reason") == "compression"
@@ -342,6 +439,9 @@ def main():
         tcs = [SimpleNamespace(id=ids[k], type="function", function=SimpleNamespace(
             name=c["name"], arguments=json.dumps(c.get("args", {})).replace("{files}", str(files))))
             for k, c in enumerate(calls or [])] or None
+        for k, tc in enumerate(tcs or []):  # the planned call, independent of what the host does with it
+            event(turn=t, event="tool_issue", tag=key.rsplit("_", 1)[0], id=tc.id, name=tc.function.name,
+                  args=json.loads(tc.function.arguments), expect=(calls[k].get("expect") or {}))
         msg = SimpleNamespace(content="" if tcs else content, tool_calls=tcs)
         r = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="tool_calls" if tcs else "stop")],
                             model="test/model")
@@ -360,7 +460,12 @@ def main():
                 fire("crash_after_compaction_before_reply", t)
                 finish("crash", next_turn=t + 1, turn=t)
             step, cur["step"] = cur["step"], cur["step"] + 1
-            cur["seen"] |= {m.get("tool_call_id") for m in kw.get("messages") or [] if m.get("role") == "tool"} & cur["issued"]
+            for m in kw.get("messages") or []:  # a tool result as the model receives it (post host transform)
+                cid = m.get("tool_call_id") if m.get("role") == "tool" else None
+                if cid in cur["issued"] and cid not in cur["seen"]:
+                    cur["seen"].add(cid)
+                    body = m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content"))
+                    event(turn=t, event="tool_seen", id=cid, sha=hashlib.sha256(body.encode()).hexdigest(), chars=len(body))
             sent = sum(len(str(m.get("content") or "")) for m in kw.get("messages") or []) // 4 + 800
             usage = int((sent if asst.get("real_usage") else est) * float(asst.get("usage_scale", 1.0)))
             if cancel and step == 0:  # the ACP cancel lands while the provider call is in flight
@@ -373,6 +478,9 @@ def main():
                 for c in groups[step]:
                     event(turn=t, event="tool_call", name=c["name"], session_prefix=prefix)
                 return response("", usage, groups[step], t, f"{prefix}{t:02d}_{step}")
+            # the scripted reply the provider RETURNED for this attempt (tagged at call time: a cancelled call may
+            # return after the host moved on), independent of what the host keeps
+            event(turn=t, event="emit", tag=f"{prefix}{t:02d}", text=reply_text(prefix, t))
             return response(reply_text(prefix, t), usage)
         ag.client.chat.completions.create.side_effect = provider
 
@@ -394,10 +502,9 @@ def main():
             return None, False, [], tags, []
         after = msgs[idx[-1] + 1:]
         reply = reply_text(prefix, t)
-        # Assistant rows the host itself wrote after the prompt (agent/turn_failure_copy.py: an interrupted
-        # turn's "Your request was not processed" row) are held rows too.
+        # Only the host's own cited failed-turn boundary copy (agent/turn_failure_copy.py) may appear unscripted.
         own = [m["content"] for m in after if m.get("role") == "assistant" and isinstance(m.get("content"), str)
-               and m["content"].strip() and m["content"] != reply and not m.get("tool_calls")]
+               and m["content"].strip() in notices]
         return (msgs[idx[-1]]["content"], any(m.get("role") == "assistant" and m.get("content") == reply for m in after),
                 [m for m in after if m.get("role") == "tool"], tags, own)
 
@@ -425,7 +532,7 @@ def main():
         event(turn=t, event="turn_end", tag=f"{prefix}{t:02d}", session_prefix=prefix, kind=kind,
               **({"held_same": True} if held == persist else {"held": held}),
               reply=reply_text(prefix, t) if reply_held else None, failed=failed, native_attempts=cur["native"],
-              interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags, host_replies=host_replies,
+              interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags, host_notices=host_replies,
               tools_planned=len(cur["issued"]), tools_answered=len(cur["seen"]),
               host_commits=buf.getvalue().count(COMMITTED) - cur["commits0"])
         return result

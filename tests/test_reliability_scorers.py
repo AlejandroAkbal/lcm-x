@@ -5,6 +5,7 @@ db/lcm.db) built here.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -15,7 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bench.instruments.reliability import cells, hosts, plugin_tree, probe  # noqa: E402
+from bench.instruments.reliability import cells, controls, hosts, plugin_tree, probe  # noqa: E402
 from bench.instruments.reliability.scorers import bars, dupes, multiset  # noqa: E402
 
 U = "[T{:02d}] user turn {}: alpha beta end."
@@ -25,8 +26,34 @@ R = "reply to T{:02d}: noted item {}."
 def turn_events(t, *, reply=True, held=None, tags=None):
     text = U.format(t, t)
     return [{"phase": "A", "turn": t, "event": "user_sent", "tag": f"T{t:02d}", "content": text, "persist": text},
+            {"phase": "A", "turn": t, "event": "emit", "tag": f"T{t:02d}", "text": R.format(t, t)},
             {"phase": "A", "turn": t, "event": "turn_end", "tag": f"T{t:02d}", "held": held or text,
              "reply": R.format(t, t) if reply else None, "user_tags": tags or {f"T{t:02d}": 1}}]
+
+
+PLAN = [("read_file", {"path": "p"}), ("lcm_expand", {"store_id": 1})]
+
+
+def tool_turn(t, calls=PLAN, results=("r0", "r1"), **dispatch):
+    """Probe events + stored rows for turn t, whose first step issues ``calls`` that the host ran for real."""
+    ids = [f"call_T{t:02d}_0_{k}" for k in range(len(calls))]
+    ev = [{"phase": "A", "turn": t, "event": "tool_issue", "tag": f"T{t:02d}", "id": i, "name": n, "args": a, "expect": {}}
+          for i, (n, a) in zip(ids, calls)]
+    ev += [{"phase": "A", "turn": t, "event": "tool_dispatch", "tag": f"T{t:02d}", "id": i, "name": n, "args": a, "ok": True,
+            "chars": len(r), **dispatch} for i, (n, a), r in zip(ids, calls, results)]
+    ev += [{"phase": "A", "turn": t, "event": "tool_seen", "id": i, "sha": hashlib.sha256(r.encode()).hexdigest()}
+           for i, r in zip(ids, results)]
+    call_row = ("assistant", "", json.dumps([{"id": i, "function": {"name": n, "arguments": json.dumps(a)}}
+                                             for i, (n, a) in zip(ids, calls)]))
+    return ev, [call_row] + [("tool", r, None, i) for i, r in zip(ids, results)]
+
+
+def tool_cell(**dispatch):
+    ev, rows = tool_turn(1, **dispatch)
+    events = clean_events()
+    events[1:1] = ev  # between T01's user_sent and its emit/turn_end
+    return events, clean_rows(1) + rows + clean_rows(3)[2:], {"tool_plan": [{"turns": [1], "calls": [
+        {"name": n, "args": a} for n, a in PLAN]}]}
 
 
 def make(tmp_path, *, rows, events, nodes=(), phase=None, sids=None, parents=None, **cell_kw):
@@ -84,8 +111,8 @@ def test_b1_b2_duplicate_user_row_fails(tmp_path):
 def test_b2_catches_identical_reply_surplus_that_tags_cannot(tmp_path):
     events = clean_events()
     for e in events:
-        if e["event"] == "turn_end":
-            e["reply"] = "same reply."
+        if e["event"] == "emit":
+            e["text"] = "same reply."
     rows = [r if r[0] == "user" else ("assistant", "same reply.") for r in clean_rows()] + [("assistant", "same reply.")]
     out = make(tmp_path, rows=rows, events=events)
     assert set(out["failed_bars"]) == {"B2"}
@@ -137,12 +164,12 @@ def test_b5_growth_minimum_and_log_parity(tmp_path):
 def test_b6_split_group_and_orphans(tmp_path):
     calls = json.dumps([{"id": "c1"}, {"id": "c2"}])
     rows = clean_rows(1) + [("assistant", "", calls), ("tool", "a", None, "c1"), ("tool", "b", None, "c2")] + clean_rows(3)[2:]
-    kw = {"tool_plan": [{"turns": [1], "calls": []}]}
-    whole = make(tmp_path, rows=rows, events=clean_events(), nodes=[[1, 2, 3, 4, 5]], **kw)
+    events, rows, kw = tool_cell()
+    whole = make(tmp_path, rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], **kw)
     assert whole["verdict"] == "PASS", whole["failed_bars"]
-    split = make(tmp_path / "s", rows=rows, events=clean_events(), nodes=[[1, 2, 3, 4]], **kw)
+    split = make(tmp_path / "s", rows=rows, events=events, nodes=[[1, 2, 3, 4]], **kw)
     assert split["failed_bars"]["B6"]["split_groups"] == 1
-    orphan = make(tmp_path / "o", rows=rows, events=clean_events(), phase={"counters": {"failed": [], "orphan_drops": 1}}, **kw)
+    orphan = make(tmp_path / "o", rows=rows, events=events, phase={"counters": {"failed": [], "orphan_drops": 1}}, **kw)
     assert orphan["failed_bars"]["B6"]["host_orphan_drops"] == 1
 
 
@@ -196,33 +223,62 @@ def test_f2_native_pass_needs_its_own_host_commit(tmp_path):
 
 
 def test_f3_unproven_scenarios_are_unsupported(tmp_path):
-    events = clean_events()
-    events[1].update(tools_planned=2, tools_answered=1)
-    calls = json.dumps([{"id": "c1"}, {"id": "c2"}])
-    rows = clean_rows(1) + [("assistant", "", calls), ("tool", "a", None, "c1"), ("tool", "b", None, "c2")] + clean_rows(3)[2:]
-    plan = {"tool_plan": [{"turns": [1], "calls": [{"name": "x"}, {"name": "y"}]}]}
-    short = make(tmp_path, rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], **plan)
-    assert short["verdict"] == "UNSUPPORTED" and "results seen 1" in short["reason"]
-    events[1].update(tools_answered=2)
-    assert make(tmp_path / "ok", rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], **plan)["verdict"] == "PASS"
-    no_groups = make(tmp_path / "g", rows=clean_rows(), events=events, **plan)
+    events, rows, plan = tool_cell()
+    undispatched = [e for e in events if not (e["event"] == "tool_dispatch" and e["name"] == "lcm_expand")]
+    short = make(tmp_path, rows=rows, events=undispatched, nodes=[[1, 2, 3, 4, 5]], **plan)
+    assert short["verdict"] == "UNSUPPORTED" and "never dispatched" in short["reason"]
+    no_emit = make(tmp_path / "e", rows=clean_rows(), events=[e for e in clean_events() if e["event"] != "emit" or e["tag"] != "T02"])
+    assert no_emit["verdict"] == "UNSUPPORTED" and "never returned its scripted reply" in no_emit["reason"]
+    no_groups = make(tmp_path / "g", rows=clean_rows(), events=clean_events(), **plan)
     assert no_groups["verdict"] == "UNSUPPORTED" and "no tool-call group" in no_groups["reason"]
     no_native = make(tmp_path / "n", rows=clean_rows(), events=clean_events(), native_recovery=True)
     assert no_native["verdict"] == "UNSUPPORTED" and "zero native" in no_native["reason"]
 
 
-def test_host_written_assistant_row_is_held_not_surplus(tmp_path):
-    notice = "Your request was not processed. Send it again if you still want me to carry it out."
-    rows = clean_rows() + [("assistant", notice)]
-    assert "B2" in make(tmp_path, rows=rows, events=clean_events())["failed_bars"]
+NOTICE = "Your request was not processed. Send it again if you still want me to carry it out."
+
+
+def test_r13_only_the_cited_notice_on_an_interrupted_attempt_is_held(tmp_path):
+    rows = clean_rows() + [("assistant", NOTICE)]
+    cited = {"failed_turn_notices": [NOTICE]}
+    assert "B2" in make(tmp_path, rows=rows, events=clean_events(), phase=cited)["failed_bars"]
     events = clean_events()
-    events[-1]["host_replies"] = [notice]  # the host appended its own interrupted-turn row after T03
-    assert make(tmp_path / "h", rows=rows, events=events)["verdict"] == "PASS"
+    events[-1].update(host_notices=[NOTICE], interrupted=True)
+    assert make(tmp_path / "h", rows=rows, events=events, phase=cited)["verdict"] == "PASS"
+    events[-1]["interrupted"] = False  # the same row on an attempt the host did not interrupt
+    assert "B2" in make(tmp_path / "n", rows=rows, events=events, phase=cited)["failed_bars"]
+    other = rows[:-1] + [("assistant", "an arbitrary replayed assistant row")]
+    events[-1].update(host_notices=["an arbitrary replayed assistant row"], interrupted=True)
+    assert "B2" in make(tmp_path / "a", rows=other, events=events, phase=cited)["failed_bars"]
+
+
+def test_r13_a_reply_the_host_dropped_is_a_deficit(tmp_path):
+    events = clean_events()
+    for e in events:
+        if e["event"] == "turn_end":
+            e["reply"] = None  # the host result no longer holds the reply the provider returned
+    out = make(tmp_path, rows=[r for r in clean_rows() if r[0] == "user"], events=events)
+    assert out["numbers"]["B2"]["deficit_rows"] == 3 and {"B1", "B2"} <= set(out["failed_bars"])
+
+
+def test_r13_tools_bind_to_real_dispatch_and_durable_rows(tmp_path):
+    events, rows, plan = tool_cell()
+    assert make(tmp_path, rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], **plan)["verdict"] == "PASS"
+    wrong, _r, _p = tool_cell(name="write_file")
+    assert "planned read_file but the host ran write_file" in make(tmp_path / "w", rows=rows, events=wrong,
+                                                                     nodes=[[1, 2, 3, 4, 5]], **plan)["failed_bars"]["B6"]["tool_failures"][0]
+    bad, _r, _p = tool_cell(ok=False, detail="error: boom")
+    assert "B6" in make(tmp_path / "f", rows=rows, events=bad, nodes=[[1, 2, 3, 4, 5]], **plan)["failed_bars"]
+    lost = make(tmp_path / "l", rows=[r for r in rows if r[0] != "tool" or r[1] != "r1"], events=events, **plan)
+    assert lost["numbers"]["B2"]["tool_missing_rows"] == 1 and "B2" in lost["failed_bars"]
+    extra = list(events)
+    extra.insert(5, dict(events[3], id=None, name="todo", args={}))  # an unplanned real dispatch in T01
+    assert "unplanned host dispatch" in str(make(tmp_path / "u", rows=rows, events=extra, nodes=[[1, 2, 3, 4, 5]], **plan)["failed_bars"])
 
 
 def test_f3_continue_rows_are_position_bound(tmp_path):
     events = clean_events(3)
-    events[2]["content"] = events[2]["persist"] = events[3]["held"] = "continue"
+    events[3]["content"] = events[3]["persist"] = events[5]["held"] = "continue"
     rows = [("user", U.format(1, 1)), ("assistant", R.format(1, 1)), ("user", "continue"), ("assistant", R.format(2, 2)),
             ("user", U.format(3, 3)), ("assistant", R.format(3, 3))]
     assert make(tmp_path, rows=rows, events=events)["verdict"] == "PASS"
@@ -237,6 +293,7 @@ def test_f4_rows_are_scored_per_session_lineage(tmp_path):
         {"phase": "A", "turn": 1, "event": "user_sent", "tag": "K01", "session_prefix": "K", "content": k, "persist": k},
         {"phase": "A", "turn": 1, "event": "turn_end", "tag": "K01", "session_prefix": "K", "held": k,
          "reply": "reply to K01: noted item 1.", "user_tags": {"K01": 1}, "session": "cron_job_01"}]
+    events.insert(-1, {"phase": "A", "turn": 1, "event": "emit", "tag": "K01", "text": "reply to K01: noted item 1."})
     rows = clean_rows(2) + [("user", k), ("assistant", "reply to K01: noted item 1.")]
     right = ["S0", "S0", "child", "child", "cron_job_01", "cron_job_01"]  # turn 2 after a rotation to "child"
     ok = make(tmp_path, rows=rows, events=events, sids=right, parents={"S0": None, "child": "S0", "cron_job_01": None})
@@ -329,6 +386,35 @@ def test_f6_final_check_never_falls_back_from_the_selected_api(monkeypatch):
     out = probe.final_check(agent, [], probe.io.StringIO())
     assert out["outcome"] == "failed" and "failure inside" in out["exception"]
     assert out["entry"] == "compress_now" and not fallback and len(out["attempts"]) == 1
+
+
+def test_r13_import_provenance_fails_closed_outside_the_host_tree(tmp_path, monkeypatch):
+    src, tree, elsewhere = tmp_path / "src", tmp_path / "tree", tmp_path / "site-packages"
+    for d in (src, tree, elsewhere):
+        d.mkdir()
+    cell = {"host_src": str(src), "host_python": sys.executable, "plugin": {"tree": str(tree), "module": "hermes_plugins.x"}}
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(__file__=str(elsewhere / "run_agent.py")))
+    monkeypatch.setitem(sys.modules, "hermes_state", types.SimpleNamespace(__file__=str(src / "hermes_state.py")))
+    monkeypatch.setitem(sys.modules, "hermes_plugins.x", types.SimpleNamespace(__file__=str(src / "x.py")))
+    bad = probe.provenance(cell)["violations"]
+    assert any(v.startswith("run_agent ->") for v in bad) and any(v.startswith("hermes_plugins.x ->") for v in bad)
+    assert not any(v.startswith("hermes_state ->") for v in bad)
+    assert "sys.executable" in " ".join(probe.provenance({**cell, "host_python": "/nonexistent/python"})["violations"])
+
+
+def test_d7_pc1_is_a_differential_encoded_as_data():
+    pc1 = controls.CONTROLS["PC-1"]
+    assert pc1["refs"] == ["47bd28e7", "ae1fb16d"]
+    exp = pc1["expect"]
+    assert exp[("47bd28e7", "baseline/in-place/acp")] == exp[("ae1fb16d", "baseline/in-place/acp")] == "PASS"
+    assert exp[("47bd28e7", "acp-trailing/in-place")] == "FAIL" != exp[("ae1fb16d", "acp-trailing/in-place")]
+
+    def rows(old_baseline):
+        return [{"plugin_ref": ref, "cell": c, "host": h, "verdict": exp[(ref, c)] if (ref, c) != ("47bd28e7", "baseline/in-place/acp")
+                 else old_baseline} for ref in pc1["refs"] for c in pc1["cells"] for h in pc1["hosts"]]
+    assert controls.check("PC-1", rows("PASS")) == []
+    # round 1's PC-1 shape: the old tree fails the baseline too, so the red is not attributable to the transform
+    assert len(controls.check("PC-1", rows("FAIL"))) == len(pc1["hosts"])
 
 
 def test_plugin_identity_is_read_from_the_tree(tmp_path):

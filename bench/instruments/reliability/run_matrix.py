@@ -21,7 +21,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
-from bench.instruments.reliability import cells as C, hosts as H, plugin_tree, report  # noqa: E402
+from bench.instruments.reliability import cells as C, controls as CT, hosts as H, plugin_tree, report  # noqa: E402
 from bench.instruments.reliability.scorers import bars  # noqa: E402
 
 PROBE = Path(__file__).with_name("probe.py")
@@ -81,7 +81,8 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     (d / "db").mkdir()
     (home / "plugins" / plugin["dir"]).symlink_to(plugin["tree"])
     (home / "config.yaml").write_text(config_yaml(cell, plugin))
-    (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name}, indent=1))
+    (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name, "host_src": host["src"],
+                                             "host_python": host["python"]}, indent=1))
     env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
            "OPENROUTER_API_KEY": "test-key", "TMPDIR": str(d / "home"),
            **cell["lcm_env"], "LCM_NATIVE_RECOVERY": "true" if cell["native_recovery"] else "false"}
@@ -148,10 +149,11 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hosts-file")
-    ap.add_argument("--hosts", required=True, help="comma-separated host names, or 'all'")
-    ap.add_argument("--plugin-ref", required=True, help="comma-separated lcm-x git refs")
+    ap.add_argument("--control", choices=sorted(CT.CONTROLS), help="run a positive control and check its pattern")
+    ap.add_argument("--hosts", help="comma-separated host names, or 'all'")
+    ap.add_argument("--plugin-ref", help="comma-separated lcm-x git refs")
     ap.add_argument("--lcm-repo", default=str(REPO))
-    ap.add_argument("--cells", required=True, help="'all' or comma-separated globs")
+    ap.add_argument("--cells", help="'all' or comma-separated globs")
     ap.add_argument("--jobs", type=int, default=min(8, max(1, (os.cpu_count() or 4) - 2)))
     ap.add_argument("--timeout", type=int, default=900, help="per-phase timeout, seconds")
     ap.add_argument("--out", required=True)
@@ -160,6 +162,12 @@ def main(argv=None) -> int:
     ap.add_argument("--lcm-env", action="append", default=[], metavar="KEY=VAL",
                     help="LCM_* override applied to every cell (repeatable)")
     a = ap.parse_args(argv)
+    if a.control:
+        ctl = CT.CONTROLS[a.control]
+        a.hosts = ",".join(ctl["hosts"]) if ctl["hosts"] != "all" else "all"
+        a.plugin_ref, a.cells = ",".join(ctl["refs"]), ",".join(ctl["cells"])
+    if not (a.hosts and a.plugin_ref and a.cells):
+        ap.error("--hosts, --plugin-ref and --cells are required without --control")
     out = Path(a.out).resolve()
     if str(out) == "/tmp" or str(out).startswith(("/tmp/", "/private/tmp")):
         ap.error("--out must not be under /tmp")
@@ -198,6 +206,11 @@ def main(argv=None) -> int:
                   + (f"  {sorted(rec.get('failed_bars', {}))}" if rec.get("failed_bars") else "")
                   + (f"  {str(rec.get('reason'))[:120]}" if rec.get("reason") else ""), flush=True)
     report.write(out, results, time.time() - started, lcm_env)
+    if a.control:
+        problems = CT.check(a.control, results)
+        (out / "CONTROL.json").write_text(json.dumps({"control": a.control, "holds": not problems, "problems": problems}, indent=1))
+        print(f"CONTROL {a.control}: {'HOLDS' if not problems else 'DOES NOT HOLD'} {problems[:5]}", flush=True)
+        return 0 if not problems else 1
     return 0
 
 

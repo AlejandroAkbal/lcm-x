@@ -19,7 +19,7 @@ import sqlite3
 from collections import Counter
 from pathlib import Path
 
-from . import multiset, summary, tool_groups
+from . import multiset, summary, tool_calls, tool_groups
 
 ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
 
@@ -31,18 +31,28 @@ def load(cell_dir: Path):
 
 
 def attempts(events: list[dict]) -> list[dict]:
-    out, open_ = [], {}
+    """Attempts with what the host held (user row, notices) and, independently, what the provider emitted and
+    which tools the host really ran."""
+    out, open_, last = [], {}, None
     for e in events:
         if e["event"] in ("user_sent", "retry"):
             a = {"tag": e["tag"], "prefix": e.get("session_prefix", "T"), "content": e["content"],
                  "persist": e["persist"] if e.get("persist") is not None else e["content"],
-                 "held": None, "reply": None, "user_tags": {}, "ended": False, "turn": e.get("turn"), "host_replies": []}
+                 "held": None, "reply": None, "user_tags": {}, "ended": False, "turn": e.get("turn"), "notices": [],
+                 "emitted": [], "tool_issues": [], "tool_dispatch": [], "tool_seen": []}
             out.append(a)
-            open_[e["tag"]] = a
+            open_[e["tag"]] = last = a
+        elif e["event"] == "emit" and e.get("tag") in open_:
+            open_[e["tag"]]["emitted"].append(e["text"])
+        elif e["event"] in ("tool_issue", "tool_dispatch") and e.get("tag") in open_:
+            open_[e["tag"]][e["event"] if e["event"] == "tool_dispatch" else "tool_issues"].append(e)
+        elif e["event"] == "tool_seen" and last is not None and not last["ended"]:
+            last["tool_seen"].append(e)
         elif e["event"] == "turn_end" and e["tag"] in open_:
             a = open_.pop(e["tag"])
-            a.update(held=a["persist"] if e.get("held_same") else e.get("held"), reply=e.get("reply"), user_tags=e.get("user_tags") or {},
-                     ended=True, end=e, host_replies=e.get("host_replies") or [])
+            a.update(held=a["persist"] if e.get("held_same") else e.get("held"), user_tags=e.get("user_tags") or {},
+                     ended=True, end=e, notices=e.get("host_notices") or [])
+            a["reply"] = a["emitted"][-1] if tool_calls.completed(a) and a["emitted"] else None
     return out
 
 
@@ -80,18 +90,17 @@ def continue_positions(seq: list[tuple[str, str]], reply_pat: str) -> Counter:
     return out
 
 
-def scenario_gaps(cell: dict, events: list[dict], atts: list[dict], tg: dict) -> list[str]:
+def scenario_gaps(cell: dict, events: list[dict], atts: list[dict], tg: dict, bound: dict) -> list[str]:
     """What the cell was meant to exercise and did not: each gap makes the cell UNSUPPORTED."""
-    gaps = []
+    gaps = [f"{a['tag']}: completed but the provider never returned its scripted reply" for a in atts
+            if tool_calls.completed(a) and not a["emitted"]] + bound["gaps"]
     if cell.get("tool_plan"):
         for a in atts:
-            end = a.get("end") or {}
-            if a["prefix"] != "T" or not a["ended"] or end.get("failed") or end.get("kind") == "cancel":
+            if a["prefix"] != "T" or not tool_calls.completed(a):
                 continue
             want = sum(len(g["calls"]) for g in cell["tool_plan"] if isinstance(g["turns"], list) and a["turn"] in g["turns"])
-            planned, answered = end.get("tools_planned", 0), end.get("tools_answered", 0)
-            if (want and planned != want) or answered != planned:
-                gaps.append(f"{a['tag']}: tool calls expected {want}, dispatched {planned}, results seen {answered}")
+            if want and len(a["tool_issues"]) != want:
+                gaps.append(f"{a['tag']}: {want} tool calls planned, {len(a['tool_issues'])} issued")
         if "B6" in (cell.get("bars") or ALL_BARS) and not tg["groups"]:
             gaps.append("B6: no tool-call group was stored, so the split check had nothing to check")
     if cell.get("native_recovery"):
@@ -102,7 +111,9 @@ def scenario_gaps(cell: dict, events: list[dict], atts: list[dict], tg: dict) ->
     return gaps
 
 
-def expected_items(atts: list[dict]) -> list[tuple[str, str]]:
+def expected_items(atts: list[dict], notices=()) -> list[tuple[str, str]]:
+    """Held user rows; exactly one scripted reply per completed non-cancel attempt (from the provider log, so a
+    reply the host dropped is a deficit); the host's cited failed-turn copy only on a verified interrupted attempt."""
     items = []
     for i, a in enumerate(atts):
         text = a["held"] if a["held"] is not None else a["persist"]
@@ -115,7 +126,8 @@ def expected_items(atts: list[dict]) -> list[tuple[str, str]]:
             items.append(("user", text))
         if a["reply"]:
             items.append(("assistant", a["reply"]))
-        items += [("assistant", x) for x in a["host_replies"]]
+        if (a.get("end") or {}).get("interrupted"):
+            items += [("assistant", x) for x in a["notices"] if x.strip() in notices]
     return items
 
 
@@ -132,13 +144,16 @@ def score(cell: dict, cell_dir: Path) -> dict:
     db = cell_dir / "db" / "lcm.db"
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        stored = con.execute("select store_id, session_id, role, content from messages order by store_id").fetchall()
+        full = con.execute("select store_id, session_id, role, content, tool_calls, tool_call_id from messages"
+                           " order by store_id").fetchall()
+        stored = [r[:4] for r in full]
     finally:
         con.close()
     atts = attempts(events)
     group = lineage(cell_dir)
     groups = sorted({attempt_group(a, group) for a in atts} | {group(sid) for _s, sid, _r, _c in stored})
-    per = {g: (expected_items([a for a in atts if attempt_group(a, group) == g]),
+    notices = {x for p in phases for x in p.get("failed_turn_notices") or []}
+    per = {g: (expected_items([a for a in atts if attempt_group(a, group) == g], notices),
                [r for r in stored if group(r[1]) == g]) for g in groups}
     applicable = [b for b in cell.get("bars") or ALL_BARS
                   if (b != "B6" or cell.get("tool_plan")) and (b != "B7" or cell.get("native_recovery"))
@@ -172,6 +187,11 @@ def score(cell: dict, cell_dir: Path) -> dict:
             "stored_rows_not_expected", "split_keys")
     numbers["B2"] = {k: sum(m[k] for m in b2_parts.values()) for k in keys}
     numbers["B2"]["per_session"] = {g: m["verdict"] for g, m in b2_parts.items()}
+    bound = tool_calls.bind(atts)
+    tools = tool_calls.compare(bound["expected"], bound["loose"], tool_calls.stored_keys(full))
+    numbers["B2"].update(tools)
+    if tools["tool_missing_rows"] or tools["tool_surplus_rows"]:
+        failed["B2"] = dict(numbers["B2"])
     if any(m["verdict"] != "PASS" for m in b2_parts.values()):
         bad = {g: m for g, m in b2_parts.items() if m["verdict"] != "PASS"}
         failed["B2"] = {**numbers["B2"], "missing": [dict(e, session=g) for g, m in bad.items() for e in m["missing"]][:5],
@@ -201,8 +221,9 @@ def score(cell: dict, cell_dir: Path) -> dict:
                   for p in phases)
     numbers["B6"] = {"groups": tg["groups"], "split_groups": tg["split_groups"], "host_orphan_drops": orphans,
                      "tool_results": sum(1 for e in events if e["event"] == "tool_result")}
-    if tg["split_groups"] or orphans:
-        failed["B6"] = {**numbers["B6"], "splits": tg["splits"][:3]}
+    numbers["B6"]["tool_execution_failures"] = len(bound["failures"])
+    if tg["split_groups"] or orphans or bound["failures"]:
+        failed["B6"] = {**numbers["B6"], "splits": tg["splits"][:3], "tool_failures": bound["failures"][:5]}
     native = {"native_unusable": sum(p.get("log_counts", {}).get("native_unusable", 0) for p in phases),
               "summary_generation_aborted": sum(p.get("log_counts", {}).get("summary_generation_aborted", 0) for p in phases),
               "max_native_attempts_per_turn": max((p.get("counters", {}).get("native_max", 0) for p in phases), default=0)}
@@ -219,7 +240,7 @@ def score(cell: dict, cell_dir: Path) -> dict:
     inconclusive = {b: v for b, v in inconclusive.items() if b in applicable}
     numbers["diagnostic"]["native_rejections"] = dict(Counter(e.get("rejection") for e in events
                                                               if e["event"] == "compaction" and e.get("rejection")))
-    gaps = scenario_gaps(cell, events, atts, tg)
+    gaps = scenario_gaps(cell, events, atts, tg, bound)
     if gaps:
         return {"verdict": "UNSUPPORTED", "reason": "scenario not proven: " + "; ".join(gaps[:5]),
                 "applicable_bars": applicable, "failed_bars": failed, "inconclusive_bars": inconclusive, "numbers": numbers}
