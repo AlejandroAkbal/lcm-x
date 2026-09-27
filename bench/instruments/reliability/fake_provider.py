@@ -30,6 +30,9 @@ TAG = re.compile(r"\[([A-Z]\d\d)\] user")
 NONCE = re.compile(r'<lcm-summary nonce="([0-9a-f]+)">')
 
 
+ROLES = ("main", "lcm-summary", "aux", "aux-title")
+
+
 def role_of(model: str) -> str:
     return (model or "").rsplit("/", 1)[-1]
 
@@ -91,22 +94,33 @@ class FakeProvider:
                 pass
 
             def do_GET(self):
-                if self.path.rstrip("/").endswith("/models"):
+                if self.path.split("?")[0].rstrip("/").endswith("/models"):
+                    provider.log(rid=provider.next_rid(), ts=time.time(), method="GET", path=self.path, route="models")
                     # context_length: a /models key the host reads (agent/model_metadata.py); 1M >= every cell window,
                     # so the host never auto-lowers the main threshold to an unknown aux model's default window.
                     data = [{"id": f"rel/{r}", "object": "model", "owned_by": "rel", "context_length": 1_000_000}
-                            for r in ("main", "lcm-summary", "aux", "aux-title")]
+                            for r in ROLES]
                     return self.send_json(200, {"object": "list", "data": data})
-                self.send_json(404, {"error": {"message": f"no route {self.path}"}})
+                model = self.path.split("?")[0].partition("/models/")[2]
+                if role_of(model) in ROLES:  # a known role's retrieve-model read: logged, answered 404 as it always was
+                    provider.log(rid=provider.next_rid(), ts=time.time(), method="GET", path=self.path, route="models",
+                                 status=404)
+                    return self.send_json(404, {"error": {"message": f"no model detail for {model}"}})
+                self.unrouted()
 
             def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
                 path = self.path.split("?")[0].rstrip("/")
-                if path.endswith("/chat/completions"):
-                    return provider.serve(self, body, "openai")
-                if path.endswith("/messages"):
-                    return provider.serve(self, body, "anthropic")
-                self.send_json(404, {"error": {"message": f"no route {self.path}"}})
+                if not path.endswith(("/chat/completions", "/messages")):
+                    return self.unrouted()
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                return provider.serve(self, body, "openai" if path.endswith("/chat/completions") else "anthropic")
+
+            def unrouted(self):
+                """Every other method/path is logged (the accounting makes it an ERROR) and refused."""
+                provider.log(rid=provider.next_rid(), ts=time.time(), method=self.command, path=self.path, route="unrouted")
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_json(404, {"error": {"message": f"no route {self.command} {self.path}"}})
+            do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = unrouted
 
             def send_json(self, status, payload):
                 raw = json.dumps(payload).encode()
@@ -133,6 +147,11 @@ class FakeProvider:
         self.server.shutdown()
         self.server.server_close()
 
+    def next_rid(self) -> int:
+        with self.lock:
+            self.n_requests += 1
+            return self.n_requests
+
     def log(self, **rec) -> None:
         with self.lock, open(self.log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -155,10 +174,8 @@ class FakeProvider:
         messages = normalize(body, api)
         role, stream = role_of(body.get("model", "")), bool(body.get("stream"))
         blob = json.dumps(messages, sort_keys=True).encode()
-        with self.lock:
-            self.n_requests += 1
-            rid = self.n_requests
-        rec = {"rid": rid, "ts": time.time(), "api": api, "role": role, "model": body.get("model"), "stream": stream,
+        rec = {"rid": self.next_rid(), "ts": time.time(), "method": "POST", "path": h.path, "route": "completion",
+               "api": api, "role": role, "model": body.get("model"), "stream": stream,
                "messages_sha256": hashlib.sha256(blob).hexdigest(), "messages": len(messages),
                "token_estimate": usage_for(messages, 1.0)}
         if role == "main":

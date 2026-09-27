@@ -71,8 +71,31 @@ def test_roles_route_by_model_and_usage_is_computed_from_received_messages(provi
     con.request("GET", "/v1/models")
     assert {m["id"] for m in json.loads(con.getresponse().read())["data"]} >= {"rel/main", "rel/lcm-summary"}
     log = [json.loads(x) for x in (provider.log_path).read_text().splitlines()]
-    assert [r["role"] for r in log] == ["main", "lcm-summary", "aux", "nope"] and len({r["rid"] for r in log}) == 4
-    assert all(len(r["messages_sha256"]) == 64 for r in log)
+    assert [r.get("role", r["route"]) for r in log] == ["main", "lcm-summary", "aux", "nope", "models"]
+    assert len({r["rid"] for r in log}) == 5 and all(len(r["messages_sha256"]) == 64 for r in log[:4])
+
+
+def test_every_request_is_logged_and_an_unrouted_request_fails_accounting(provider):
+    """Regression (R2a review): GET /v1/models and unknown routes bypassed the log, so accounting passed on an
+    incomplete request set."""
+    post(provider, "/v1/chat/completions", {"model": "rel/main", "messages": MSGS})
+    con = http.client.HTTPConnection("127.0.0.1", provider.port, timeout=10)
+    con.request("GET", "/v1/models")
+    con.getresponse().read()
+    d, emit = provider.log_path.parent, [{"phase": "A", "event": "emit"}]
+    (d / "provider-requests.jsonl").write_text(provider.log_path.read_text())
+    acct = PC.accounting(d, emit)
+    assert acct["ok"] and acct["requests_by_route"] == {"completion": 1, "models": 1}
+    for method, path in (("GET", "/v1/models/rel/aux"), ("GET", "/v1/files"), ("POST", "/v1/embeddings")):
+        con.request(method, path, "{}" if method == "POST" else None)
+        resp = con.getresponse()
+        assert resp.read() and resp.status == 404
+    (d / "provider-requests.jsonl").write_text(provider.log_path.read_text())
+    log = [json.loads(x) for x in provider.log_path.read_text().splitlines()]
+    assert [(r["method"], r["path"]) for r in log[1:]] == [("GET", "/v1/models"), ("GET", "/v1/models/rel/aux"),
+                                                           ("GET", "/v1/files"), ("POST", "/v1/embeddings")]
+    acct = PC.accounting(d, emit)
+    assert not acct["ok"] and [u["path"] for u in acct["unexpected_requests"]] == ["/v1/files", "/v1/embeddings"]
 
 
 def test_openai_sse_framing_text_tools_usage_and_done(provider):
@@ -233,8 +256,10 @@ def test_process_cells_are_selected_or_unsupported_and_config_is_localhost_only(
 
 
 def test_accounting_matches_requests_to_scripted_steps(tmp_path):
-    reqs = [{"rid": 1, "role": "main", "reply": {}}, {"rid": 2, "role": "main", "phase": "held", "fault": "hold_until_killed"},
+    reqs = [{"rid": 1, "role": "main", "reply": {}, "kind": "normal"},  # "kind" = the scenario's turn kind
+            {"rid": 2, "role": "main", "phase": "held", "fault": "hold_until_killed"},
             {"rid": 2, "role": "main", "phase": "client_closed"}, {"rid": 3, "role": "lcm-summary", "reply": {}}]
+    reqs = [{**r, "route": "completion"} for r in reqs]
     (tmp_path / "provider-requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
     events = [{"phase": "A", "event": "emit"}, {"phase": "A", "event": "crash", "fault": "crash_after_compaction_before_reply"}]
     acct = PC.accounting(tmp_path, events)
@@ -342,3 +367,20 @@ def test_ci_gate_fails_on_error_and_on_untracked_g_rel_1_fail():
     assert len(ci.gate([*rows, {"verdict": "ERROR", "host": "h", "cell": "long-80/in-place", "reason": "x"}], {549})) == 1
     assert len(ci.gate([{"verdict": "FAIL", "host": "h", "cell": "baseline/rotation/acp", "targets": []}], {549})) == 1
     assert all(h["sha"] and h["python_version"] for h in json.loads(ci.CI_HOSTS.read_text())["hosts"].values())
+
+
+def test_unverified_host_never_executes_its_interpreter(tmp_path):
+    """Regression (R2a review): the anthropic-SDK probe ran the host python before the identity check."""
+    marker, venv = tmp_path / "ran", tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(f"#!/bin/sh\ntouch {marker}\n")
+    (venv / "bin" / "python").chmod(0o755)
+    host = {"python": str(venv / "bin" / "python"), "src": str(tmp_path / "src"), "sha": "0" * 40}
+    cell = next(c for c in PC.R2_CELLS if c.get("api") == "anthropic")
+    plugin = {"ref": "HEAD", "sha": "1" * 40, "dir": "lcm", "tree": str(tmp_path)}
+    rec = PC.run_cell_process(cell, "h", host, plugin, tmp_path / "out", 5, False, identity={"error": "sha mismatch"})
+    assert rec["verdict"] == "ERROR" and "identity" in rec["reason"] and not marker.exists()
+    assert not PC.has_dist(host["python"], "anthropic")
+    (venv / "lib" / "python3.11" / "site-packages" / "anthropic-0.87.0.dist-info").mkdir(parents=True)
+    (venv / "lib" / "python3.11" / "site-packages" / "anthropic-0.87.0.dist-info" / "METADATA").write_text("Name: anthropic\n")
+    assert PC.has_dist(host["python"], "anthropic") and not marker.exists()

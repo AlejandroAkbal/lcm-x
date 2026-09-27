@@ -19,7 +19,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
 import time
 from pathlib import Path
 
@@ -343,19 +342,32 @@ class ProcessCell:
 
 
 def accounting(d: Path, events: list[dict]) -> dict:
-    """The provider log must account for every main-model call the transcript implies: each distinct main request
-    is exactly one scripted step (a reply, a tool-call step, a crash hold or an unexpected request)."""
+    """The provider log is the complete request set. Every distinct request is a model-role completion, a
+    ``/models`` catalog read, or unexpected (an unrouted path/method or an unknown role: the cell ERRORs). Each main
+    request is exactly one scripted step (a reply, a tool-call step, a crash hold or an unexpected main request)."""
     reqs = read_jsonl(d / "provider-requests.jsonl")
-    by_role = {}
+    by_role, by_route, unexpected = {}, {}, []
     for r in {r["rid"]: r for r in reqs}.values():
-        by_role[r["role"]] = by_role.get(r["role"], 0) + 1
+        route = r.get("route")
+        by_route[route] = by_route.get(route, 0) + 1
+        if route == "completion":
+            by_role[r["role"]] = by_role.get(r["role"], 0) + 1
+        if route not in ("completion", "models") or (route == "completion" and r["role"] not in FP.ROLES):
+            unexpected.append({k: r.get(k) for k in ("rid", "method", "path", "role", "route")})
     implied = {"emit": sum(1 for e in events if e["event"] == "emit"),
                "tool_steps": len({(e["phase"], e["id"].rsplit("_", 1)[0]) for e in events if e["event"] == "tool_issue"}),
                "crash_holds": sum(1 for e in events if e.get("fault") == "crash_after_compaction_before_reply"),
                "unexpected": len({r["rid"] for r in reqs if r.get("unexpected")})}
-    return {"requests_by_role": by_role, "main_implied": implied,
-            "faults": sorted({(r["rid"], r["fault"]) for r in reqs if r.get("fault")}),
-            "ok": by_role.get("main", 0) == sum(implied.values())}
+    return {"requests_by_role": by_role, "requests_by_route": by_route, "unexpected_requests": unexpected[:20],
+            "main_implied": implied, "faults": sorted({(r["rid"], r["fault"]) for r in reqs if r.get("fault")}),
+            "ok": by_role.get("main", 0) == sum(implied.values()) and not unexpected}
+
+
+def has_dist(python: str, name: str) -> bool:
+    """Package metadata only (a ``<name>-*.dist-info`` in the venv's site-packages): the host interpreter never runs
+    outside the contained cell environment. ``python`` is not resolved: a venv's bin/python is a symlink."""
+    venv = Path(os.path.abspath(python)).parent.parent
+    return any(venv.glob(f"lib/python3*/site-packages/{name}-*.dist-info/METADATA"))
 
 
 def session_count(home: Path) -> int | None:
@@ -384,15 +396,14 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
         rec.update(fields)
         (d / "verdict.json").write_text(json.dumps(rec, indent=1, default=str))
         return rec
+    if not identity or "error" in identity:  # before anything reads or runs the host tree
+        return done(verdict="ERROR", reason=f"host identity not verified: {(identity or {}).get('error')}")
     if why := unsupported(cell, transport):
         return done(verdict="UNSUPPORTED", reason=why)
     if transport == "gateway-process":
         return done(verdict="UNSUPPORTED", reason=gateway_unsupported(host["src"]))
-    if cell.get("api") == "anthropic" and subprocess.run([host["python"], "-c", "import anthropic"], capture_output=True,
-                                                          env={"PATH": "/usr/bin:/bin"}).returncode:
+    if cell.get("api") == "anthropic" and not has_dist(host["python"], "anthropic"):
         return done(verdict="UNSUPPORTED", reason="the host venv has no anthropic SDK (hermes-agent[anthropic] not installed)")
-    if not identity or "error" in identity:
-        return done(verdict="ERROR", reason=f"host identity not verified: {(identity or {}).get('error')}")
     home = d / "hermes-home"
     for sub in (home / "plugins", d / "home" / "work", d / "db", d / "files"):
         sub.mkdir(parents=True)
@@ -433,6 +444,8 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
         return done(verdict="ERROR", reason=f"STOP: host attempted non-localhost network access: {network[:3]}")
     if prov or observer:
         return done(verdict="ERROR", reason=f"import provenance / observer failure: {(prov + observer)[:3]}")
+    if acct["unexpected_requests"]:
+        return done(verdict="ERROR", reason=f"unexpected provider requests: {acct['unexpected_requests'][:3]}")
     if run.scenario.unexpected:
         return done(verdict="ERROR", reason=f"unexpected main-model requests: {run.scenario.unexpected[:3]}")
     if last.get("exit") == "done" and not acct["ok"]:
