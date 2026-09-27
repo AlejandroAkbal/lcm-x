@@ -121,10 +121,42 @@ Anthropic messages, `/v1/models`); its request log is reconciled with the transc
 probe traces (R1's transcript schema). Faults are real: SIGKILL of the host process group while the provider holds the
 turn's request; ACP `session/cancel` while it is in flight; the final check is the ACP `/compress` command.
 Containment: localhost base URLs, no API-key env, every proxy variable at a recording sink that refuses
-(`proxy-attempts.jsonl`), model catalog off, a seeded models.dev cache, macOS `sandbox-exec` (localhost-only
-network), and the socket guard; any attempt makes the cell ERROR (STOP). The R2 summariser runs with
-`LCM_SUMMARY_SPEND_MAX_CALLS=100000` (60 turns in ~20 s would trip the per-window spend guard). Cells whose fault is
-injected in-process (publication failure, crash between end/start, crash after rotation), cron cells and the R1
+(`proxy-attempts.jsonl`), `model_catalog: {enabled: false, excluded_providers: [opencode-free]}`, a seeded models.dev
+cache, macOS `sandbox-exec` (localhost-only network), and the socket guard; any attempt makes the cell ERROR (STOP).
+`excluded_providers` is read at `hermes_cli/inventory.py:54`; without it customer-0.21.2 fetches the keyless
+opencode-free catalog on ACP `session/new` (`hermes_cli/models.py:2105 _fetch_opencode_free_models`). The R2
+summariser runs with `LCM_SUMMARY_SPEND_MAX_CALLS=100000` (60 turns in ~20 s would trip the per-window spend guard).
+Cells whose fault is injected in-process (publication failure, crash between end/start), cron cells and the R1
 gateway cells are UNSUPPORTED with the reason; `--transport gateway-process` is UNSUPPORTED with per-host citations
 (the webhook platform is one-shot per delivery; api_server bypasses TurnRunner). `scorers/chronology.py` reports
 (never gates) user-row tag order per lineage.
+
+- **Backlog guarantee (R1 and R2).** Before the final check, if fewer than 3 turns have passed since the last
+  committed non-final compaction, up to 3 extra scripted turns run (tagged and scored like any turn); the checks
+  are in `final_check.backlog_checks`. B4 still `sanitized` after that is INCONCLUSIVE with the checks in the reason.
+- **Private byte-code.** Every host invocation (R1 probe, R2 host process) sets `PYTHONPYCACHEPREFIX=<cell>/pycache`;
+  `hosts.verify` refuses a sourceless `.pyc` (outside `__pycache__`, or with no matching `.py`).
+- **Legacy `/compress` fallback.** `final_check` falls back to `_compress_context(force=True)` only on
+  `ModuleNotFoundError` for exactly `agent.conversation_compression_manual`; any other ImportError is recorded and B4 fails.
+- **crash-after-rotation over acp-process.** `RotationKiller` polls `lcm_lifecycle_state` every 20 ms and SIGKILLs the
+  host group while the rotated child session has 0 lcm rows; a rotation seen after the child has rows is skipped
+  (`missed_rotations`) and the next one is used. No provider request is held, so accounting does not count it as one.
+- **anthropic-route/acp-process** routes main to the fake provider's `/anthropic` endpoint and needs the host's
+  `anthropic` extra (`hermes-agent[anthropic]`); without the SDK the cell is UNSUPPORTED. The local hosts lack it.
+- **customer-0.21.2 lcm-tool-mid-turn is UNSUPPORTED over ACP.** That host defers plugin tools behind the
+  `tool_search`/`tool_call` bridge by default (`tools.tool_search.enabled: "auto"`, `hermes_cli/config_defaults.py:1793`),
+  so the scripted direct `lcm_grep` call is never dispatched ("scenario not proven"). The default is not changed.
+
+### Nightly CI (`.github/workflows/reliability-nightly.yml`)
+Triggers: daily schedule and `workflow_dispatch` (effective once on main), and `pull_request` path-filtered to
+`bench/instruments/reliability/**` and the workflow file. Not a required check; default token only. Matrix over
+`hosts.ci.json` (pinned shas): eva-0.21.5 and customer-0.21.2 on Python 3.11, upstream-main on 3.14. `ci.py prep`
+fetches the sha and installs it editable with `[acp,edge-tts,bedrock,vertex,anthropic]` (the harness verifies git HEAD
+and cites source); R1 all cells and R2 acp-process all cells run with `--plugin-ref HEAD`; MATRIX.md is the job
+summary and results are uploaded. `ci.py gate` fails on any ERROR, or on a FAIL in the G-REL-1 cell set unless the
+cell targets an open issue. Linux has no `sandbox-exec`: there containment is the proxy sink plus the socket guard.
+
+### Claim boundary
+R2 proves the plugin's behaviour through a real `hermes acp` process on the pinned host shas, with every model route
+at a deterministic localhost fake. It does not prove live-model behaviour, the gateway process, several sessions in
+one process, or the process-side publication-failure hook (R2b, #569), and it says nothing about customer boxes.
