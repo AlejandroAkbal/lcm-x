@@ -57,8 +57,10 @@ completed non-cancel attempt (a reply the host dropped is a deficit), plus the h
 the host reported `interrupted`. Any other assistant row is surplus.
 - **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as expected,
   and every stored `continue` row is followed by the reply of its own turn (position-bound).
-- **B2** multiset-v1 (port of the gauntlet's `lossless_bar_multiset.py`): per (role, sha256(NFC,
-  whitespace-collapsed)) stored count == expected count; surplus and deficit reported apart. Every
+- **B2** multiset-v1 (port of the gauntlet's `lossless_bar_multiset.py`), per session lineage: per (role,
+  sha256(content with only leading/trailing whitespace stripped, the host's ACP prompt strip
+  `acp_adapter/server.py` `_extract_text(prompt).strip()`)) stored count == expected count; internal whitespace
+  is exact. Tool call/result rows are keyed per lineage too. Surplus and deficit reported apart. Every
   stored-only key and every split reply is surplus and fails. Expected =
   what the host held per attempt after its ACP strip and consecutive-user merge (a crashed prompt folded
   into the next composite counts once).
