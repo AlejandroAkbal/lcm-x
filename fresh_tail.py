@@ -50,6 +50,27 @@ def _assistant_group_start(messages: Sequence[Dict[str, Any]], start: int) -> in
     return start
 
 
+def tool_group_safe_end(messages: Sequence[Dict[str, Any]], end: int) -> int:
+    """Move a prefix end off a tool-call group (#559).
+
+    A prefix ``messages[:end]`` that stops after an assistant with ``tool_calls``
+    or between its results would orphan the rest. Trim back to before the group;
+    when that empties the prefix, extend through the group's results instead.
+    Shapes the group rule cannot classify keep ``end`` (today's behaviour).
+    """
+    start = _assistant_group_start(messages, end)
+    if start == end or start > 0:
+        return start
+    call_ids = {_tool_call_id(tool_call) for tool_call in (messages[0].get("tool_calls") or [])}
+    while (
+        end < len(messages)
+        and messages[end].get("role") == "tool"
+        and str(messages[end].get("tool_call_id") or "").strip() in call_ids
+    ):
+        end += 1
+    return end
+
+
 def resolve_fresh_tail_boundary(
     messages: Sequence[Dict[str, Any]],
     *,

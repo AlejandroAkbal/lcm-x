@@ -128,7 +128,7 @@ from .message_analysis import (
     _merge_adjacent_assistant_messages,
     _tool_call_id,
 )
-from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
+from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary, tool_group_safe_end
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
@@ -1828,7 +1828,7 @@ class LCMEngine(
             if smaller and len(smaller) < len(current_chunk):
                 return smaller
 
-        return current_chunk[:-1]
+        return current_chunk[: tool_group_safe_end(current_chunk, len(current_chunk) - 1)]
 
     def _summarize_leaf_chunk_with_rescue(
         self,
