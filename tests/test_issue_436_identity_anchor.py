@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import time
+from collections import Counter
 
 import pytest
 
@@ -77,14 +78,17 @@ def _state_db(tmp_path, sessions: list[tuple[str, str | None, str | None]]) -> N
 
 
 def _assert_claims_are_in_the_input(engine: LCMEngine, captured: list[str]) -> list[int]:
-    """Every leaf source a summary claims had its text in a summarizer input."""
+    """Every leaf source a summary claims had its own copy of its full text in a summarizer input:
+    per text, the claims never outnumber the occurrences across the inputs (T5)."""
     text = "\n".join(captured)
     claimed = [sid for node in engine._dag.get_session_nodes(engine._session_id)
                if node.source_type == "messages" for sid in node.source_ids]
     rows = engine._store.get_batch(claimed)
-    for store_id in claimed:
-        content = str(rows[store_id].get("content") or "")
-        assert content.strip()[:60] in text, f"store_id {store_id} claimed without its text: {content[:60]!r}"
+    wanted = Counter(str(rows[store_id].get("content") or "").strip() for store_id in claimed)
+    for content, claims in wanted.items():
+        assert not content or text.count(content) >= claims, (
+            f"{claims} claim(s) of {content[:60]!r} but {text.count(content)} cop(ies) in the input"
+        )
     return claimed
 
 
