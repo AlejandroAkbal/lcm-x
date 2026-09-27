@@ -136,7 +136,7 @@ from .reconcile import _COMPACTION_COMMIT_PROOF_METADATA_PREFIX, ReconcileMixin,
 from .reconcile import _emission_identity
 from .reconcile import _has_lossy_redacted_identity, _merge_append_cut, _proof_user_identity
 from .compaction import CompactionMixin
-from .identity_anchor import IdentityAnchorMixin, identity_anchor_enabled
+from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -5447,6 +5447,7 @@ class LCMEngine(
                 logger.info("LCM identity-anchor recognised %d replayed rows: session=%s cursor=%d incoming=%d",
                             len(anchor_plan["replayed"]), self._session_id, cursor, n)
         anchored_replay_indexes = anchor_plan["replayed"] if anchor_plan else set()
+        anchor_remainders: dict[int, Any] = {}
         if cursor > 0:
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
             if (
@@ -5697,8 +5698,13 @@ class LCMEngine(
                         )
                     continue
                 if absolute_idx in anchored_replay_indexes:
-                    continue  # #436 R1: a replay of a stored occurrence
+                    continue  # #436 R1/R2: a replay of a stored occurrence
                 store_msg = replay_msg
+                remainder = (anchor_plan or {}).get("remainders", {}).get(absolute_idx)
+                raw_remainder = _raw_remainder(replay_msg, remainder) if remainder is not None else None
+                if raw_remainder is not None:  # #436 R3: only the new row of a partially-held survivor
+                    store_msg = {**replay_msg, "content": raw_remainder, "timestamp": None}
+                    anchor_remainders[absolute_idx] = None
                 if (
                     str(original_msg.get("role") or "") == "tool"
                     and _is_hermes_persisted_output_marker(
@@ -5785,12 +5791,13 @@ class LCMEngine(
         if anchor_plan is not None:
             try:
                 stored_at = {idx: store_id for (idx, _msg), store_id in zip(messages_to_store_with_index, store_ids)}
+                self._identity_anchor_commit(anchor_plan, {idx: stored_at[idx] for idx in anchor_remainders if idx in stored_at})
                 self._identity_anchor_remember([
                     (self._message_replay_identity(reconcile_messages[idx], strip_carrier=False), store_id, messages[idx])
-                    for idx, store_id in stored_at.items()
+                    for idx, store_id in stored_at.items() if idx not in anchor_remainders
                 ])
             except Exception as exc:
-                logger.warning("LCM identity-anchor current-turn record failed (%s)", type(exc).__name__)
+                logger.warning("LCM identity-anchor relation write failed (%s)", type(exc).__name__)
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists

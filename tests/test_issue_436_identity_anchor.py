@@ -138,6 +138,52 @@ def test_r1_replay_after_restart_is_matched_per_occurrence(tmp_path):
         engine.shutdown()
 
 
+def test_r2_a_live_composite_of_stored_rows_is_recognised_with_a_witness(tmp_path):
+    """H3 merge: C = R + "\\n\\n" + U, both stored, carries R's stamp. Nothing new is stored; the
+    decomposition is recorded."""
+    engine = _engine(tmp_path)
+    r, u = _u("R prompt" + PAD, 500.0), _u("U prompt" + PAD, 510.0)
+    try:
+        head = [SYSTEM, *_turns(1, 3, 0.0)]
+        engine.ingest([*head, r, u])  # a failed turn: two consecutive user rows
+        composite = _u(r["content"] + "\n\n" + u["content"], 500.0)
+        live = [*head, composite, _a("reply to U", 511.0), *_turns(10, 4, 600.0)]
+        engine.ingest(live)
+        texts = [str(row["content"]) for row in _rows(engine)]
+        assert composite["content"] not in texts and texts.count(r["content"]) == 1
+        ids = {str(row["content"]): int(row["store_id"]) for row in _rows(engine)}
+        kinds = {(rel[1], rel[2]) for rel in _relations(engine)}
+        assert {("composite", ids[r["content"]]), ("composite", ids[u["content"]])} <= kinds
+    finally:
+        engine.shutdown()
+
+
+def test_r3_remainder_is_stored_once_byte_exact(tmp_path):
+    """A held head plus a new remainder: U is stored once, with its exact bytes and separators, and
+    the recorded constituents rebuild the host composite byte for byte."""
+    engine = _engine(tmp_path)
+    r = _u("head R\n\n  indented line \n\n\nthree newlines\t", 500.0)
+    remainder = "  remainder U \n\nsecond  paragraph\n\n\n  tail \t"
+    try:
+        head = [SYSTEM, *_turns(1, 2, 0.0)]
+        engine.ingest([*head, r])
+        composite = _u(r["content"] + "\n\n" + remainder, 500.0)
+        engine.ingest([*head, composite, _a("reply", 501.0)])
+        rows = _rows(engine)
+        texts = [str(row["content"]) for row in rows]
+        assert texts.count(r["content"]) == 1 and texts.count(remainder) == 1
+        assert composite["content"] not in texts
+        stored_u = next(row for row in rows if row["content"] == remainder)
+        assert stored_u.get("observed_at") is None  # its own host stamp is unknown
+        group = sorted((rel for rel in _relations(engine) if rel[1] == "composite"), key=lambda rel: rel[3])
+        by_id = {int(row["store_id"]): str(row["content"]) for row in rows}
+        assert "\n\n".join(by_id[rel[2]] for rel in group) == composite["content"]
+        engine.ingest([*head, composite, _a("reply", 501.0)])  # re-reading it stores nothing
+        assert len(_rows(engine)) == len(rows)
+    finally:
+        engine.shutdown()
+
+
 def test_r5_null_stamp_is_backfilled_only_for_the_proven_occurrence(tmp_path):
     engine = _engine(tmp_path)
     try:
