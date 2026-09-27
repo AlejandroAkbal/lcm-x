@@ -234,11 +234,7 @@ def main():
         finish("unsupported", reason=f"host shape not citable at this sha: {missing}")
         return
 
-    def _blocked(*_a, **_k):
-        raise OSError("network blocked by probe")
-    socket.socket.connect = _blocked
-    socket.create_connection = _blocked
-    socket.getaddrinfo = _blocked
+    guard_sockets(local_ok=False)
     handler = logging.StreamHandler(buf)
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
@@ -611,6 +607,57 @@ def main():
         cur["final"] = True  # its compaction events are B4 evidence, not B5 passes
         out["final_check"] = final_check(agent, history, buf)
     finish("done", next_turn=None)
+
+
+LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def guard_sockets(local_ok, on_refuse=None):
+    """Refuse outbound traffic at every Python socket entry: connect, connect_ex, sendto, sendmsg (UDP and
+    literal addresses included), create_connection and name resolution. ``local_ok`` lets loopback through (the
+    R2 host observer); R1's in-process probe needs no network at all. ``on_refuse(what, host, port)`` records."""
+    def local(host):
+        host = host.decode() if isinstance(host, bytes) else host
+        return local_ok and (host is None or str(host) in LOCAL_HOSTS or str(host).startswith("127."))
+
+    def refuse(what, host, port):
+        if on_refuse:
+            on_refuse(what, str(host), port)
+        raise OSError(f"network blocked by probe: {what} {host}:{port}")
+
+    def blocked(sock, name, address):
+        if not local_ok and name in ("connect", "connect_ex"):  # R1: no socket connects at all, any family
+            return True
+        inet = sock.family in (socket.AF_INET, socket.AF_INET6) and isinstance(address, tuple)
+        return inet and not local(address[0])
+
+    def wrap(name, pos):
+        orig = getattr(socket.socket, name)
+
+        def guarded(self, *args):
+            address = args[pos] if len(args) > max(pos, 0) or (pos < 0 and args) else None
+            if (address is not None or name in ("connect", "connect_ex")) and blocked(self, name, address):
+                host, port = address[:2] if isinstance(address, tuple) else (address, None)
+                refuse(name, host, port)
+            return orig(self, *args)
+        setattr(socket.socket, name, guarded)
+    for name, pos in (("connect", 0), ("connect_ex", 0), ("sendto", -1), ("sendmsg", 3)):
+        wrap(name, pos)
+    orig_gai, orig_cc = socket.getaddrinfo, socket.create_connection
+
+    def getaddrinfo(host, port, *a, **k):
+        if not local(host):
+            try:
+                refuse("getaddrinfo", host, port)
+            except OSError as exc:
+                raise socket.gaierror(socket.EAI_NONAME, str(exc)) from None
+        return orig_gai(host, port, *a, **k)
+
+    def create_connection(address, *a, **k):
+        if not local(address[0]):
+            refuse("create_connection", address[0], address[1])
+        return orig_cc(address, *a, **k)
+    socket.getaddrinfo, socket.create_connection = getaddrinfo, create_connection
 
 
 def session_count():

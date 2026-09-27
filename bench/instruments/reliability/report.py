@@ -13,6 +13,8 @@ from bench.instruments.reliability.cells import ISSUES, registry  # noqa: E402
 BOUNDARY = ("Claim class: advisory / code_green_local. A PASS proves this lcm-x tree, on this host sha, under this "
             "scripted in-process scenario, meets the bars; not behaviour under real models, the real ACP/gateway "
             "processes, real transports or customer boxes.")
+BOUNDARY_R2 = ("Claim class: advisory / code_green_local. Transport {t}: real host processes with a scripted localhost "
+               "model. A PASS says nothing about real-model behaviour, real messaging platforms or customer boxes.")
 VERDICTS = ("PASS", "FAIL", "INCONCLUSIVE", "ERROR", "UNSUPPORTED")
 
 
@@ -69,7 +71,9 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
     refs = sorted({(r["plugin_ref"], r["plugin_sha"][:12]) for r in results})
     order = [c["id"] for c in registry()]
     env = f"Global LCM env override: `{json.dumps(lcm_env)}`." if lcm_env else "No global LCM env override."
-    lines = ["# Reliability matrix", "", BOUNDARY, "", env, f"Wall clock: {wall:.0f} s for {len(results)} cells.", ""]
+    transports = sorted({r["transport"] for r in results if r.get("transport")})
+    boundary = BOUNDARY_R2.format(t="/".join(transports)) if transports else BOUNDARY
+    lines = ["# Reliability matrix", "", boundary, "", env, f"Wall clock: {wall:.0f} s for {len(results)} cells.", ""]
     for ref, sha in refs:
         rs = [r for r in results if r["plugin_ref"] == ref and r["plugin_sha"][:12] == sha]
         by = {(r["cell"], r["host"]): r for r in rs}
@@ -96,7 +100,7 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
     for c in registry():
         for t in c["targets"]:
             targeting[t].append(c["id"])
-    im = ["# Issue map", "", BOUNDARY, "", env, "",
+    im = ["# Issue map", "", boundary, "", env, "",
           "\"target cell FAILS\" = a cell targeting the issue fails that issue's bar at the evaluated ref. It is a "
           "signal, not an attribution: whether the failure IS that issue is a human call from the signature.", ""]
     for ref, sha in refs:

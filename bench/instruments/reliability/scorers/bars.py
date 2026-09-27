@@ -19,7 +19,7 @@ import sqlite3
 from collections import Counter
 from pathlib import Path
 
-from . import multiset, summary, tool_calls, tool_groups
+from . import chronology, multiset, summary, tool_calls, tool_groups
 
 ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
 
@@ -56,8 +56,9 @@ def attempts(events: list[dict]) -> list[dict]:
     return out
 
 
-def lineage(cell_dir: Path):
-    """store session id -> lineage: "chat" for S0 and its compression descendants, else the root session."""
+def lineage(cell_dir: Path, root: str = "S0"):
+    """store session id -> lineage: "chat" for ``root`` (R1: S0; R2: the ACP session id) and its compression
+    descendants, else the root session."""
     parents, state = {}, cell_dir / "db" / "state.db"
     if state.exists():
         con = sqlite3.connect(f"file:{state}?mode=ro", uri=True)
@@ -71,7 +72,7 @@ def lineage(cell_dir: Path):
         while parents.get(sid) and sid not in seen:
             seen.add(sid)
             sid = parents[sid]
-        return "chat" if sid == "S0" else sid
+        return "chat" if sid == root else sid
     return group
 
 
@@ -151,7 +152,7 @@ def score(cell: dict, cell_dir: Path) -> dict:
     finally:
         con.close()
     atts = attempts(events)
-    group = lineage(cell_dir)
+    group = lineage(cell_dir, cell.get("chat_root", "S0"))
     groups = sorted({attempt_group(a, group) for a in atts} | {group(sid) for _s, sid, _r, _c in stored})
     notices = {x for p in phases for x in p.get("failed_turn_notices") or []}
     per = {g: (expected_items([a for a in atts if attempt_group(a, group) == g], notices),
@@ -241,7 +242,7 @@ def score(cell: dict, cell_dir: Path) -> dict:
                        for k in ("resident_engine_conflict", "skipped_ingest_resident_conflict", "recorded_replaced")},
         "phases": len(phases), "session_count": phases[-1].get("session_count") if phases else None,
         "lcm_tool_calls": sum(p.get("counters", {}).get("lcm_tool_calls", 0) for p in phases),
-        "summary_nodes": summary.nodes_report(db)}
+        "summary_nodes": summary.nodes_report(db), "chronology": chronology.report(stored, group)}
     inconclusive = {b: v for b, v in inconclusive.items() if b in applicable}
     numbers["diagnostic"]["native_rejections"] = dict(Counter(e.get("rejection") for e in events
                                                               if e["event"] == "compaction" and e.get("rejection")))

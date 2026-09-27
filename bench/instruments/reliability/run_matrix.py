@@ -192,6 +192,9 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-dbs", choices=("fail", "all"), default="fail", help="keep db/ copies of non-PASS cells, or all")
     ap.add_argument("--lcm-env", action="append", default=[], metavar="KEY=VAL",
                     help="LCM_* override applied to every cell (repeatable)")
+    ap.add_argument("--transport", choices=("acp-process", "gateway-process", "api-server"),
+                    help="R2: run the cells through a real host process (process_cell.py); default: R1 in-process")
+    ap.add_argument("--turn-timeout", type=float, default=300.0, help="R2: per ACP request timeout, seconds")
     a = ap.parse_args(argv)
     if a.control:
         ctl = CT.CONTROLS[a.control]
@@ -220,11 +223,17 @@ def main(argv=None) -> int:
         ap.error(f"--plugin-ref values resolve to the same commit: {[(p['ref'], p['sha'][:12]) for p in plugins]}")
     out.mkdir(parents=True, exist_ok=True)
     (out / "run.json").write_text(json.dumps({"argv": sys.argv, "hosts": hosts, "plugins": plugins, "lcm_env": lcm_env,
-                                              "host_identity": identities, "cells": [c["id"] for c in selected]}, indent=1))
+                                              "host_identity": identities, "cells": [c["id"] for c in selected],
+                                              **({"transport": a.transport} if a.transport else {})}, indent=1))
     jobs = [(c, h, hosts[h], p) for p in plugins for h in hosts for c in selected]
+    runner = run_cell
+    if a.transport:  # R2 (process_cell.py); without --transport the R1 in-process path below is unchanged
+        from functools import partial
+        from bench.instruments.reliability import process_cell
+        runner = partial(process_cell.run_cell_process, transport=a.transport, turn_timeout=a.turn_timeout)
     started, results = time.time(), []
     with ThreadPoolExecutor(max_workers=a.jobs) as pool, open(out / "results.jsonl", "w") as sink:
-        futures = {pool.submit(run_cell, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env,
+        futures = {pool.submit(runner, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env,
                                identities[h]): (c, h, p) for c, h, hd, p in jobs}
         for fut in as_completed(futures):
             try:
@@ -233,6 +242,7 @@ def main(argv=None) -> int:
                 c, h, p = futures[fut]
                 rec = {"cell": c["id"], "host": h, "host_sha": hosts[h]["sha"], "plugin_ref": p["ref"],
                        "plugin_sha": p["sha"], "targets": c["targets"], "verdict": "ERROR",
+                       **({"transport": a.transport} if a.transport else {}),
                        "reason": f"harness job failed: {exc!r}"[:500]}
             results.append(rec)
             sink.write(json.dumps(rec, default=str) + "\n")
