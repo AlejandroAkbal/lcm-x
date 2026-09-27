@@ -19,17 +19,24 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
-from bench.instruments.reliability import acp_driver as AD, fake_provider as FP, probe as P1, run_matrix as RM
+from bench.instruments.reliability import acp_driver as AD, cells as C, fake_provider as FP, probe as P1, run_matrix as RM
 
 OBSERVER = Path(__file__).with_name("observer")
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 SANDBOX = ('(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip "localhost:*"))'
            '(allow network-outbound (remote unix-socket))')
 FAKE_KEY = "rel-fake-key-not-a-secret"
-PROCESS_FAULTS = {"acp-process": {"crash_after_compaction_before_reply", "cancel_then_retry"}}
+PROCESS_FAULTS = {"acp-process": {"crash_after_compaction_before_reply", "cancel_then_retry",
+                                   "crash_after_rotation_before_child_row"}}
+# R2-only: the main route over the Anthropic Messages API (a ``/anthropic`` base path selects the anthropic_messages
+# transport, hermes_cli/runtime_provider.py _detect_api_mode_for_url); the #550 class.
+R2_CELLS = [{**C.cell("anthropic-route/acp-process", [], in_place=True,
+                      doc="baseline/in-place/acp with the main model on the Anthropic Messages API (fake provider)"),
+             "api": "anthropic"}]
 # gateway-process: why no local platform can drive an R1 gateway cell, cited per host at run time.
 GATEWAY_ANCHORS = {
     "turn_runner": ("gateway/run_turn.py", "TurnRunner(self, turn_ctx)"),
@@ -78,8 +85,9 @@ def unsupported(cell: dict, transport: str) -> str | None:
 
 def config_yaml(cell: dict, plugin: dict, base_url: str) -> str:
     route = f'provider: custom\n    base_url: "{base_url}"\n    api_key: "{FAKE_KEY}"\n'
+    main_url = base_url[:-len("/v1")] + "/anthropic" if cell.get("api") == "anthropic" else base_url
     return (RM.config_yaml(cell, plugin)
-            + f'model:\n  default: rel/main\n  provider: custom\n  base_url: "{base_url}"\n  api_key: "{FAKE_KEY}"\n'
+            + f'model:\n  default: rel/main\n  provider: custom\n  base_url: "{main_url}"\n  api_key: "{FAKE_KEY}"\n'
             f"  context_length: {cell['window']}\n"
             f"auxiliary:\n  compression:\n    {route}    model: rel/aux\n  title_generation:\n    {route}    model: rel/aux-title\n"
             "  background_review:\n    enabled: false\n"
@@ -237,7 +245,18 @@ class ProcessCell:
         self.log_mark = len(self.host_log())
         self.event(turn=t, event="user_sent" if kind != "retry" else "retry", tag=f"T{t:02d}", role="user",
                    session_prefix="T", content=text, persist=None, content_sha256=hashlib.sha256(text.encode()).hexdigest())
-        answer, stop = self.proc.prompt(self.sid, text, self.turn_timeout)
+        kind_rot = "crash_after_rotation_before_child_row"
+        killer = AD.RotationKiller(self.proc, self.home / "lcm.db", self.sid, lambda ev: self.fire(kind_rot, t, **ev)) \
+            if self.phase == "A" and kind_rot not in self.fired and kind_rot in {f["kind"] for f in self.cell["faults"]} \
+            else None
+        if killer:  # --kill-after-rotation: SIGKILL while the rotated child session has no lcm rows yet
+            killer.start()
+        try:
+            answer, stop = self.proc.prompt(self.sid, text, self.turn_timeout)
+        finally:
+            if killer:
+                killer.stop.set()
+                killer.join()
         self.event(turn=t, event="acp_response", tag=f"T{t:02d}", stop_reason=stop, chars=len(answer))
         return stop
 
@@ -288,8 +307,8 @@ class ProcessCell:
                 if self.cell.get("final_compaction_check", True) else None
             return {"exit": "done", "next_turn": None, **({"final_check": final} if final else {})}
         except AD.ProcessGone as exc:
-            if self.proc.killed and "crash_after_compaction_before_reply" in self.fired:
-                t = self.scenario.st["t"]
+            if self.proc.killed and any(k.startswith("crash") for k in self.fired):
+                t = self.last_turn
                 return {"exit": "crash", "next_turn": t + 1, "turn": t}
             return {"exit": "error", "reason": f"host process ended: {exc}; stderr: {self.stderr_tail()}"}
         except (AD.DriverError, OSError, ValueError) as exc:
@@ -332,7 +351,7 @@ def accounting(d: Path, events: list[dict]) -> dict:
         by_role[r["role"]] = by_role.get(r["role"], 0) + 1
     implied = {"emit": sum(1 for e in events if e["event"] == "emit"),
                "tool_steps": len({(e["phase"], e["id"].rsplit("_", 1)[0]) for e in events if e["event"] == "tool_issue"}),
-               "crash_holds": sum(1 for e in events if e["event"] == "crash"),
+               "crash_holds": sum(1 for e in events if e.get("fault") == "crash_after_compaction_before_reply"),
                "unexpected": len({r["rid"] for r in reqs if r.get("unexpected")})}
     return {"requests_by_role": by_role, "main_implied": implied,
             "faults": sorted({(r["rid"], r["fault"]) for r in reqs if r.get("fault")}),
@@ -369,6 +388,9 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
         return done(verdict="UNSUPPORTED", reason=why)
     if transport == "gateway-process":
         return done(verdict="UNSUPPORTED", reason=gateway_unsupported(host["src"]))
+    if cell.get("api") == "anthropic" and subprocess.run([host["python"], "-c", "import anthropic"], capture_output=True,
+                                                          env={"PATH": "/usr/bin:/bin"}).returncode:
+        return done(verdict="UNSUPPORTED", reason="the host venv has no anthropic SDK (hermes-agent[anthropic] not installed)")
     if not identity or "error" in identity:
         return done(verdict="ERROR", reason=f"host identity not verified: {(identity or {}).get('error')}")
     home = d / "hermes-home"

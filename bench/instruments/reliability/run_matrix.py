@@ -226,7 +226,9 @@ def main(argv=None) -> int:
             identities[name] = H.verify(name, host)
         except (ValueError, OSError) as exc:
             identities[name] = {"error": str(exc)}
-    selected = C.select(a.cells)
+    if a.transport:  # R2 (process_cell.py); without --transport the R1 in-process path is unchanged
+        from bench.instruments.reliability import process_cell
+    selected = C.select(a.cells, extra=process_cell.R2_CELLS if a.transport else ())
     plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins", out) for ref in a.plugin_ref.split(",")]
     if len({p["sha"] for p in plugins}) < len(plugins):
         ap.error(f"--plugin-ref values resolve to the same commit: {[(p['ref'], p['sha'][:12]) for p in plugins]}")
@@ -236,9 +238,8 @@ def main(argv=None) -> int:
                                               **({"transport": a.transport} if a.transport else {})}, indent=1))
     jobs = [(c, h, hosts[h], p) for p in plugins for h in hosts for c in selected]
     runner = run_cell
-    if a.transport:  # R2 (process_cell.py); without --transport the R1 in-process path below is unchanged
+    if a.transport:
         from functools import partial
-        from bench.instruments.reliability import process_cell
         runner = partial(process_cell.run_cell_process, transport=a.transport, turn_timeout=a.turn_timeout)
     started, results = time.time(), []
     with ThreadPoolExecutor(max_workers=a.jobs) as pool, open(out / "results.jsonl", "w") as sink:

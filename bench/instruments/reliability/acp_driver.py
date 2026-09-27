@@ -186,7 +186,7 @@ def rotation_probe(db_path: Path, conversation_id: str) -> tuple[str | None, int
 
 
 class RotationKiller(threading.Thread):
-    """``--kill-after-rotation``: poll (100 ms) for a rotation; SIGKILL the ACP group while the child has 0 lcm rows."""
+    """``--kill-after-rotation``: poll (20 ms) for a rotation; SIGKILL the ACP group while the child has 0 lcm rows."""
 
     def __init__(self, client: AcpProcess, db_path: Path, conversation_id: str, on_kill=None) -> None:
         super().__init__(name="rotation-killer", daemon=True)
@@ -194,19 +194,22 @@ class RotationKiller(threading.Thread):
         self.baseline, _ = rotation_probe(db_path, conversation_id)
         self.stop = threading.Event()
         self.event: dict | None = None
+        self.missed = 0
 
     def check(self, kill: bool) -> None:
         current, rows = rotation_probe(self.db_path, self.conversation_id)
         if self.event is None and self.baseline and current and current != self.baseline:
+            if kill and rows > 0:  # the poll lost the race for this rotation: wait for the next one
+                self.baseline, self.missed = current, self.missed + 1
+                return
             self.event = {"parent_session_id": self.baseline, "child_session_id": current, "child_rows_at_detect": rows,
-                          "killed": False}
-            if kill and rows == 0:
+                          "missed_rotations": self.missed, "killed": kill}
+            if kill:
                 if self.on_kill:
                     self.on_kill(self.event)
                 self.client.kill()
-                self.event["killed"] = True
 
     def run(self) -> None:
         while not self.stop.is_set() and self.event is None:
             self.check(kill=True)
-            self.stop.wait(0.1)
+            self.stop.wait(0.02)

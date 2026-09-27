@@ -70,6 +70,7 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
     hosts = sorted({r["host"] for r in results})
     refs = sorted({(r["plugin_ref"], r["plugin_sha"][:12]) for r in results})
     order = [c["id"] for c in registry()]
+    order += sorted({r["cell"] for r in results} - set(order))  # transport-only (R2) cells
     env = f"Global LCM env override: `{json.dumps(lcm_env)}`." if lcm_env else "No global LCM env override."
     transports = sorted({r["transport"] for r in results if r.get("transport")})
     boundary = BOUNDARY_R2.format(t="/".join(transports)) if transports else BOUNDARY

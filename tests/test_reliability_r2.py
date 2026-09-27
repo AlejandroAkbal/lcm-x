@@ -236,10 +236,23 @@ def test_accounting_matches_requests_to_scripted_steps(tmp_path):
     reqs = [{"rid": 1, "role": "main", "reply": {}}, {"rid": 2, "role": "main", "phase": "held", "fault": "hold_until_killed"},
             {"rid": 2, "role": "main", "phase": "client_closed"}, {"rid": 3, "role": "lcm-summary", "reply": {}}]
     (tmp_path / "provider-requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reqs))
-    events = [{"phase": "A", "event": "emit"}, {"phase": "A", "event": "crash"}]
+    events = [{"phase": "A", "event": "emit"}, {"phase": "A", "event": "crash", "fault": "crash_after_compaction_before_reply"}]
     acct = PC.accounting(tmp_path, events)
     assert acct["ok"] and acct["requests_by_role"] == {"main": 2, "lcm-summary": 1}
     assert not PC.accounting(tmp_path, events[:1])["ok"]
+    rotation_kill = {"phase": "A", "event": "crash", "fault": "crash_after_rotation_before_child_row"}  # holds no request
+    assert not PC.accounting(tmp_path, [events[0], rotation_kill])["ok"]
+
+
+def test_rotation_killer_skips_a_lost_race_and_kills_on_the_next_empty_child(tmp_path, monkeypatch):
+    states = iter([("S1", 5), ("S2", 3), ("S3", 0)])  # baseline, child already has rows (lost race), empty child
+    monkeypatch.setattr(AD, "rotation_probe", lambda *_: next(states))
+    killed, fired = [], []
+    killer = AD.RotationKiller(types.SimpleNamespace(kill=lambda: killed.append(1)), tmp_path / "lcm.db", "c", fired.append)
+    killer.check(kill=True)
+    assert killer.event is None and killer.baseline == "S2" and not killed
+    killer.check(kill=True)
+    assert killed and fired[0]["child_session_id"] == "S3" and fired[0]["missed_rotations"] == 1 and fired[0]["killed"]
 
 
 def test_plugins_root_symlink_or_escape_is_refused_before_any_cache_write(tmp_path):
