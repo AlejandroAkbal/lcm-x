@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bench.instruments.reliability import acp_driver as AD, cells, fake_provider as FP, hosts, plugin_tree, probe  # noqa: E402
+from bench.instruments.reliability import acp_driver as AD, cells, ci, fake_provider as FP, hosts, plugin_tree, probe  # noqa: E402
 from bench.instruments.reliability import process_cell as PC, run_matrix as RM  # noqa: E402
 from bench.instruments.reliability.scorers import chronology  # noqa: E402
 
@@ -331,3 +331,14 @@ def test_extra_turns_only_when_a_pass_just_consumed_the_backlog(tmp_path):
     (tmp_path / "transcript.jsonl").write_text(json.dumps({"event": "compaction", "turn": 1, "compression_status": "compacted"}) + "\n")
     assert list(probe.extend_turns(cell, 4, lambda t: probe.backlog_low(tmp_path, t, []))) == [4, 5]
     assert list(probe.extend_turns({**cell, "final_compaction_check": False}, 1, lambda t: True)) == [1, 2, 3, 4, 5]
+
+
+def test_ci_gate_fails_on_error_and_on_untracked_g_rel_1_fail():
+    rows = [{"verdict": "FAIL", "host": "h", "cell": "crash-after-rotation/rotation", "targets": [519, 549]},
+            {"verdict": "FAIL", "host": "h", "cell": "native-long-prefix/in-place", "targets": []},
+            {"verdict": "INCONCLUSIVE", "host": "h", "cell": "baseline/in-place/acp", "targets": []}]
+    assert ci.gate(rows, {549}) == []  # an open targeted issue, a cell outside G-REL-1, a non-FAIL
+    assert len(ci.gate(rows, {1})) == 1
+    assert len(ci.gate([*rows, {"verdict": "ERROR", "host": "h", "cell": "long-80/in-place", "reason": "x"}], {549})) == 1
+    assert len(ci.gate([{"verdict": "FAIL", "host": "h", "cell": "baseline/rotation/acp", "targets": []}], {549})) == 1
+    assert all(h["sha"] and h["python_version"] for h in json.loads(ci.CI_HOSTS.read_text())["hosts"].values())

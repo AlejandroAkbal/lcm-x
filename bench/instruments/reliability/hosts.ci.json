@@ -1,0 +1,29 @@
+{
+  "comment": "Pinned CI hosts for .github/workflows/reliability-nightly.yml (ci.py prep). upstream-main is bumped by a weekly PR, never floating.",
+  "hosts": {
+    "eva-0.21.5": {
+      "repo": "NousResearch/hermes-agent",
+      "sha": "f97608f178d1ffeca59860195ab7da295f7c8e5f",
+      "hermes_version": "0.21.5",
+      "python_version": "3.11",
+      "extras": "acp,edge-tts,bedrock,vertex,anthropic",
+      "pins": ["agent-client-protocol==0.9.0", "pip==24.0"]
+    },
+    "customer-0.21.2": {
+      "repo": "electricsheephq/evaOS-hermes-desktop-app-adapter",
+      "sha": "2d10969e7d6fab477c4aa4f7e4c9e4df1f524e9a",
+      "hermes_version": "0.21.2",
+      "python_version": "3.11",
+      "extras": "acp,edge-tts,bedrock,vertex,anthropic",
+      "pins": ["agent-client-protocol==0.9.0", "pip==24.0"]
+    },
+    "upstream-main": {
+      "repo": "NousResearch/hermes-agent",
+      "sha": "6f7a7991bb069db07ae74a479823ce8310f8c7e0",
+      "hermes_version": "0.0.0",
+      "python_version": "3.14",
+      "extras": "acp,edge-tts,bedrock,vertex,anthropic",
+      "pins": ["agent-client-protocol==0.9.0", "pip==24.0"]
+    }
+  }
+}
