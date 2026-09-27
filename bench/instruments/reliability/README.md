@@ -16,7 +16,11 @@ uv run --no-project python bench/instruments/reliability/run_matrix.py \
   [--lcm-env LCM_KEY=VAL ...]
 ```
 - Hosts file: `--hosts-file`, else `$LCM_RELIABILITY_HOSTS`, else the host-prep lane's file; see
-  `hosts.example.json`. A host under the live `~/.hermes` is refused.
+  `hosts.example.json`. A host whose path, lexical or resolved, is under the live `~/.hermes` is refused.
+- Host identity is verified before any cell runs: `git rev-parse HEAD` == sha with no modified tracked file for
+  a git tree; for an exported tree, `tree-manifest.json` next to it (written at host prep by
+  `python hosts.py --write-manifest <src> --sha <sha> --git-repo <repo>`, which proves the tree equals
+  `git archive <sha>`) must match the sha and the tree's current hash. An unverified host's cells are ERROR.
 - Each ref is exported once with `git archive` into `<out>/plugins/<sha12>/`; the plugin dir name,
   `plugins.enabled` entry and engine name are read from that tree (v0.23.x = `hermes-lcm`/`lcm`).
 - Per cell: `<out>/cells/<host>/<sha12>/<cell-slug>/` holds cell.json, transcript.jsonl, phase-*.json,
@@ -43,17 +47,23 @@ Every emulated host shape is located at run time in the host tree and recorded a
 whose trigger never fires at that host sha.
 
 ## Bars (all applicable bars must pass)
-- **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as the host holds.
+B1 and B2 are scored per session lineage: the chat lineage is S0 and its compression children (state.db
+`parent_session_id`), each cron fire its own lineage; a row stored in the wrong lineage fails both.
+- **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as the host holds,
+  and every stored `continue` row is followed by the reply of its own turn (position-bound).
 - **B2** multiset-v1 (port of the gauntlet's `lossless_bar_multiset.py`): per (role, sha256(NFC,
-  whitespace-collapsed)) stored count == expected count; surplus and deficit reported apart. Expected =
+  whitespace-collapsed)) stored count == expected count; surplus and deficit reported apart. Every
+  stored-only key and every split reply is surplus and fails. Expected =
   what the host held per attempt after its ACP strip and consecutive-user merge (a crashed prompt folded
   into the next composite counts once).
 - **B3** zero `publication_invariant_conflict` log lines across phases.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
-  (`compress_now`, or `_compress_context(force=True)` on older hosts; re-invoked once after a cleanup-only
-  `sanitized`) does not end in error, conflict or exception. Ending `sanitized`/noop is INCONCLUSIVE.
-- **B5** depth-0 message-sourced summary nodes grow after every LCM pass; published passes (LCM or
-  host-native) >= `min_compactions`; `LCM compaction #` log lines == LCM passes in the ledger.
+  (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
+  re-invoked once after a cleanup-only `sanitized`) does not end in error, conflict or exception; an
+  exception from the selected entry point fails with no fallback. Ending `sanitized`/noop is INCONCLUSIVE.
+- **B5** depth-0 message-sourced summary nodes grow after every LCM pass; every host-native pass has its own
+  host `commit_status: committed` telemetry line in the same turn; published passes (LCM or host-native,
+  the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes.
 - **B6** (tool cells) no message-sourced summary covers part of a tool group (#559 invariant); zero host
   orphan-tool-result drops.
 - **B7** (native cells) no `native recovery did not produce a usable summary`, no host
@@ -64,8 +74,17 @@ data; `native-long-prefix/*` (default tuning, 1M window) run the host ContextCom
 LLM, so no slow-summary timeouts) and LCM's post-summary checks; every rejection reason is recorded.
 
 Verdicts: PASS, FAIL (failed bars with numbers), INCONCLUSIVE (no bar fails, one could not decide), ERROR (harness or host failure; never a PASS),
-UNSUPPORTED (with the reason). `sql_dup_counter.py`, `summary_nodes_report.py` and `compaction_ledger.py`
+UNSUPPORTED (with the reason). A cell must prove its scenario ran or it is UNSUPPORTED, never PASS: every
+planned tool call dispatched and its result seen by the next provider call, at least one stored tool group
+for B6, at least one native attempt in a native cell, a cancel that reported `interrupted` before the
+retry, and every host citation its faults and transport need. A runner job that raises is ERROR.
+`sql_dup_counter.py`, `summary_nodes_report.py` and `compaction_ledger.py`
 are ported as `scorers/dupes.py` and `scorers/summary.py` (diagnostics and the B5 ledger).
+
+## Positive controls
+PC-1 is a differential: lcm-x `47bd28e7` (before #498, the #494 fix) vs `ae1fb16d` on eva-0.21.5, rs34-0.21.5
+and upstream-main: `baseline/in-place/acp` PASSes at both, `acp-trailing/in-place` FAILs only at
+`47bd28e7` (the host's post-commit-proof persist strip). customer-0.21.2 passes both refs (no such strip).
 
 ## Limits
 In-process only: no real `hermes acp`/gateway process, transport, model or timing. Gateway timestamp
