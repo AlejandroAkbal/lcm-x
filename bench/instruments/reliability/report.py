@@ -54,6 +54,10 @@ def issue_status(rows: list[dict], capability: str, bars: tuple) -> tuple[str, s
     if hits:
         return ("target cell FAILS (" + ", ".join(r["cell"] for r in hits) + ")",
                 "; ".join(f"`{r['cell']}`: {signature(r)}" for r in hits))
+    unsure = sorted(r["cell"] for r in live if set(r.get("inconclusive_bars", {})) & set(bars))
+    if unsure:
+        return "target cell INCONCLUSIVE (" + ", ".join(unsure) + ")", "; ".join(
+            f"`{r['cell']}`: {json.dumps(r['inconclusive_bars'])[:200]}" for r in live if r["cell"] in unsure)
     return "target cells PASS on this bar" + (" (some ERROR/UNSUPPORTED)" if len(live) < len(rows) else ""), ""
 
 
