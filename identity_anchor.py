@@ -15,6 +15,7 @@ stamp attaches only to the one occurrence proven this turn.
 R2 a merge survivor is recognised only by an exact, unique, ordered decomposition into stored
 occurrences, or by a relation LCM itself recorded when it saw that composite; R3 a survivor holding
 a stored head and a new remainder stores the remainder once (its own stamp unknown) with the relation.
+R4 (coverage bound to the summarizer input) lives in compaction's input loop.
 
 ``LCM_IDENTITY_ANCHOR`` (default on): ``0``/``false``/``no``/``off`` restores the pre-#436 ingest exactly.
 """
@@ -421,6 +422,77 @@ class IdentityAnchorMixin:
             if (store_id in null and not _lossy(identity) and identity == identity_of[store_id]
                     and counts[identity] == 1 and (stamp, identity) not in held):
                 out.append((store_id, stamp))
+        return out
+
+    # -- R4: coverage bound to the summarizer input ----------------------------
+
+    def _identity_anchor_summary_input(self, chunk, full_map, view=()) -> Optional[list]:
+        """The summarizer input for ``chunk`` built TOGETHER with what each input row may claim:
+        ``[(input_row, [store_id, ...]), ...]``, or None (today's input and mapping).
+        - A live composite LCM recorded (R2 witness) claims its constituents: their text is in it.
+        - An owned, host-stamped user row above the frontier that no live row maps, whose identity the
+          host ``view`` no longer shows, and that sits below the chunk's last mapped row (a host merge
+          absorbed it, a persist override rewrote its survivor, ...) is REHYDRATED from its stored
+          bytes, in store order, and claims only itself.
+        Nothing is claimed without its text in the input; rows with valid coverage (<= frontier) keep it."""
+        if not identity_anchor_enabled() or not isinstance(full_map, dict) or not chunk:
+            return None
+        frontier, mapped = int(self._last_compacted_store_id or 0), set(full_map.values())
+        carry = self._load_compression_carry_ranges()
+
+        def owned(row) -> bool:
+            store_id, owner = int(row["store_id"]), str(row.get("session_id") or "")
+            return owner == self._session_id or any(owner == s and a < store_id <= b for s, a, b in carry)
+
+        claimed: set[int] = set()
+        claims: dict[int, list] = {}
+        self._identity_anchor_text_memo = {}
+        scope = [str(self._session_id), *self._identity_anchor_chain()]
+        for message in chunk:
+            stamp = _normalize_observed_at(message.get("timestamp"))
+            if message.get("role") != "user" or id(message) in full_map or stamp is None:
+                continue
+            donors = [row for row in self._store.find_rows_by_observed_at(str(self._conversation_id or ""), scope, [stamp])
+                      if row.get("role") == "user"]
+            content = self._message_replay_identity(message, strip_carrier=False)[1]
+            groups = [group for group in self._identity_anchor_witnesses(donors, stamp)
+                      if "\n\n".join(self._identity_text(row) for row in group) == content] if donors else []
+            if not groups and donors and "\n\n" in content:  # LCM observes the exact composite here (form i)
+                pool = self._identity_anchor_pool(donors, set())
+                group, _ambiguous = self._identity_anchor_compose(
+                    content, {self._identity_text(row) for row in pool}, pool, donors, set()
+                )
+                if group is not None:
+                    self._store.add_message_relations([_composite_relation(group, stamp)])
+                    groups = [group]
+            if len(groups) == 1:
+                ids = [int(row["store_id"]) for row in groups[0]
+                       if owned(row) and int(row["store_id"]) > frontier and int(row["store_id"]) not in mapped | claimed]
+                claimed.update(ids)
+                claims[id(message)] = ids
+        last = max([full_map[id(m)] for m in chunk if id(m) in full_map] + list(claimed), default=0)
+        gaps = []
+        if last > frontier:
+            shown = {self._message_replay_identity(message, strip_carrier=False) for message in view}
+            rows = self._store.get_range(str(self._session_id), start_id=frontier + 1, end_id=last - 1, limit=100000)
+            for source, start, end in carry:
+                if end > frontier and start < last:
+                    rows += self._store.get_range(source, start_id=max(start, frontier) + 1, end_id=min(end, last - 1), limit=100000)
+            gaps = sorted((row for row in rows if row.get("role") == "user" and owned(row)
+                           and row.get("observed_at") is not None
+                           and int(row["store_id"]) not in mapped | claimed
+                           and not self._stored_row_forms(row) & shown
+                           and not self._matches_ignore_message_patterns(row, stored_row=True)),
+                          key=lambda row: int(row["store_id"]))
+        if not gaps and not claims:
+            return None
+        out, pending = [], list(gaps)
+        for message in chunk:
+            position = full_map.get(id(message)) or max(claims.get(id(message)) or [0])
+            while pending and position and int(pending[0]["store_id"]) < position:
+                row = pending.pop(0)
+                out.append(({"role": "user", "content": row.get("content") or ""}, [int(row["store_id"])]))
+            out.append((message, claims.get(id(message), [])))
         return out
 
     # -- writes ----------------------------------------------------------------

@@ -75,6 +75,57 @@ def _assert_claims_are_in_the_input(engine: LCMEngine, captured: list[str]) -> l
     return claimed
 
 
+# -- (a)-(e) REVISION 1 acceptance -------------------------------------------------------------------
+
+def test_a_unrelated_same_timestamp_row_is_not_absorbed(tmp_path, summaries):
+    """Astra's counterexample: R and U share one host stamp and nothing else. U never absorbs R:
+    no relation joins them, and R is claimed only with its own bytes in the summarizer input."""
+    engine = _engine(tmp_path)
+    r = _u("unrelated retained text" + PAD, 500.0)
+    u = _u("new user text" + PAD, 500.0)
+    head = _turns(1, 3, 0.0)  # Hermes hands the engine no system row
+    try:
+        engine.ingest([*head, r])
+    finally:
+        engine.shutdown()
+    engine = _engine(tmp_path)  # restart; the host no longer shows R, U carries the same (batch) stamp
+    try:
+        live = [*head, u, _a("reply to U", 502.0), *_turns(10, 4, 600.0)]
+        engine.compress(live)
+        by_text = {str(row["content"]): int(row["store_id"]) for row in _rows(engine)}
+        r_id, u_id = by_text[r["content"]], by_text[u["content"]]
+        assert not [rel for rel in _relations(engine) if {r_id, u_id} <= {rel[0], rel[2]}]
+        claimed = _assert_claims_are_in_the_input(engine, summaries)
+        assert u_id in claimed
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["steady", "restart"])
+def test_b_summary_never_claims_a_row_whose_text_is_not_in_its_input(tmp_path, summaries, restart):
+    """H1 persist override: R's survivor is rewritten to U under R's stamp, R leaves the host list.
+    U is stored once, and a summary may claim R only with R's own bytes in the summarizer input."""
+    engine = _engine(tmp_path)
+    r = _u("interrupted prompt R" + PAD, 500.0)
+    u = _u("follow-up U" + PAD, 500.0)
+    head = _turns(1, 3, 0.0)  # Hermes hands the engine no system row
+    try:
+        engine.ingest([*head, r])
+        if restart:
+            engine.shutdown()
+            engine = _engine(tmp_path)
+        live = [*head, u, _a("reply to U", 502.0), *_turns(10, 4, 600.0)]
+        engine.ingest(live)
+        engine.compress(live)
+        texts = [str(row["content"]) for row in _rows(engine)]
+        assert texts.count(r["content"]) == 1 and texts.count(u["content"]) == 1
+        assert engine._last_compression_status == "compacted"  # R pending forever would stall publication
+        u_id = next(int(row["store_id"]) for row in _rows(engine) if row["content"] == u["content"])
+        assert u_id in _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()
+
+
 def test_d_two_identical_gateway_messages_at_one_timestamp_are_both_stored(tmp_path):
     engine = _engine(tmp_path)
     ok = _u("ok", 700.0)
@@ -138,9 +189,9 @@ def test_r1_replay_after_restart_is_matched_per_occurrence(tmp_path):
         engine.shutdown()
 
 
-def test_r2_a_live_composite_of_stored_rows_is_recognised_with_a_witness(tmp_path):
+def test_r2_a_live_composite_of_stored_rows_is_recognised_with_a_witness(tmp_path, summaries):
     """H3 merge: C = R + "\\n\\n" + U, both stored, carries R's stamp. Nothing new is stored; the
-    decomposition is recorded."""
+    decomposition is recorded; a summary of C claims R and U with their bytes in its input."""
     engine = _engine(tmp_path)
     r, u = _u("R prompt" + PAD, 500.0), _u("U prompt" + PAD, 510.0)
     try:
@@ -154,6 +205,9 @@ def test_r2_a_live_composite_of_stored_rows_is_recognised_with_a_witness(tmp_pat
         ids = {str(row["content"]): int(row["store_id"]) for row in _rows(engine)}
         kinds = {(rel[1], rel[2]) for rel in _relations(engine)}
         assert {("composite", ids[r["content"]]), ("composite", ids[u["content"]])} <= kinds
+        engine.compress(live)
+        claimed = _assert_claims_are_in_the_input(engine, summaries)
+        assert {ids[r["content"]], ids[u["content"]]} <= set(claimed)
     finally:
         engine.shutdown()
 
