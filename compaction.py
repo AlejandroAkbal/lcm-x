@@ -23,6 +23,7 @@ from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .fresh_tail import tool_group_safe_end
 from .lifecycle_state import LifecycleBindingChangedError, LifecyclePublicationConflictError
 from .message_analysis import _matched_tool_call_ids
 from .message_content import text_content_for_pattern_matching
@@ -529,7 +530,7 @@ class CompactionMixin:
                 break
             selected.append(msg)
             used += msg_tokens
-        return selected
+        return list(candidate_raw[: tool_group_safe_end(candidate_raw, len(selected))])
 
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
