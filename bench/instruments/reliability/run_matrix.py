@@ -97,18 +97,27 @@ def unfired_reason(cell: dict, fired: set, citations: dict) -> str | None:
     return f"fault trigger(s) {missing} never fired at this host sha"
 
 
-def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
-             keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None) -> dict:
+def with_lcm_env(cell: dict, plugin: dict, lcm_env: dict | None) -> dict:
     if lcm_env:  # a global override wins over the cell's tuning and is part of the cell record
         cell = {**cell, "lcm_env": {**cell["lcm_env"], **lcm_env}, "global_lcm_env": lcm_env}
         if "LCM_NATIVE_RECOVERY" in lcm_env:  # decided by the plugin's own parser at this ref, not "== true"
             cell["native_recovery"], cell["native_recovery_parser"] = plugin_tree.parse_bool(
                 Path(plugin["tree"]), "LCM_NATIVE_RECOVERY", lcm_env["LCM_NATIVE_RECOVERY"])
-    d = out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"])
+    return cell
+
+
+def checked_cell_dir(out: Path, d: Path) -> Path:
     if (out / "cells").is_symlink():
         raise ValueError(f"{out / 'cells'} is a symlink; refused")
     if (out / "cells").resolve() not in d.resolve().parents or out.resolve() not in d.resolve().parents:
         raise ValueError(f"cell dir {d} is not under {out / 'cells'}")
+    return d
+
+
+def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
+             keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None) -> dict:
+    cell = with_lcm_env(cell, plugin, lcm_env)
+    d = checked_cell_dir(out, out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"]))
     if d.exists():
         shutil.rmtree(d)
     home = d / "hermes-home"

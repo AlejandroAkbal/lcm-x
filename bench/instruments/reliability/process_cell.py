@@ -30,11 +30,21 @@ SANDBOX = ('(version 1)(allow default)(deny network-outbound)(allow network-outb
            '(allow network-outbound (remote unix-socket))')
 FAKE_KEY = "rel-fake-key-not-a-secret"
 PROCESS_FAULTS = {"acp-process": {"crash_after_compaction_before_reply", "cancel_then_retry"}}
-# gateway/platforms/api_server.py:588 (eva-0.21.5): the api_server platform "never passes through TurnRunner",
-# so it is not the gateway turn path; see README (R2) for why gateway-process is UNSUPPORTED at this revision.
-GATEWAY_UNSUPPORTED = ("gateway-process needs a local platform whose inbound path is gateway/run_turn_runner.py; "
-                       "not implemented in R2 (see README 'R2 transport cells'); api_server never passes through "
-                       "TurnRunner (gateway/platforms/api_server.py:588)")
+# gateway-process: why no local platform can drive an R1 gateway cell, cited per host at run time.
+GATEWAY_ANCHORS = {
+    "turn_runner": ("gateway/run_turn.py", "TurnRunner(self, turn_ctx)"),
+    "webhook_session": ("gateway/platforms/webhook.py", 'session_chat_id = f"webhook:{route_name}:{delivery_id}"'),
+    "webhook_close": ("gateway/platforms/webhook.py", "async def on_processing_complete"),
+    "api_server_bypass": ("gateway/platforms/api_server.py", "never passes through ``TurnRunner``"),
+}
+
+
+def gateway_unsupported(src: str) -> str:
+    c = cite_all(src, GATEWAY_ANCHORS)
+    return (f"no local TurnRunner-backed platform holds one chat across turns at this host sha: the webhook platform "
+            f"(TurnRunner at {c['turn_runner']}) keys every POST to its own one-shot session ({c['webhook_session']}), "
+            f"closed when the run ends ({c['webhook_close']}); api_server never passes through TurnRunner "
+            f"({c['api_server_bypass']}); the remaining platforms bridge to external messaging services")
 
 
 def append(path: Path, rec: dict) -> None:
@@ -85,9 +95,9 @@ def reply_text(cell: dict, prefix: str, t: int) -> str:
     return f"reply to {prefix}{t:02d}: noted item {t}."
 
 
-def cite_all(src: str) -> dict:
+def cite_all(src: str, anchors: dict = P1.ANCHORS) -> dict:
     out = {}
-    for key, (rel, needle) in P1.ANCHORS.items():
+    for key, (rel, needle) in anchors.items():
         try:
             lines = (Path(src) / rel).read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -335,13 +345,8 @@ def session_count(home: Path) -> int | None:
 def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
                      keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None,
                      transport: str = "acp-process", turn_timeout: float = 300.0) -> dict:
-    if lcm_env:
-        cell = {**cell, "lcm_env": {**cell["lcm_env"], **lcm_env}, "global_lcm_env": lcm_env}
-        if "LCM_NATIVE_RECOVERY" in lcm_env:
-            cell["native_recovery"] = lcm_env["LCM_NATIVE_RECOVERY"].lower() == "true"
-    d = out / "cells" / host_name / plugin["sha"][:12] / f"{RM.slug(cell['id'])}@{transport}"
-    if (out / "cells").resolve() not in d.resolve().parents:
-        raise ValueError(f"cell dir {d} is not under {out / 'cells'}")
+    cell = RM.with_lcm_env(cell, plugin, lcm_env)
+    d = RM.checked_cell_dir(out, out / "cells" / host_name / plugin["sha"][:12] / f"{RM.slug(cell['id'])}@{transport}")
     if d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True)
@@ -355,7 +360,7 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
     if why := unsupported(cell, transport):
         return done(verdict="UNSUPPORTED", reason=why)
     if transport == "gateway-process":
-        return done(verdict="UNSUPPORTED", reason=GATEWAY_UNSUPPORTED)
+        return done(verdict="UNSUPPORTED", reason=gateway_unsupported(host["src"]))
     if not identity or "error" in identity:
         return done(verdict="ERROR", reason=f"host identity not verified: {(identity or {}).get('error')}")
     home = d / "hermes-home"
