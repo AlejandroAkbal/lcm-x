@@ -40,38 +40,57 @@ _CARRY_PREFIX = "identity_anchor_carry"
 _RECENT_CAP = 16  # rows this process stored lately: the R5 current-turn window
 _POOL_WINDOW = 256  # store ids either side of a stamp donor searched for a composite's constituents
 _MAX_DECOMPOSITIONS = 3
+_DECOMPOSE_BUDGET = 2048  # T3: prefixes visited per decomposition (ingest thread)
+_DECOMPOSE_MAX_PARTS = 64
 
 
 def identity_anchor_enabled() -> bool:
     return (os.environ.get("LCM_IDENTITY_ANCHOR") or "").strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _decompositions(content: str, texts: set, *, partial: bool) -> list:
+def _decompositions(content: str, texts: set, *, partial: bool) -> Optional[list]:
     """Ordered splits of ``content`` into ``"\\n\\n"``-joined whole ``texts`` (at least two parts).
     ``partial`` also returns ``(parts, remainder)`` for a held prefix followed by a new remainder.
-    Stops after ``_MAX_DECOMPOSITIONS`` (the caller only needs to know whether one is unique)."""
+    Stops after ``_MAX_DECOMPOSITIONS`` (the caller only needs to know whether one is unique).
+    Iterative and bounded (T3): more than ``_DECOMPOSE_BUDGET`` visited prefixes or
+    ``_DECOMPOSE_MAX_PARTS`` parts returns None, "ambiguous": the row is stored whole."""
     out: list = []
     by_head: dict[str, list] = defaultdict(list)
     short = [text for text in texts if 0 < len(text) < 16]
     for text in texts:
         if len(text) >= 16:
             by_head[text[:16]].append(text)
+    stack: list = []  # (pos, parts, texts left to try): the recursive walk, iteratively (T3)
+    visited = 0
 
-    def walk(pos: int, parts: list) -> None:
+    def enter(pos: int, parts: list) -> bool:
+        """One walk() call: False once the budget is spent."""
+        nonlocal visited
         if len(out) >= _MAX_DECOMPOSITIONS:
-            return
+            return True
+        visited += 1
+        if visited > _DECOMPOSE_BUDGET or len(stack) >= _DECOMPOSE_MAX_PARTS:
+            return False
         if partial and parts and pos < len(content):
             out.append((list(parts), content[pos:]))
-        for text in by_head.get(content[pos:pos + 16], []) + short:
-            end = pos + len(text)
-            if not content.startswith(text, pos):
-                continue
-            if end == len(content) and len(parts) >= 1:
-                out.append((parts + [text], ""))
-            elif content.startswith("\n\n", end) and end + 2 < len(content):
-                walk(end + 2, parts + [text])
+        stack.append((pos, parts, iter(by_head.get(content[pos:pos + 16], []) + short)))
+        return True
 
-    walk(0, [])
+    if not enter(0, []):
+        return None
+    while stack:
+        pos, parts, pending = stack[-1]
+        text = next(pending, None)
+        if text is None:
+            stack.pop()
+            continue
+        end = pos + len(text)
+        if not content.startswith(text, pos):
+            continue
+        if end == len(content) and len(parts) >= 1:
+            out.append((parts + [text], ""))
+        elif content.startswith("\n\n", end) and end + 2 < len(content) and not enter(end + 2, parts + [text]):
+            return None
     return out
 
 
@@ -366,7 +385,7 @@ class IdentityAnchorMixin:
                 plan["relations"].append(("alt_stamp", stamp, [row], None))
                 return self._identity_anchor_take(idx, [row], consumed, matched, plan)
         # R3: held constituents then a new remainder, stored once with its own stamp unknown.
-        partials = [(parts, rest) for parts, rest in _decompositions(content, texts, partial=True)
+        partials = [(parts, rest) for parts, rest in _decompositions(content, texts, partial=True) or ()
                     if rest and donor_texts & set(parts) and rest not in texts]
         longest = max((len(parts) for parts, _rest in partials), default=0)
         partials = [(parts, rest) for parts, rest in partials if len(parts) == longest]  # every held part accounted
@@ -398,8 +417,10 @@ class IdentityAnchorMixin:
         """R2 form (i): ``(group, ambiguous)``; ``group`` is the one exact, unique, ordered decomposition
         of ``content`` into stored occurrences (a stamp donor among them), each used once."""
         donor_texts = {self._identity_text(row) for row in donors}
-        full = [parts for parts, rest in _decompositions(content, texts, partial=False)
-                if not rest and donor_texts & set(parts)]
+        found = _decompositions(content, texts, partial=False)
+        if found is None:  # T3: search budget spent: ambiguous, the composite is stored whole
+            return None, True
+        full = [parts for parts, rest in found if not rest and donor_texts & set(parts)]
         group = self._identity_anchor_assign(full[0], pool, donors, consumed) if len(full) == 1 else None
         return group, len(full) > 1
 
