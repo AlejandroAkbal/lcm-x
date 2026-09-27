@@ -5,6 +5,7 @@ a host list in, stored rows / relations / summary coverage out."""
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 
 import pytest
@@ -427,5 +428,35 @@ def test_563_h2_merge_turn_views_are_replays_and_never_brick_publication(tmp_pat
         stored = [int(row["store_id"]) for row in _rows(engine)]
         assert int(engine._last_compacted_store_id or 0) >= stored[-6]
         _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()
+
+
+def test_t6_a_rescue_prefix_of_rehydrated_rows_alone_consumes_no_unread_raw_row(tmp_path, monkeypatch):
+    """#572 T6: R is rehydrated ahead of the raw rows. When the summarizer rejects the whole input and
+    the adaptive rescue keeps only the oldest prefix [R], no raw row is consumed or claimed unread."""
+    read: list[str] = []
+
+    def summarize(**kwargs):
+        if "[U]" in kwargs["text"]:
+            raise RuntimeError("maximum context length exceeded")
+        read.append(kwargs["text"])
+        return "Earlier turns.\nExpand for details about: turns", 1
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize)
+    engine = _engine(tmp_path)
+    r = _u("[R] interrupted prompt" + PAD * 12, 500.0)
+    try:
+        engine.ingest([r])
+        engine.shutdown()
+        engine = _engine(tmp_path)  # restart: the persist override left U under R's stamp; R left the list
+        with contextlib.suppress(RuntimeError):  # a failed rescue may surface as the pass's error
+            engine.compress([_u("[U] follow-up", 500.0), _a("reply to U", 502.0), *_turns(10, 3, 600.0)])
+        frontier = int(engine._last_compacted_store_id or 0)
+        u_id = next(int(row["store_id"]) for row in _rows(engine) if row["content"] == "[U] follow-up")
+        claimed = [sid for node in engine._dag.get_session_nodes(engine._session_id)
+                   if node.source_type == "messages" for sid in node.source_ids]
+        assert u_id not in claimed and u_id > frontier, (claimed, frontier)
+        assert all("[U]" not in text for text in read)
     finally:
         engine.shutdown()

@@ -1690,6 +1690,11 @@ class CompactionMixin:
                         summary_input_chunk,
                         **summary_kwargs,
                     )
+                    selected_ids = {id(message) for message in selected_raw_chunk}
+                    if anchored_input and not any(id(sources.get(id(m), m)) in selected_ids for m in compacted_chunk):
+                        # #436 T6: a rescue prefix of rehydrated rows alone read no raw row; never let the
+                        # boundary fallback below consume raw rows the summarizer did not read.
+                        raise RuntimeError("adaptive leaf rescue kept only rehydrated rows")
                 except Exception as exc:
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
