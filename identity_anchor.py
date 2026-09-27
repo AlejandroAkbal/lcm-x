@@ -108,6 +108,7 @@ class IdentityAnchorMixin:
         if cached is not None and cached[0] == session_id:
             return cached[1]
         chain: list[str] = []
+        read = False
         try:
             path = self._state_db_path()
             if session_id and path.exists():
@@ -124,12 +125,14 @@ class IdentityAnchorMixin:
                         current = str(row[0])
                         seen.add(current)
                         chain.append(current)
+                    read = True
                 finally:
                     conn.close()
         except Exception as exc:  # host DB drift or absence: no ancestry, session scope only
             logger.debug("LCM identity-anchor ancestry read failed: %s", exc)
             chain = []
-        self._identity_anchor_chain_cache = (session_id, chain)
+        if read:  # T4: only a completed read is cached; a missing or failing state.db is asked again
+            self._identity_anchor_chain_cache = (session_id, chain)
         return chain
 
     def _identity_anchor_carry_key(self) -> str:

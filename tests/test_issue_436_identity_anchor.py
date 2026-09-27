@@ -478,3 +478,14 @@ def test_t3_decomposition_search_is_bounded_and_ambiguous_on_exhaustion(shape):
     assert len(_decompositions(content, texts, partial=True) or []) <= 3  # stops at its cap, never recurses
     assert time.monotonic() - started < 1.0
     assert _decompositions("R one\n\nU two", {"R one", "U two"}, partial=False) == [(["R one", "U two"], "")]
+
+
+def test_t4_ancestry_is_cached_only_after_a_completed_read(tmp_path):
+    """#572 T4: no state.db yet (or a failed read) is not cached as "no ancestors" for the session."""
+    engine = _engine(tmp_path, "C")
+    try:
+        assert engine._identity_anchor_chain() == []  # the host has not created state.db yet
+        _state_db(tmp_path, [("P", None, "compression"), ("C", "P", None)])
+        assert engine._identity_anchor_chain() == ["P"]
+    finally:
+        engine.shutdown()
