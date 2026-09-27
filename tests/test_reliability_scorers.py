@@ -186,6 +186,9 @@ def test_f2_native_pass_needs_its_own_host_commit(tmp_path):
     proven = make(tmp_path / "p", rows=clean_rows(), events=events, extra_events=native + final, passes=1, min_compactions=2)
     assert proven["verdict"] == "PASS", proven["failed_bars"]
     assert proven["numbers"]["B5"]["published"] == 2  # the final forced pass is B4 evidence, not counted here
+    final_lcm = [{"phase": "A", "turn": 3, "event": "compaction", "compression_status": "compacted", "final": True, "depth0_nodes": 9}]
+    logged = make(tmp_path / "l", rows=clean_rows(), events=clean_events(), extra_events=final_lcm, phase={"compactions_logged": 3})
+    assert logged["verdict"] == "PASS" and logged["numbers"]["B5"]["published"] == 2  # final LCM pass logs, is not counted
 
 
 def test_f3_unproven_scenarios_are_unsupported(tmp_path):

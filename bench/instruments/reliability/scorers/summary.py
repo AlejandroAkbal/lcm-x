@@ -22,10 +22,12 @@ def growth(events: list[dict], logged_publications: int, min_compactions: int) -
     """The per-published-pass ledger. An LCM pass proves itself by depth-0 message-node growth; a host-native
     pass (LCM writes no node) proves itself only by a host ``commit_status: committed`` telemetry line in the
     same turn (``host_commits`` on that turn's turn_end/crash events). Published passes >= min; logged
-    ``LCM compaction #`` lines == LCM passes. The final forced compaction is B4 evidence, not a pass here."""
+    ``LCM compaction #`` lines == LCM passes (the final forced one included: it logs too). The final forced
+    compaction is B4 evidence, not a published pass here."""
     passes = [e for e in events if e.get("event") == "compaction" and not e.get("final")]
     published = [e for e in passes if e.get("compression_status") in ("compacted", "host_native")]
     lcm = [e for e in passes if e.get("compression_status") == "compacted"]  # native passes add no LCM nodes
+    lcm_all = [e for e in events if e.get("event") == "compaction" and e.get("compression_status") == "compacted"]
     counts = [e.get("depth0_nodes") for e in lcm]
     stalls = [i for i in range(1, len(counts)) if counts[i] is None or counts[i - 1] is None or counts[i] <= counts[i - 1]]
     if counts and (counts[0] is None or counts[0] < 1):
@@ -41,4 +43,4 @@ def growth(events: list[dict], logged_publications: int, min_compactions: int) -
     return {"published": len(published), "lcm_published": len(lcm), "logged": logged_publications,
             "min_compactions": min_compactions, "depth0_sequence": counts, "non_growing_passes": stalls,
             "native_passes_without_host_commit": unproven,
-            "ok": not stalls and not unproven and len(published) >= min_compactions and logged_publications == len(lcm)}
+            "ok": not stalls and not unproven and len(published) >= min_compactions and logged_publications == len(lcm_all)}
