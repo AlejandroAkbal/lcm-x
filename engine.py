@@ -5431,8 +5431,12 @@ class LCMEngine(
                 audit_from = next((idx for idx, identity in enumerate(current_prefix_identities)
                                    if identity != cached_source_identities[idx]), None)
             try:
+                if reconciled_existing_session and cursor > 0:
+                    for store_id, stamp in self._identity_anchor_backfill_prefix(messages, reconcile_messages, cursor):
+                        self._store.backfill_observed_at(store_id, stamp)
                 anchor_plan = self._identity_anchor_prematch(messages, reconcile_messages, cursor, audit_from)
                 anchor_plan["replayed"] -= replayed_tool_segment_indexes
+                self._identity_anchor_commit(anchor_plan)
             except Exception as exc:
                 logger.warning("LCM identity-anchor pre-match failed (%s); ordered-prefix path only", type(exc).__name__)
                 anchor_plan = None
@@ -5778,6 +5782,15 @@ class LCMEngine(
         )
         originals = [messages[idx] for idx, _msg in messages_to_store_with_index]
         self._watch_stored_user_rows(zip(originals, protected_messages, store_ids))
+        if anchor_plan is not None:
+            try:
+                stored_at = {idx: store_id for (idx, _msg), store_id in zip(messages_to_store_with_index, store_ids)}
+                self._identity_anchor_remember([
+                    (self._message_replay_identity(reconcile_messages[idx], strip_carrier=False), store_id, messages[idx])
+                    for idx, store_id in stored_at.items()
+                ])
+            except Exception as exc:
+                logger.warning("LCM identity-anchor current-turn record failed (%s)", type(exc).__name__)
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists

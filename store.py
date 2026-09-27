@@ -895,15 +895,28 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    # -- #436 identity anchor: host-time lookup ------------------------------
+    # -- #436 identity anchor: host-time lookup and message relations ---------
 
     def _ensure_identity_anchor_schema(self) -> None:
-        """Additive, created on first anchored use: one non-unique index."""
+        """Additive, created on first anchored use: one non-unique index and ``message_relations``
+        (no UNIQUE constraint beyond its primary key)."""
         if getattr(self, "_identity_anchor_schema_ready", False):
             return
         with self._write_lock:
             self._conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_msg_conversation_observed ON messages(conversation_id, observed_at);
+                CREATE TABLE IF NOT EXISTS message_relations (
+                    relation_id INTEGER PRIMARY KEY,
+                    store_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    related_store_id INTEGER,
+                    ordinal INTEGER,
+                    observed_at REAL,
+                    created_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_msg_relations_store ON message_relations(store_id, kind);
+                CREATE INDEX IF NOT EXISTS idx_msg_relations_related ON message_relations(related_store_id, kind);
+                CREATE INDEX IF NOT EXISTS idx_msg_relations_observed ON message_relations(kind, observed_at);
             """)
         self._identity_anchor_schema_ready = True
 
@@ -911,7 +924,8 @@ class MessageStore:
         self, conversation_id: str, session_ids: List[str], observed_ats: List[float],
     ) -> List[Dict[str, Any]]:
         """Rows of ``session_ids`` in ``conversation_id`` whose host ``observed_at`` is one of
-        ``observed_ats``, in store order (indexed; bounded by the distinct stamps asked for)."""
+        ``observed_ats``, plus rows carrying one of them as a recorded alternate stamp, in store order
+        (indexed; bounded by the distinct stamps asked for)."""
         values, sessions = sorted(set(observed_ats)), set(session_ids)
         if not values or not sessions:
             return []
@@ -924,11 +938,79 @@ class MessageStore:
                 f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE conversation_id IN (?, '') AND observed_at IN ({marks})",
                 [_normalize_conversation_id_value(conversation_id), *chunk],
             ).fetchall()
+            aliased = self._conn.execute(
+                f"SELECT store_id, observed_at FROM message_relations WHERE kind = 'alt_stamp' AND observed_at IN ({marks})",
+                chunk,
+            ).fetchall()
             for r in rows:
                 row = self._row_to_dict(r)
                 if str(row.get("session_id") or "") in sessions:
                     found[(int(row["store_id"]), float(row["observed_at"]))] = row
+            batch = self.get_batch(sorted({int(store_id) for store_id, _stamp in aliased}))
+            for store_id, stamp in aliased:  # the one occurrence an H1 unstable stamp was proven for (R5)
+                row = batch.get(int(store_id))
+                if row is not None and str(row.get("session_id") or "") in sessions:
+                    found[(int(store_id), float(stamp))] = {**row, "observed_at": float(stamp)}
         return [found[key] for key in sorted(found)]
+
+    def add_message_relations(self, groups: List[List[tuple]]) -> int:
+        """Append relation GROUPS; each group is ``[(store_id, kind, related_store_id, ordinal,
+        observed_at), ...]`` sharing one ``created_at`` (its group key). A group identical to a recorded
+        one (same head, kind, stamp and members) is not added again."""
+        groups = [group for group in groups if group]
+        if not groups:
+            return 0
+        self._ensure_identity_anchor_schema()
+        added = 0
+        with self._write_lock:
+            for group in groups:
+                store_id, kind, _related, _ordinal, observed_at = group[0]
+                members = sorted((ordinal, related) for _s, _k, related, ordinal, _o in group)
+                existing: dict[Any, list] = {}
+                for created_at, ordinal, related in self._conn.execute(
+                    "SELECT created_at, ordinal, related_store_id FROM message_relations "
+                    "WHERE store_id = ? AND kind = ? AND observed_at IS ?",
+                    (int(store_id), kind, observed_at),
+                ):
+                    existing.setdefault(created_at, []).append((ordinal, related))
+                if any(sorted(found) == members for found in existing.values()):
+                    continue
+                created_at = max(time.time(), float(max(existing, default=0) or 0) + 1e-6)
+                self._conn.executemany(
+                    "INSERT INTO message_relations (store_id, kind, related_store_id, ordinal, observed_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [(int(s), k, r, o, ob, created_at) for s, k, r, o, ob in group],
+                )
+                added += len(group)
+            self._conn.commit()
+        return added
+
+    def get_message_relations(self, store_ids: List[int], kind: str, *, related: bool = False) -> List[Dict[str, Any]]:
+        """Relation rows of ``kind`` whose ``store_id`` (or ``related_store_id``) is in ``store_ids``."""
+        ids = sorted({int(i) for i in store_ids})
+        if not ids:
+            return []
+        self._ensure_identity_anchor_schema()
+        column, out = ("related_store_id" if related else "store_id"), []
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            out += [dict(zip(("store_id", "kind", "related_store_id", "ordinal", "observed_at", "created_at"), r))
+                    for r in self._conn.execute(
+                        "SELECT store_id, kind, related_store_id, ordinal, observed_at, created_at FROM message_relations "
+                        f"WHERE kind = ? AND {column} IN ({','.join('?' * len(chunk))}) ORDER BY relation_id",
+                        [kind, *chunk])]
+        return out
+
+    def backfill_observed_at(self, store_id: int, observed_at: float) -> bool:
+        """R5: set a NULL ``observed_at`` from a proven later host copy; never overwrites a value."""
+        with self._write_lock:
+            cur = self._conn.execute(
+                "UPDATE messages SET observed_at = ?, observed_at_source = 'host_message_timestamp' "
+                "WHERE store_id = ? AND observed_at IS NULL",
+                (float(observed_at), int(store_id)),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""

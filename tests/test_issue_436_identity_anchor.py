@@ -138,6 +138,23 @@ def test_r1_replay_after_restart_is_matched_per_occurrence(tmp_path):
         engine.shutdown()
 
 
+def test_r5_null_stamp_is_backfilled_only_for_the_proven_occurrence(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        head = [SYSTEM, *[{k: v for k, v in m.items() if k != "timestamp"} for m in _turns(1, 2, 0.0)]]
+        engine.ingest(head)
+    finally:
+        engine.shutdown()
+    engine = _engine(tmp_path)
+    try:  # a restart: the host now stamps the same rows
+        engine.ingest([SYSTEM, *_turns(1, 2, 0.0), *_turns(10, 1, 600.0)])
+        rows = _rows(engine)
+        assert len(rows) == 6
+        assert [row.get("observed_at") for row in rows[:4]] == [m["timestamp"] for m in _turns(1, 2, 0.0)]
+    finally:
+        engine.shutdown()
+
+
 def test_flag_off_writes_no_identity_state(tmp_path, monkeypatch):
     monkeypatch.setenv("LCM_IDENTITY_ANCHOR", "false")
     engine = _engine(tmp_path)
