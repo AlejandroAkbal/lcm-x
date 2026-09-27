@@ -92,7 +92,10 @@ class FakeProvider:
 
             def do_GET(self):
                 if self.path.rstrip("/").endswith("/models"):
-                    data = [{"id": f"rel/{r}", "object": "model", "owned_by": "rel"} for r in ("main", "lcm-summary", "aux")]
+                    # context_length: a /models key the host reads (agent/model_metadata.py); 1M >= every cell window,
+                    # so the host never auto-lowers the main threshold to an unknown aux model's default window.
+                    data = [{"id": f"rel/{r}", "object": "model", "owned_by": "rel", "context_length": 1_000_000}
+                            for r in ("main", "lcm-summary", "aux", "aux-title")]
                     return self.send_json(200, {"object": "list", "data": data})
                 self.send_json(404, {"error": {"message": f"no route {self.path}"}})
 
