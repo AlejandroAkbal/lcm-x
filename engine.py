@@ -5436,6 +5436,7 @@ class LCMEngine(
                         self._store.backfill_observed_at(store_id, stamp)
                 anchor_plan = self._identity_anchor_prematch(messages, reconcile_messages, cursor, audit_from)
                 anchor_plan["replayed"] -= replayed_tool_segment_indexes
+                self._identity_anchor_version_rewind(messages, anchor_plan)
                 self._identity_anchor_commit(anchor_plan)
             except Exception as exc:
                 logger.warning("LCM identity-anchor pre-match failed (%s); ordered-prefix path only", type(exc).__name__)

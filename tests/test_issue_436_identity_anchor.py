@@ -357,3 +357,22 @@ def test_flag_off_writes_no_identity_state(tmp_path, monkeypatch):
         ).fetchone()
     finally:
         engine.shutdown()
+
+
+def test_r6_an_unstamped_same_object_rewrite_keeps_both_versions(tmp_path):
+    """No host timestamps anywhere: the same host dict rewritten draft -> edited after LCM stored it.
+    The new bytes are stored as a version that supersedes the old; a re-read adds nothing."""
+    engine = _engine(tmp_path)
+    try:
+        first = _u("the assistant said hi", None)
+        prompt = _u("draft", None)
+        engine.ingest([first, prompt])
+        prompt["content"] = "edited"
+        engine.ingest([first, prompt])
+        engine.ingest([first, prompt])
+        rows = _rows(engine)
+        assert [row["content"] for row in rows] == ["the assistant said hi", "draft", "edited"]
+        ids = {str(row["content"]): int(row["store_id"]) for row in rows}
+        assert (ids["edited"], "supersedes", ids["draft"], None) in _relations(engine)
+    finally:
+        engine.shutdown()

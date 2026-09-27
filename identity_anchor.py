@@ -197,6 +197,9 @@ class IdentityAnchorMixin:
         self._identity_anchor_text_memo: dict[int, str] = {}
         n = len(messages)
         start = cursor if audit_from is None else max(0, min(audit_from, cursor))
+        rewritten = self._identity_anchor_rewritten(messages, cursor)
+        if rewritten:  # R6: a rewritten host object is examined like a new row (a merge survivor, ...)
+            start = min(start, min(rewritten))
         if not identity_anchor_enabled() or not self._session_id or start >= n:
             return plan
         stamps = {}
@@ -259,6 +262,7 @@ class IdentityAnchorMixin:
         for idx in list(plan["remainders"]):
             if idx in plan["replayed"]:
                 del plan["remainders"][idx]
+        plan["explained"] = plan["replayed"] - plan.get("positional", set())
         plan["replayed"] = {idx for idx in plan["replayed"] if idx >= plan["cursor"]}
         plan["carry"] = [row for idx in plan["replayed"] | set(plan["remainders"]) for row in matched.get(idx, ())]
         if plan["replayed"] and any(str(row.get("session_id")) in chain for row in plan["carry"]):
@@ -597,6 +601,27 @@ class IdentityAnchorMixin:
         if identity_anchor_enabled():
             versions = [entry for entry in getattr(self, "_identity_anchor_versions", ()) if entry[0] is not message]
             self._identity_anchor_versions = (versions + [(message, int(store_id))])[-_RECENT_CAP:]
+
+    def _identity_anchor_rewritten(self, messages, cursor: int) -> list:
+        """Indexes before ``cursor`` holding a host object this process stored and has since seen
+        rewritten (R6 before/after evidence, stamped or not)."""
+        versions = getattr(self, "_identity_anchor_versions", ()) if identity_anchor_enabled() else ()
+        return [idx for idx in range(min(cursor, len(messages)))
+                if any(message is messages[idx] for message, _store_id in versions)]
+
+    def _identity_anchor_version_rewind(self, messages, plan) -> None:
+        """R6: a rewritten host object whose new bytes the pre-match did not explain as stored
+        occurrences (a composite, an alias, a replay) is an occurrence not stored yet, stamped or not:
+        the cursor moves back to it; every other row of that range stays a replay (today's positional
+        proof)."""
+        cursor = plan["cursor"]
+        rewritten = [idx for idx in self._identity_anchor_rewritten(messages, cursor)
+                     if idx not in plan.get("explained", ())]
+        if not rewritten:
+            return
+        plan["cursor"] = min(rewritten)
+        plan["replayed"].update(idx for idx in range(min(rewritten), cursor) if idx not in rewritten)
+        plan["replayed"].difference_update(rewritten)
 
     def _identity_anchor_record_versions(self, stored) -> None:
         """R6: a rewritten host object that this ingest stored as a row of its own is a new version of
