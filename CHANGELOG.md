@@ -6,6 +6,14 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
+## v0.24.3 - (unreleased; rc1) (#559: a leaf chunk never splits a parallel tool-call group)
+
+- Fix: a leaf chunk ends only at a tool-group boundary, so a compaction never summarizes an assistant row with parallel
+  tool calls apart from one of its results; before, the host dropped the orphaned result and every later publication
+  in that session failed with `publication_invariant_conflict` (a freeze, no rows lost). (#559, #560)
+- Docs: `LCM_MODEL_THRESHOLDS` for profiles that mix a 200k-token primary route with a 1M-token backup; all four
+  supported `lcm:` YAML keys. (#554, #558)
+
 ## v0.24.2 - 2026-09-26 (post-v0.24.1 fix train: committed-frontier resume, replay binding of superseded outputs, forced-overflow recovery, todo-span identity, merge-append alignment, Anthropic tool schemas)
 
 - Fix: a retried compaction after a host cancel resumes from the committed frontier instead of re-summarizing the covered prefix; non-consumable rows are preserved in place. (#457)
