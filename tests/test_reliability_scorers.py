@@ -619,7 +619,7 @@ def test_r2a3_b5_a_counted_node_with_no_message_source_fails(tmp_path):
     """Regression (R2a.3, #567 thread): a message-sourced node with source_ids [] counted toward depth-0 growth
     and passed the cross-lineage check."""
     assert make(tmp_path, rows=clean_rows(), events=clean_events(), nodes=[[1, 2]])["verdict"] == "PASS"
-    for i, bad in enumerate(([], "not-a-list", [99])):
+    for i, bad in enumerate(([], "not-a-list", [99], [True])):  # a JSON true is not store id 1
         out = make(tmp_path / str(i), rows=clean_rows(), events=clean_events(), nodes=[[1, 2], bad])
         assert out["failed_bars"]["B5"]["empty_source_nodes"] == [2], bad
     assert bars.source_ids("{unparseable") == [] and bars.source_ids("null") == [] and bars.source_ids("[1]") == [1]
@@ -627,7 +627,7 @@ def test_r2a3_b5_a_counted_node_with_no_message_source_fails(tmp_path):
 
 def test_r2a3_malformed_durable_tool_calls_are_b2_surplus(tmp_path):
     """Regression (R2a.3, #567 thread): malformed or non-list tool_calls JSON was silently "no calls"."""
-    for i, calls in enumerate(("{not json", '{"id": "c1"}', '"x"', "[1]")):
+    for i, calls in enumerate(("{not json", '{"id": "c1"}', '"x"', "[1]", "")):  # only NULL means no calls
         out = make(tmp_path / str(i), rows=clean_rows() + [("assistant", "", calls)], events=clean_events())
         assert out["failed_bars"]["B2"]["tool_surplus_rows"] == 1, calls
         assert out["numbers"]["B2"]["tool_surplus"] == [["chat", "malformed_tool_calls", 7]], calls

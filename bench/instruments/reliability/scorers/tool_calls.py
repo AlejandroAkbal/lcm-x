@@ -67,13 +67,13 @@ def bind(atts: list[dict], lineage_of=lambda a: "chat") -> dict:
 def stored_keys(rows, lineage=lambda sid: "chat") -> Counter:
     """rows: (store_id, session_id, role, content, tool_calls, tool_call_id). An assistant row whose ``tool_calls``
     is not a JSON list of objects is one ``(lineage, "malformed_tool_calls", store_id)`` key: never expected, so it is
-    B2 surplus, never silently "no calls"."""
+    B2 surplus, never silently "no calls". Only SQL NULL means no calls: ``''`` is malformed text."""
     keys = Counter()
     for store_id, session, role, content, calls, call_id in rows:
         g = lineage(session)
         if role == "tool":
             keys[(g, "tool", call_id, hashlib.sha256((content or "").encode()).hexdigest())] += 1
-        elif role == "assistant" and calls:
+        elif role == "assistant" and calls is not None:
             try:
                 entries = json.loads(calls)
             except ValueError:

@@ -228,9 +228,9 @@ def score(cell: dict, cell_dir: Path) -> dict:
     crossing, empty = [], []
     for nid, sid, src in nodes:  # a summary must cover >= 1 stored row, and only rows of its own session lineage
         ids = source_ids(src)
-        if not any(isinstance(i, int) and i in session_of for i in ids):
+        if not any(type(i) is int and i in session_of for i in ids):  # a JSON true is not store id 1
             empty.append(nid)  # counted toward depth-0 growth, yet it summarises no stored message
-        if any(group(session_of.get(i, f"missing:{i}") if isinstance(i, int) else f"invalid:{i}") != group(sid)
+        if any(group(session_of.get(i, f"missing:{i}") if type(i) is int else f"invalid:{i}") != group(sid)
                for i in ids):
             crossing.append(nid)
     grow["cross_lineage_nodes"], grow["empty_source_nodes"] = crossing[:10], empty[:10]

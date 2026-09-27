@@ -451,3 +451,21 @@ def test_process_phase_deadline_is_an_error_with_its_cause(tmp_path):
         run.provider.server.server_close()
     assert time.monotonic() - started < 15
     assert last["exit"] == "error" and "PhaseDeadline" in last["reason"] and "1.5s deadline" in last["reason"], last
+
+
+def test_process_phase_deadline_is_checked_before_a_done_return(tmp_path):
+    """Regression (R2a.3 review): work after the last request could cross the deadline and still return done."""
+    cell = {**next(c for c in cells.registry() if c["id"] == "baseline/in-place/acp"), "turns": 1,
+            "final_compaction_check": False}
+    run = PC.ProcessCell(cell, tmp_path, {"src": str(tmp_path)}, "acp-process", 300.0, phase_timeout=1.0)
+    run.work.mkdir(parents=True)
+    run.argv = lambda: [sys.executable, "-c", PEER]  # answers every request at once
+    event = run.event
+    run.event = lambda **ev: (event(**ev), ev.get("event") == "acp_response" and time.sleep(1.3))
+    try:
+        last = run.run_phase(1)
+    finally:
+        run.proxy.stop()
+        run.provider.server.server_close()
+    assert any(json.loads(x).get("event") == "acp_response" for x in run.transcript.read_text().splitlines())
+    assert last["exit"] == "error" and "PhaseDeadline" in last["reason"], last

@@ -319,9 +319,13 @@ class ProcessCell:
                     self.turn(t)
             final = {**self.final_check(), "backlog_checks": self.backlog_log} \
                 if self.cell.get("final_compaction_check", True) else None
+            self.budget()  # work after the last request may have crossed the deadline: never a late "done"
             return {"exit": "done", "next_turn": None, **({"final_check": final} if final else {})}
         except AD.ProcessGone as exc:
             if self.proc.killed and any(k.startswith("crash") for k in self.fired):
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    return {"exit": "error", "reason": f"PhaseDeadline: phase {self.phase} exceeded its "
+                                                       f"{self.phase_timeout}s deadline before the crash was recorded"}
                 t = self.last_turn
                 return {"exit": "crash", "next_turn": t + 1, "turn": t}
             return {"exit": "error", "reason": f"host process ended: {exc}; stderr: {self.stderr_tail()}"}
