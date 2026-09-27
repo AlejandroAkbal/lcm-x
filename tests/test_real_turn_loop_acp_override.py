@@ -318,3 +318,176 @@ def test_rotation_child_publication_error_keeps_the_host_rotation_heal(tmp_path)
     assert result["error_returned_input"] == 0, result
     assert result["session_count"] > 2, result
     assert all(count >= 1 for count in result["user_rows_by_turn"].values()), result
+
+
+# -- #553: a crash after a preflight compaction commits and before the reply (the dangling retained row) --
+
+_CRASH_PROBE = _PROBE.split('n = {"c": 0}\n', 1)[0].replace(
+    'enabled_toolsets=["todo"]', 'enabled_toolsets=["todo", "context_engine"]'
+) + textwrap.dedent(
+    """
+    n = {"c": 0}
+    def stub(*a, **kw):
+        n["c"] += 1
+        return f"Stub summary #{n['c']}.\\nExpand for details about: stub", 1
+    for name, module in list(sys.modules.items()):
+        if name.startswith("hermes_plugins.hermes_lcm_x") and hasattr(module, "summarize_with_escalation"):
+            module.summarize_with_escalation = stub
+    compacted_at, current, failures, tool_done, tool_calls = [], {"t": 0}, [], set(), {"n": 0}
+    def traced_compact(self, messages, *args, **kwargs):
+        result = traced_compress(self, messages, *args, **kwargs)
+        if self._last_compression_status == "compacted":
+            compacted_at.append(current["t"])
+        return result
+    type(engine).compress = traced_compact
+    original_tool_call = type(engine).handle_tool_call
+    def counted_tool_call(self, name, args, **kwargs):
+        tool_calls["n"] += 1
+        return original_tool_call(self, name, args, **kwargs)
+    type(engine).handle_tool_call = counted_tool_call
+    def reply(content, prompt_tokens, tool=False):
+        call = SimpleNamespace(id="call_553", type="function", function=SimpleNamespace(name="lcm_status", arguments="{}"))
+        msg = SimpleNamespace(content="" if tool else content, tool_calls=[call] if tool else None)
+        response = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="tool_calls" if tool else "stop")], model="test/model")
+        response.usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=20, total_tokens=prompt_tokens + 20)
+        return response
+    phase, reload = os.environ["PROBE_PHASE"], os.environ.get("PROBE_GATEWAY_RELOAD") == "1"
+    exit_at, tool_turn = int(os.environ.get("PROBE_EXIT_AT") or 0), int(os.environ.get("PROBE_TOOL_TURN") or 0)
+    first, history = int(os.environ.get("PROBE_START_TURN") or 1), []
+    if phase != "A":  # the restored list ends on the dangling retained row (acp_adapter/session.py)
+        history = SessionDB(db_path=home / "state.db").get_messages_as_conversation(agent.session_id, repair_alternation=True)
+    for t in range(first, turns + 1):
+        if phase == "B" and t == exit_at:
+            print(json.dumps({"clean_exit_before": t}), flush=True)
+            os._exit(0)  # a clean restart between turns (a gateway deploy)
+        if reload and phase != "A":  # gateway/run_turn.py: the state.db transcript, repaired, every turn
+            db = SessionDB(db_path=home / "state.db")
+            agent.session_id = db.get_compression_tip(agent.session_id) or agent.session_id
+            history = db.get_messages_as_conversation(agent.session_id, repair_alternation=True)
+        text = f"[T{t:02d}] user turn {t}: " + ("alpha beta gamma delta " * 400) + "end."
+        est = sum(len(str(m.get("content") or "")) for m in history) // 4 + len(text) // 4 + 800
+        def call(*a, _t=t, _est=est, **kw):
+            if phase == "A" and _t in compacted_at:
+                print(json.dumps({"crashed_at": _t}), flush=True)
+                os._exit(0)  # the process dies after the compaction committed, before the reply
+            if _t == tool_turn and _t not in tool_done:
+                tool_done.add(_t)  # S1: an LCM tool call in the merge turn ingests the live list first
+                return reply("", _est, tool=True)
+            return reply(f"reply to T{_t:02d}: noted item {_t}.", _est)
+        agent.client.chat.completions.create.side_effect = call
+        current["t"] = t
+        result = agent.run_conversation(user_message=text, conversation_history=history, task_id="S0",
+                                        persist_user_message=text)
+        if isinstance(result.get("messages"), list):
+            history = result["messages"]
+        if result.get("failed") or not result.get("completed"):
+            failures.append(t)
+    db = sqlite3.connect(str(home / "lcm.db"))
+    rows = db.execute("SELECT role, content FROM messages ORDER BY store_id").fetchall()
+    db.close()
+    log = buf.getvalue()
+    print(json.dumps({
+        "engine": getattr(engine, "name", None),
+        "failed_turns": failures,
+        "duplicate_rows": len(rows) - len(set(rows)),
+        "conflicts": log.count("publication_invariant_conflict"),
+        "compactions_published": len(re.findall(r"LCM compaction #\\d+", log)),
+        "recorded_replaced": log.count("LCM recorded host-replaced rows"),
+        "tool_calls": tool_calls["n"],
+        "user_rows_by_turn": {
+            f"{i:02d}": sum(1 for r, c in rows if r == "user" and (c or "").startswith(f"[T{i:02d}]"))
+            for i in range(1, turns + 1)
+        },
+        "turns_missing": [i for i in range(1, turns + 1) if not any(f"[T{i:02d}] user turn" in (c or "") for _r, c in rows)],
+    }))
+    """
+)
+
+
+def _run_crash_phase(tmp_path, home, phase, **env) -> tuple[dict, dict]:
+    python, src = HERMES
+    completed = subprocess.run(
+        [python, "-c", _CRASH_PROBE],
+        cwd=src or None,
+        env={
+            "HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home),
+            "PYTHONDONTWRITEBYTECODE": "1", "OPENROUTER_API_KEY": "test-key", "PROBE_TRAILING": "0",
+            "PROBE_TURNS": "60", "PROBE_PHASE": phase, "LCM_NATIVE_RECOVERY": "false",
+            "LCM_CONTEXT_THRESHOLD": "0.5", "LCM_FRESH_TAIL_COUNT": "24", "LCM_FRESH_TAIL_MAX_TOKENS": "12000",
+            "LCM_LEAF_CHUNK_TOKENS": "4000", "LCM_THRESHOLD_FULL_SWEEP_ENABLED": "true",
+            **{key: str(value) for key, value in env.items()},
+        },
+        capture_output=True, text=True, timeout=900, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    lines = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")]
+    return lines[0], lines[-1]
+
+
+def _run_crash_restart(tmp_path, *, in_place, reload=False, exit_at=0, tool_turn=False) -> dict:
+    home = tmp_path / "hermes-home"
+    (home / "plugins").mkdir(parents=True)
+    (home / "plugins" / "hermes-lcm-x").symlink_to(REPO_ROOT)
+    (home / "config.yaml").write_text(
+        "context:\n  engine: lcm-x\n"
+        f"compression:\n  enabled: true\n  threshold: 0.8\n  in_place: {'true' if in_place else 'false'}\n  target_ratio: 0.3\n"
+        "lcm:\n  context_threshold: 0.5\n"
+        "plugins:\n  enabled: [hermes-lcm-x]\n  disabled: []\n",
+        encoding="utf-8",
+    )
+    common = {"PROBE_IN_PLACE": "1" if in_place else "0", "PROBE_GATEWAY_RELOAD": "1" if reload else "0"}
+    crashed, _ = _run_crash_phase(tmp_path, home, "A", **common)
+    start = crashed["crashed_at"] + 1  # the dangling retained row is that turn's prompt
+    first, result = _run_crash_phase(
+        tmp_path, home, "B", PROBE_START_TURN=start, PROBE_EXIT_AT=exit_at, PROBE_TOOL_TURN=start if tool_turn else 0, **common
+    )
+    if exit_at:
+        assert first == {"clean_exit_before": exit_at}, first
+        _first, result = _run_crash_phase(tmp_path, home, "C", PROBE_START_TURN=exit_at, **common)
+    assert result["engine"] == "lcm-x", result
+    return result
+
+
+CRASH_CELLS = {  # (gateway reload every turn, clean exit before this turn then a second restart)
+    "acp-history": (False, 0),
+    "gateway-reload": (True, 0),
+    "gateway-second-restart": (True, 18),
+}
+_TIP_SWITCH = pytest.mark.xfail(strict=True, reason="harness, not #553: the probe switches agent.session_id to the "
+                                "compression tip in process, which LCM's resident-engine guard refuses (post_llm_call "
+                                "skipped ingest: resident_engine_conflict); 1 conflict and 25 duplicates on the base too")
+_LONG = pytest.mark.skipif(os.environ.get("LCM_REAL_HERMES_LONG") != "1", reason="opt-in: set LCM_REAL_HERMES_LONG=1")
+
+
+@_LONG
+@pytest.mark.parametrize("in_place,cell", [
+    pytest.param(in_place, cell, id=f"{'in-place' if in_place else 'rotation'}-{cell}",
+                 marks=[_TIP_SWITCH] if not in_place and CRASH_CELLS[cell][0] else [])
+    for in_place in (True, False) for cell in sorted(CRASH_CELLS)
+])
+def test_crash_after_preflight_compaction_keeps_publishing(tmp_path, in_place, cell):
+    """#553: the retained row R dangles; the next turn merges its prompt into R and the persist step
+    replaces the row (S2). Every later turn completes, publishes and is stored exactly once."""
+    reload, exit_at = CRASH_CELLS[cell]
+    result = _run_crash_restart(tmp_path, in_place=in_place, reload=reload, exit_at=exit_at)
+    assert result["failed_turns"] == [] and result["duplicate_rows"] == 0 and result["conflicts"] == 0, result
+    assert result["compactions_published"] >= 8, result
+    assert {t: c for t, c in result["user_rows_by_turn"].items() if c != 1} == {}, result
+    if in_place and not exit_at:  # the last phase's log: A admitted the replaced row and recorded it
+        assert result["recorded_replaced"] >= 1, result
+
+
+@_LONG
+@pytest.mark.parametrize("in_place", [
+    True,
+    pytest.param(False, marks=pytest.mark.xfail(strict=True, reason=(
+        "outside #553's C1: the tool call's in-turn compaction rotates again before the persist step, and the "
+        "empty child then re-stores its list (#519 R2): 45 duplicates and every turn from 27 fails, the same on the base"))),
+], ids=["in-place", "rotation"])
+def test_crash_then_lcm_tool_call_in_the_merge_turn_keeps_publishing(tmp_path, in_place):
+    """#553 S1: the merge turn dispatches a real LCM tool call, which ingests the merged row whole
+    before the persist step replaces it; the composite holds R's and U's bytes (stored once)."""
+    result = _run_crash_restart(tmp_path, in_place=in_place, tool_turn=True)
+    assert result["tool_calls"] >= 1, result  # the dispatch really fired
+    assert result["failed_turns"] == [] and result["duplicate_rows"] == 0 and result["conflicts"] == 0, result
+    assert result["compactions_published"] >= 8 and result["turns_missing"] == [], result

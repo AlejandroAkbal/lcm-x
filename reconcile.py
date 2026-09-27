@@ -366,8 +366,19 @@ def _merge_append_cut(identity, is_base, start: int = 0) -> bool:
 # Per stored user row, keyed by store_id (survives rotation and restart): the
 # identity content of the form a host rewrote that row to in place (#498).
 _HOST_REWRITE_IDENTITY_METADATA_PREFIX = "host_rewrite_identity"
+# Per in-place session (#553): the retained last rows the host replaced, which the publication passes.
+_HOST_REPLACED_ROWS_METADATA_PREFIX = "host_replaced_rows"
 # The in-process override cache is read-through (a miss reloads from metadata): FIFO-bounded.
 _HOST_REWRITE_OVERRIDE_CACHE_CAP = 1024
+
+
+def _merge_append_cuts(content: str, limit: int = 64) -> list:
+    """#553 E: the first ``limit`` positions of Hermes' consecutive-user joiner in ``content``."""
+    cuts, cut = [], content.find("\n\n")
+    while cut >= 0 and len(cuts) < limit:
+        cuts.append(cut)
+        cut = content.find("\n\n", cut + 1)
+    return cuts
 
 
 def _commit_proof_identity_digest(identity) -> str:
@@ -2189,6 +2200,7 @@ class ReconcileMixin:
             skip_metadata_valid = len(skip_landing) == len(target)
             matched = 0
             index = composite = 0
+            merged_at = None
             n = len(messages)
             if not target:
                 # A scaffold-only output (fresh_tail_count=0): the proof covers exactly
@@ -2224,6 +2236,7 @@ class ReconcileMixin:
                 ):
                     index -= 1  # #535: a new user row merged behind the last output row: stored whole
                     matched += 1
+                    merged_at = index  # #553 E: ... or, after Hermes' persist step, its new part alone
                     break
                 if digest != target[matched] and matched == len(target) - 1 and (
                     allow_replaced_tail is not None and not native and identity[0] == "user" and tuple(identity[2:]) == ("", "", "")
@@ -2284,9 +2297,18 @@ class ReconcileMixin:
                     if index >= n:
                         return None
                     identity = proof_identity(messages[index], stored_row=index + 1 == composite)
-                    if _has_lossy_redacted_identity(identity) or identity != proof_identity(
-                        row, stored_row=True, with_host_rewrite=True
+                    stored = proof_identity(row, stored_row=True, with_host_rewrite=True)
+                    if index == merged_at and identity != stored and identity[0] == stored[0] == "user" and tuple(
+                        identity[2:]
+                    ) == tuple(stored[2:]) and any(
+                        identity[1][cut + 2:].strip() == stored[1] and _commit_proof_identity_digest(
+                            proof_identity((identity[0], identity[1][:cut], *identity[2:]))
+                        ) == target[-1]
+                        for cut in _merge_append_cuts(identity[1])
                     ):
+                        identity = stored  # #553 E: the first own row is the merged row's new part alone
+                    merged_at = None
+                    if _has_lossy_redacted_identity(identity) or identity != stored:
                         return None
                     index += 1
                 after_store_id = int(page[-1]["store_id"])
@@ -2322,6 +2344,45 @@ class ReconcileMixin:
                 logger.info("LCM rewrote the rotation child's carry ranges (%s): store ids %s", reason, store_ids)
         except Exception:
             logger.debug("LCM carry-range rewrite failed", exc_info=True)
+
+    def _in_place_proof_cursor(self, messages, floor) -> Optional[int]:
+        """#553 A: the in-place session's own proof walk also admits the last output row the host
+        replaced (#519 R1's predicate: the carry end is this session's OWN user row whose digest is
+        the proof's last target, and the session owns no row after the proof). That position and
+        every later row are stored as new. The replaced row is recorded for the publication to pass
+        (in place it cannot leave the carry: the session owns it). Any other shape, a cursor at or
+        below ``floor``, or a failed record is today's walk."""
+        replaced: list = []
+        proof_cursor = self._cursor_from_durable_commit_proof(messages, allow_replaced_tail=replaced)
+        if not replaced:
+            return proof_cursor
+        if (proof_cursor or 0) > (floor or 0) and all(source == self._session_id for source, _s, _e in replaced) and (
+            self._record_host_replaced_rows([end for _source, _start, end in replaced])
+        ):
+            return proof_cursor
+        return self._cursor_from_durable_commit_proof(messages)
+
+    def _load_host_replaced_rows(self) -> list:
+        try:
+            payload = self._store.read_metadata_json(f"{_HOST_REPLACED_ROWS_METADATA_PREFIX}:{self._session_id}")
+            return sorted({int(i) for i in payload.get("store_ids", [])}) if isinstance(payload, dict) else []
+        except Exception:
+            logger.debug("LCM host-replaced rows load failed", exc_info=True)
+            return []
+
+    def _record_host_replaced_rows(self, store_ids) -> bool:
+        """#553 A: bounded (the newest 16), fail-soft: False when the record was not written."""
+        try:
+            ids = sorted(set(self._load_host_replaced_rows()) | {int(i) for i in store_ids})[-16:]
+            if not self._store.write_metadata_json(
+                [f"{_HOST_REPLACED_ROWS_METADATA_PREFIX}:{self._session_id}"], json.dumps({"version": 1, "store_ids": ids})
+            ):
+                return False
+            logger.info("LCM recorded host-replaced rows for session %s: store ids %s", self._session_id, ids)
+            return True
+        except Exception:
+            logger.debug("LCM host-replaced rows write failed", exc_info=True)
+            return False
 
     def _cursor_from_host_rewrite_head(self, messages, session_count: int) -> Optional[int]:
         """Head-anchored replay (#498): stored row i vs incoming i from the session start,
@@ -2441,6 +2502,29 @@ class ReconcileMixin:
         bases = (head, (head[0], head[1].rstrip(), *head[2:]))  # the exact joiner; only B's trailing whitespace may go
         pairs = [(ident, row)] + ([((ident[0], rest, *ident[2:]), {**row, "content": rest})] if rest is not None else [])
         return next((pair for form, pair in pairs if _merge_append_cut(form, lambda prefix: prefix in bases, len(bases[1][1]))), None)
+
+    def _merge_append_remainder(self, base, row) -> Optional[str]:
+        """#553 B: the text a host merged behind stored ``base`` to build stored ``row`` (a plain #535
+        pair, never a carrier), else None."""
+        if row.get("role") != "user" or not isinstance(row.get("content"), str) or self._merged_pair_row(base, row) is None:
+            return None
+        content, head = row["content"], normalize_content_value(base.get("content")) or ""
+        for prefix in (head, head.rstrip()):
+            if prefix and content.startswith(prefix + "\n\n") and content[len(prefix) + 2:].strip():
+                return content[len(prefix) + 2:]
+        return None
+
+    def _restored_merge_form(self, base, row, recorded) -> Optional[str]:
+        """#553 D': ``base + "\\n\\n" + row`` when ``base`` is a row A recorded (``recorded``), both are
+        plain stored user rows and ``row`` is not a merge-append of ``base``: the form a state.db reload
+        re-merges after the persist step replaced ``base`` by ``row``. Else None."""
+        if int(base.get("store_id") or 0) not in recorded or any(
+            r.get("role") != "user" or not isinstance(r.get("content"), str) or r.get("tool_call_id") or r.get("tool_calls")
+            for r in (base, row)
+        ) or self._merged_pair_row(base, row) is not None:
+            return None
+        head, tail = base["content"], row["content"]
+        return head + "\n\n" + tail if head.strip() and tail.strip() else None
 
     def _collapse_merge_append_bases(self, rows) -> list:
         """#535: a stored row the next stored row holds merge-appended is one host occurrence with it
@@ -2579,7 +2663,7 @@ class ReconcileMixin:
         head_cursor = self._cursor_from_host_rewrite_head(messages, session_count)
         if head_cursor is not None and head_cursor > (cursor or 0):
             cursor = head_cursor  # the greatest independently proven cursor wins
-        proof_cursor = self._cursor_from_durable_commit_proof(messages)
+        proof_cursor = self._in_place_proof_cursor(messages, cursor)  # #553: admits the replaced last row
         if proof_cursor is not None and proof_cursor > (cursor or 0):
             # The last compaction's durable output proof covers more of this
             # snapshot than content matching could (e.g. it stopped at the
@@ -2698,7 +2782,7 @@ class ReconcileMixin:
             )
             return len(messages)
 
-        proof_cursor = self._cursor_from_durable_commit_proof(messages)
+        proof_cursor = self._in_place_proof_cursor(messages, 0)  # #553
         if proof_cursor is not None:
             self._record_ingest_reconciliation(
                 action="advanced cursor",
@@ -2990,7 +3074,9 @@ class ReconcileMixin:
         """Return whether ``message`` is the unique active durable fold."""
         return bool(self._active_folded_tail_identity_overrides([message]))
 
-    def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]], occurrences=None) -> dict[int, int]:
+    def _get_store_id_map_for_messages(
+        self, messages: List[Dict[str, Any]], occurrences=None, *, merge_forms: bool = True
+    ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated
@@ -3005,6 +3091,8 @@ class ReconcileMixin:
         the compaction frontier. It is admitted only when exactly one active
         message has its durable identity, so content duplication cannot make the
         old row hijack another occurrence.
+
+        ``merge_forms=False`` (the ingest pre-map, which decides storage) omits #553's B / D' forms.
         """
         candidates: list[Dict[str, Any]] = []
         active_lineage_identities = self._active_folded_tail_identity_overrides(
@@ -3117,6 +3205,20 @@ class ReconcileMixin:
                 stored_cleanup_identity_counts[cleanup_identity] = (
                     stored_cleanup_identity_counts.get(cleanup_identity, 0) + 1
                 )
+
+        # #553 B: a stored #535 composite (its base the candidate right before it) also admits its
+        # remainder alone (the persist step replaced the merged row by it). D': a stored user row right
+        # after a row A recorded also admits both re-merged (the host's state.db reload).
+        recorded = self._load_host_replaced_rows() if merge_forms and len(candidates) > 1 else []
+        for index in range(1, len(candidates) if merge_forms else 0):
+            if stored_alt_identities[index] is None:
+                base, row = candidates[index - 1], candidates[index]
+                rest = self._merge_append_remainder(base, row)
+                rest = self._restored_merge_form(base, row, recorded) if rest is None else rest
+                alt = None if rest is None else self._message_replay_identity({**row, "content": rest}, stored_row=True)
+                if alt is not None and alt != stored_identities[index]:
+                    stored_alt_identities[index] = alt
+                    stored_identity_counts[alt] = stored_identity_counts.get(alt, 0) + 1
 
         # #488: map occurrences, never bytes alone. ``occurrences`` is the caller's slice of its
         # COMPLETE list's projection (A2); compress() registers its admitted list once (F5).

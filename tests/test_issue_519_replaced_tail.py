@@ -255,7 +255,8 @@ def test_second_restart_restores_the_composite(tmp_path, monkeypatch, caplog):
 
 
 def test_second_restart_stores_no_more_than_the_base(tmp_path, monkeypatch, caplog):
-    """T4's pinned count: the head's two restarts store fewer rows than the base's (2 + 18 vs 18 + 18)."""
+    """T4's pinned count: the head's two restarts store fewer rows than the base's (2 + 1 vs 18 + 18):
+    #553 E admits the restored composite over the child's first stored row, so only T18 is new."""
     def run(path, fixed):
         if not fixed:
             _base_behaviour(monkeypatch)
@@ -274,7 +275,7 @@ def test_second_restart_stores_no_more_than_the_base(tmp_path, monkeypatch, capl
 
     fixed = run(tmp_path / "fixed", True)
     base = run(tmp_path / "base", False)
-    assert fixed == (2, 18) and base == (18, 18)
+    assert fixed == (2, 1) and base == (18, 18)
 
 
 def _middle_rewrite(r):

@@ -1753,6 +1753,11 @@ class CompactionMixin:
                 carried_ranges,
             )
             publication_excluded_store_ids.extend(filter_exclusion_proofs)
+            consumed_set = set(consumed_store_ids)  # #553 A: a row the host replaced in place is passed, never claimed
+            publication_excluded_store_ids.extend(
+                store_id for store_id in self._load_host_replaced_rows()
+                if expected_frontier < store_id <= published_frontier and store_id not in consumed_set
+            )
             # The frontier consumes every durable row removed from the active
             # prefix, including trailing dependent replies. Summary lineage
             # excludes those replies; their durable ledger drives replay cleanup.

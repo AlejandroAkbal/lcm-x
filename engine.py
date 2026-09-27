@@ -5326,7 +5326,9 @@ class LCMEngine(
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
+            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(
+                messages, merge_forms=False  # #553: storage never rides on the B / D' forms
+            )
             try:
                 for idx in range(scan_start, n):
                     mapped_ignore = self._mapped_stored_row_matches_ignore_message_patterns(messages[idx])
@@ -5773,17 +5775,22 @@ class LCMEngine(
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]], full_map=None) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
         ids = [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
-        return ids if full_map is None else self._with_merge_append_bases(ids, set(full_map.values()))
+        host = {ids_by_message_id[id(msg)]: msg.get("content") for msg in messages if id(msg) in ids_by_message_id}
+        return ids if full_map is None else self._with_merge_append_bases(ids, set(full_map.values()), host)
 
-    def _with_merge_append_bases(self, ids: List[int], mapped: set) -> List[int]:
+    def _with_merge_append_bases(self, ids: List[int], mapped: set, host=None) -> List[int]:
         """#535: a consumed row the host built by merging a new user row behind the previous lineage
         row B consumes B too when B is above F, owned as the publication requires (this session or a
         proven carry range, same conversation), no message of the full list maps it, and its bytes
-        are inside the consumed row (the summarizer reads them there)."""
+        are inside the consumed row (the summarizer reads them there). #553 D': or B is the row the
+        host replaced (recorded) and the host row mapped here is exactly B + "\\n\\n" + this row."""
         frontier, rows, carry, out = int(self._last_compacted_store_id or 0), self._store.get_batch(ids), None, []
+        recorded = None
         for store_id in ids:
             row = rows.get(store_id) or {}
-            if row.get("role") == "user" and "\n\n" in str(row.get("content") or ""):
+            restored = (host or {}).get(store_id)
+            restored = restored if isinstance(restored, str) and restored != row.get("content") and "\n\n" in restored else None
+            if row.get("role") == "user" and ("\n\n" in str(row.get("content") or "") or restored is not None):
                 carry = self._load_compression_carry_ranges() if carry is None else carry  # a rotation child's parents
                 prior = self._store.get_session_rows_through(self._session_id, store_id - 1, 1) + [
                     r for sid, start, end in carry
@@ -5793,7 +5800,11 @@ class LCMEngine(
                 base_id, owner = int(base.get("store_id") or 0), str(base.get("session_id") or "")
                 owned = owner == self._session_id or any(owner == sid and start < base_id <= end for sid, start, end in carry)
                 owned = owned and str(base.get("conversation_id") or "").strip() in {"", str(self._conversation_id or "")}
-                if owned and frontier < base_id and base_id not in mapped.union(ids, out) and self._merged_pair_row(base, row):
+                if restored is not None and recorded is None:
+                    recorded = self._load_host_replaced_rows()
+                if owned and frontier < base_id and base_id not in mapped.union(ids, out) and (
+                    self._merged_pair_row(base, row) or restored is not None and restored == self._restored_merge_form(base, row, recorded)
+                ):
                     out.append(base_id)
             out.append(store_id)
         return out

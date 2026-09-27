@@ -1035,7 +1035,7 @@ def test_durable_commit_proof_only_extends_the_reconciled_cursor(tmp_path, monke
             host.extend(_turn(i))
             engine.ingest(host)
         rows = _row_count(engine)
-        monkeypatch.setattr(engine, "_cursor_from_durable_commit_proof", lambda messages: 1)
+        monkeypatch.setattr(engine, "_cursor_from_durable_commit_proof", lambda messages, allow_replaced_tail=None: 1)
         engine._ingest_cursor = 0
         engine._ingest_cursor_needs_reconcile = True
         engine.ingest(host)

@@ -366,14 +366,14 @@ def test_persist_step_after_the_merge_stores_nothing_twice(tmp_path, monkeypatch
         s.engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="#519: after the persist step the replaced last row (NEW alone) is not "
-                   "mapped to the stored composite, so the next compaction cannot prove contiguous coverage")
 @pytest.mark.parametrize("mode", ["inplace", "rotation"])
 def test_persist_step_after_the_merge_compacts_again(tmp_path, monkeypatch, mode):
+    """#553 B: the replaced last row (NEW alone) maps the stored composite; N2 consumes its base."""
     s, _before = _persisted(tmp_path, monkeypatch, mode)
     try:
         s.turns(40)
         assert s.compact()[0] == "compacted", s.engine._last_compression_noop_reason
+        assert _dups(s.engine) == 0 and _raw_count(s.engine, NEW) == 1
     finally:
         s.engine.shutdown()
 
