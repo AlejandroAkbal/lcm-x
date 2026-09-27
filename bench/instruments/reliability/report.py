@@ -50,6 +50,9 @@ def issue_status(rows: list[dict], capability: str, bars: tuple) -> tuple[str, s
     if not live:
         why = "; ".join(sorted({str(r.get("reason"))[:90] for r in rows})) if rows else capability
         return f"NOT COVERED ({why or 'no targeting cell'})", ""
+    unapplied = [b for b in bars if not any(b in (r.get("applicable_bars") or ()) for r in live)]
+    if unapplied:  # a bar no targeting cell evaluated is not a pass
+        return f"NOT COVERED on {'/'.join(unapplied)} (no targeting cell applies it)", ""
     hits = sorted((r for r in live if set(r.get("failed_bars", {})) & set(bars)), key=lambda r: r["cell"])
     if hits:
         return ("target cell FAILS (" + ", ".join(r["cell"] for r in hits) + ")",
@@ -68,7 +71,7 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
     env = f"Global LCM env override: `{json.dumps(lcm_env)}`." if lcm_env else "No global LCM env override."
     lines = ["# Reliability matrix", "", BOUNDARY, "", env, f"Wall clock: {wall:.0f} s for {len(results)} cells.", ""]
     for ref, sha in refs:
-        rs = [r for r in results if r["plugin_sha"][:12] == sha]
+        rs = [r for r in results if r["plugin_ref"] == ref and r["plugin_sha"][:12] == sha]
         by = {(r["cell"], r["host"]): r for r in rs}
         lines += [f"## lcm-x `{ref}` ({sha})", "", "| cell | " + " | ".join(hosts) + " |", "|---|" + "---|" * len(hosts)]
         for cid in [c for c in order if any((c, h) in by for h in hosts)]:
@@ -97,7 +100,7 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
           "\"target cell FAILS\" = a cell targeting the issue fails that issue's bar at the evaluated ref. It is a "
           "signal, not an attribution: whether the failure IS that issue is a human call from the signature.", ""]
     for ref, sha in refs:
-        rs = [r for r in results if r["plugin_sha"][:12] == sha]
+        rs = [r for r in results if r["plugin_ref"] == ref and r["plugin_sha"][:12] == sha]
         im += [f"## lcm-x `{ref}` ({sha})", "",
                "| issue | bar | targeting cells | host | status | signature |", "|---|---|---|---|---|---|"]
         for issue, (issue_bars, capability) in ISSUES.items():

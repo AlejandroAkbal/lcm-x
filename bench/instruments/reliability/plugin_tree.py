@@ -41,9 +41,6 @@ def export(repo: Path, ref: str, plugins_root: Path) -> dict:
         dest.mkdir(parents=True, exist_ok=True)
         blob = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", sha], capture_output=True, check=True).stdout
         with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
-            try:
-                tar.extractall(dest, filter="data")
-            except TypeError:  # Python without extraction filters
-                tar.extractall(dest)
+            tar.extractall(dest, filter="data")
         done.write_text(sha + "\n")
     return {"ref": ref, "sha": sha, "tree": str(dest), **identity(dest)}

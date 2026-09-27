@@ -15,15 +15,22 @@ CONTROLS = {
                         ("ae1fb16d", "baseline/in-place/acp"): "PASS", ("ae1fb16d", "acp-trailing/in-place"): "PASS"}},
     "PC-2": {"refs": ["v0.24.2"], "hosts": "all", "cells": ["parallel-tool-group/in-place", "parallel-tool-group/rotation"],
              "expect": {("v0.24.2", "*"): "FAIL"}, "bars": ["B6"]},
-    "PC-3": {"refs": ["origin/main"], "hosts": "all", "cells": ["crash-then-lcm-tool-in-merge-turn/in-place"],
-             "expect": {("origin/main", "*"): "FAIL"}},
+    # Pinned known-bad main before the #553 fix (a moving origin/main is not a control).
+    "PC-3": {"refs": ["508f893517f52a400c2bfe0b37f914e864ff806c"], "hosts": "all",
+             "cells": ["crash-then-lcm-tool-in-merge-turn/in-place"],
+             "expect": {("508f893517f52a400c2bfe0b37f914e864ff806c", "*"): "FAIL"}, "bars": ["B3"]},
 }
 
 
-def check(name: str, rows: list[dict]) -> list[str]:
-    """Every (ref, cell, host) the control expects is present with the expected verdict (and failed bar)."""
+def check(name: str, rows: list[dict], run_hosts: list[str] | None = None) -> list[str]:
+    """Every (ref, cell, host) the control expects is present with the expected verdict (and failed bar).
+    ``"all"`` means the hosts the run requested (``run_hosts``), never the hosts that happened to produce rows."""
     ctl, problems = CONTROLS[name], []
-    hosts = ctl["hosts"] if ctl["hosts"] != "all" else sorted({r["host"] for r in rows})
+    hosts = ctl["hosts"] if ctl["hosts"] != "all" else sorted(run_hosts or [])
+    if not hosts:
+        return [f"{name}: no host requested"]
+    if not rows:
+        problems.append(f"{name}: no result rows")
     for ref in ctl["refs"]:
         for cell in ctl["cells"]:
             want = ctl["expect"].get((ref, cell)) or ctl["expect"].get((ref, "*"))

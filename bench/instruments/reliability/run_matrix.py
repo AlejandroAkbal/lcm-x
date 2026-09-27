@@ -42,9 +42,9 @@ def config_yaml(cell: dict, plugin: dict) -> str:
 
 
 def backup(src: Path, dst: Path) -> None:
-    """WAL-safe copy through the sqlite3 backup API."""
+    """WAL-safe copy through the sqlite3 backup API; a missing source is an error."""
     if not src.exists():
-        return
+        raise FileNotFoundError(f"{src} does not exist")
     s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     d = sqlite3.connect(dst)
     try:
@@ -53,6 +53,37 @@ def backup(src: Path, dst: Path) -> None:
     finally:
         d.close()
         s.close()
+
+
+def copy_dbs(home: Path, dbdir: Path) -> list[str]:
+    """Copy lcm.db and state.db for scoring; every failure is returned, and any failure means the cell is not scored."""
+    errors = []
+    for name in ("lcm.db", "state.db"):
+        try:
+            backup(home / name, dbdir / name)
+        except (sqlite3.Error, OSError) as exc:
+            errors.append(f"{name}: {exc!r}"[:300])
+    return errors
+
+
+def verdict_fields(cell: dict, d: Path, last: dict, fired: set, citations: dict, backup_errors: list[str]) -> dict:
+    """The record's verdict. The scorers only run on a finished probe with complete DB copies."""
+    if last["exit"] == "unsupported":
+        return {"verdict": "UNSUPPORTED", "reason": last.get("reason")}
+    if last["exit"] != "done":
+        return {"verdict": "ERROR", "reason": last.get("reason") or last}
+    if backup_errors:
+        return {"verdict": "ERROR", "reason": "database copy failed, not scored: " + "; ".join(backup_errors)}
+    if reason := unfired_reason(cell, fired, citations):
+        return {"verdict": "UNSUPPORTED", "reason": reason}
+    try:
+        scored = bars.score(cell, d)
+    except Exception as exc:  # a scorer failure is a harness ERROR, never a PASS
+        return {"verdict": "ERROR", "reason": f"scoring failed: {exc!r}"}
+    rec = {k: scored[k] for k in ("verdict", "failed_bars", "numbers", "inconclusive_bars", "applicable_bars")}
+    if scored.get("reason"):
+        rec["reason"] = scored["reason"]
+    return rec
 
 
 def unfired_reason(cell: dict, fired: set, citations: dict) -> str | None:
@@ -73,6 +104,8 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
         if "LCM_NATIVE_RECOVERY" in lcm_env:
             cell["native_recovery"] = lcm_env["LCM_NATIVE_RECOVERY"].lower() == "true"
     d = out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"])
+    if (out / "cells").resolve() not in d.resolve().parents:
+        raise ValueError(f"cell dir {d} is not under {out / 'cells'}")
     if d.exists():
         shutil.rmtree(d)
     home = d / "hermes-home"
@@ -112,31 +145,13 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
         break
     else:
         last = {"exit": "error", "reason": "phase budget exhausted"}
-    for name in ("lcm.db", "state.db"):
-        try:
-            backup(home / name, d / "db" / name)
-        except sqlite3.Error as exc:
-            last.setdefault("backup_error", repr(exc))
+    backup_errors = copy_dbs(home, d / "db")  # consulted only for a finished probe (verdict_fields)
     fired_file = d / "faults-fired.jsonl"
     fired = {json.loads(x)["kind"] for x in fired_file.read_text().splitlines()} if fired_file.exists() else set()
     first_phase = d / "phase-A.json"
     citations = json.loads(first_phase.read_text()).get("citations", {}) if first_phase.exists() else {}
     rec.update(phases=phases_run, wall_s=round(time.time() - started, 1), citations=citations)
-    if last["exit"] == "unsupported":
-        rec.update(verdict="UNSUPPORTED", reason=last.get("reason"))
-    elif last["exit"] != "done":
-        rec.update(verdict="ERROR", reason=last.get("reason") or last)
-    elif reason := unfired_reason(cell, fired, citations):
-        rec.update(verdict="UNSUPPORTED", reason=reason)
-    else:
-        try:
-            scored = bars.score(cell, d)
-            rec.update(verdict=scored["verdict"], failed_bars=scored["failed_bars"], numbers=scored["numbers"],
-                       inconclusive_bars=scored["inconclusive_bars"])
-            if scored.get("reason"):
-                rec["reason"] = scored["reason"]
-        except Exception as exc:  # a scorer failure is a harness ERROR, never a PASS
-            rec.update(verdict="ERROR", reason=f"scoring failed: {exc!r}")
+    rec.update(verdict_fields(cell, d, last, fired, citations, backup_errors))
     (d / "verdict.json").write_text(json.dumps(rec, indent=1, default=str))
     if keep_dbs == "fail" and rec["verdict"] == "PASS":  # a PASS cell's DBs are regenerable
         shutil.rmtree(d / "db", ignore_errors=True)
@@ -144,6 +159,19 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(d / "files", ignore_errors=True)
     return rec
+
+
+def env_refusal(lcm_env: dict) -> str | None:
+    """--lcm-env takes LCM_* tuning only: no path-valued keys (a path could point at a live DB) and no secrets
+    (they would be persisted in run.json, cell.json and the reports)."""
+    for k in lcm_env:
+        if not k.startswith("LCM_"):
+            return f"--lcm-env key {k} must start with LCM_"
+        if re.search(r"(_PATH|_DIR|_HOME|_FILE)$", k) or k == "LCM_DATABASE_PATH":
+            return f"--lcm-env key {k} is path-valued; refused"
+        if re.search(r"KEY|TOKEN|SECRET|PASSWORD", k):
+            return f"--lcm-env key {k} is secret-shaped; refused"
+    return None
 
 
 def main(argv=None) -> int:
@@ -171,9 +199,11 @@ def main(argv=None) -> int:
     out = Path(a.out).resolve()
     if str(out) == "/tmp" or str(out).startswith(("/tmp/", "/private/tmp")):
         ap.error("--out must not be under /tmp")
+    if H.under_real_hermes(out):
+        ap.error("--out must not be under the live ~/.hermes")
     lcm_env = dict(kv.split("=", 1) for kv in a.lcm_env)
-    if any(not k.startswith("LCM_") for k in lcm_env):
-        ap.error("--lcm-env keys must start with LCM_")
+    if bad := env_refusal(lcm_env):
+        ap.error(bad)
     hosts = H.load(H.hosts_file(a.hosts_file), None if a.hosts == "all" else a.hosts.split(","))
     identities = {}
     for name, host in hosts.items():
@@ -183,6 +213,8 @@ def main(argv=None) -> int:
             identities[name] = {"error": str(exc)}
     selected = C.select(a.cells)
     plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins") for ref in a.plugin_ref.split(",")]
+    if len({p["sha"] for p in plugins}) < len(plugins):
+        ap.error(f"--plugin-ref values resolve to the same commit: {[(p['ref'], p['sha'][:12]) for p in plugins]}")
     out.mkdir(parents=True, exist_ok=True)
     (out / "run.json").write_text(json.dumps({"argv": sys.argv, "hosts": hosts, "plugins": plugins, "lcm_env": lcm_env,
                                               "host_identity": identities, "cells": [c["id"] for c in selected]}, indent=1))
@@ -207,7 +239,7 @@ def main(argv=None) -> int:
                   + (f"  {str(rec.get('reason'))[:120]}" if rec.get("reason") else ""), flush=True)
     report.write(out, results, time.time() - started, lcm_env)
     if a.control:
-        problems = CT.check(a.control, results)
+        problems = CT.check(a.control, results, list(hosts))
         (out / "CONTROL.json").write_text(json.dumps({"control": a.control, "holds": not problems, "problems": problems}, indent=1))
         print(f"CONTROL {a.control}: {'HOLDS' if not problems else 'DOES NOT HOLD'} {problems[:5]}", flush=True)
         return 0 if not problems else 1

@@ -147,6 +147,7 @@ def score(cell: dict, cell_dir: Path) -> dict:
         full = con.execute("select store_id, session_id, role, content, tool_calls, tool_call_id from messages"
                            " order by store_id").fetchall()
         stored = [r[:4] for r in full]
+        nodes = con.execute("select node_id, session_id, source_ids from summary_nodes where source_type = 'messages'").fetchall()
     finally:
         con.close()
     atts = attempts(events)
@@ -212,8 +213,12 @@ def score(cell: dict, cell_dir: Path) -> dict:
         inconclusive["B4"] = f"forced compaction ended {final.get('engine_status')!r} ({final.get('noop_reason')!r}) " \
                              f"after {len(final.get('attempts', []))} attempt(s) of {final.get('entry')}"
     grow = summary.growth(events, sum(p.get("compactions_logged", 0) for p in phases), cell.get("min_compactions", 5))
+    session_of = {r[0]: r[1] for r in full}
+    crossing = [nid for nid, sid, src in nodes  # a summary must only cover rows of its own session lineage
+                if any(group(session_of.get(i, f"missing:{i}")) != group(sid) for i in json.loads(src or "[]"))]
+    grow["cross_lineage_nodes"] = crossing[:10]
     numbers["B5"] = grow
-    if not grow["ok"]:
+    if not grow["ok"] or crossing:
         failed["B5"] = {k: v for k, v in grow.items() if k != "depth0_sequence"} | {"depth0_tail": grow["depth0_sequence"][-8:]}
     tg = tool_groups.split_groups(db)
     hooked = all("orphan_hook" not in p for p in phases)

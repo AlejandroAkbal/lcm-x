@@ -15,6 +15,7 @@ import io
 import json
 import os
 import pwd
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -75,11 +76,17 @@ def verify(name: str, host: dict) -> dict:
     """Prove the tree at ``src`` IS the configured sha; raise otherwise."""
     src, sha = Path(host["src"]), host["sha"]
     if (src / ".git").exists():
-        head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(src), "status", "--porcelain", "--untracked-files=no"],
-                               capture_output=True, text=True).stdout.strip()
-        if head != sha or dirty:
-            raise ValueError(f"host {name}: git HEAD {head} != {sha} or tracked files modified")
+        def git(*args):  # every git command must succeed, or the tree is not verified
+            done = subprocess.run(["git", "-C", str(src), *args], capture_output=True, text=True)
+            if done.returncode:
+                raise ValueError(f"host {name}: git {' '.join(args)} failed: {done.stderr.strip()[:200]}")
+            return done.stdout.strip()
+        head = git("rev-parse", "HEAD")
+        dirty = git("status", "--porcelain", "--untracked-files=all")  # untracked files can shadow modules
+        ignored_py = git("ls-files", "--others", "--ignored", "--exclude-standard", "--", "*.py")
+        if head != sha or dirty or ignored_py:
+            raise ValueError(f"host {name}: git HEAD {head} != {sha}, or the tree has modified/untracked files "
+                             f"or ignored *.py: {(dirty or ignored_py)[:200]}")
         return {"method": "git HEAD", "head": head}
     mpath = manifest_path(src)
     if not mpath.exists():
@@ -103,6 +110,8 @@ def load(path: Path, names: list[str] | None = None, hermes_dir: Path | None = N
             raise ValueError(f"unknown hosts {unknown}; {path} lists {sorted(hosts)}")
         hosts = {n: hosts[n] for n in names}
     for name, host in hosts.items():
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in (".", ".."):
+            raise ValueError(f"host name {name!r} is not a single safe path component")
         for key in ("python", "src", "sha"):
             if not host.get(key):
                 raise ValueError(f"host {name}: missing {key!r}")

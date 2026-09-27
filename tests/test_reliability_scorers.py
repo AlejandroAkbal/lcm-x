@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bench.instruments.reliability import cells, controls, hosts, plugin_tree, probe  # noqa: E402
+from bench.instruments.reliability import cells, controls, hosts, plugin_tree, probe, report, run_matrix  # noqa: E402
 from bench.instruments.reliability.scorers import bars, dupes, multiset  # noqa: E402
 
 U = "[T{:02d}] user turn {}: alpha beta end."
@@ -428,3 +428,109 @@ def test_plugin_identity_is_read_from_the_tree(tmp_path):
     assert plugin_tree.identity(old) == {"dir": "hermes-lcm", "enabled": "hermes-lcm", "engine": "lcm",
                                          "module": "hermes_plugins.hermes_lcm"}
     assert plugin_tree.identity(new)["engine"] == "lcm-x"
+
+
+def fake_compress_host(monkeypatch, compress_now):
+    for name, attrs in {"agent": {}, "agent.conversation_compression_manual": {"compress_now": compress_now,
+                                                                            "parse_compress_args": lambda s: s},
+                        "agent.conversation_compression": {"finalize_context_engine_compression_notification": lambda *a, **k: None},
+                        "acp_adapter": {}, "acp_adapter.commands": {"_estimate_tokens": lambda *a: 1}}.items():
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(**attrs))
+
+
+@pytest.mark.parametrize("host_status", ["skipped", "lock_skipped"])
+def test_r14_a1_final_check_needs_a_fresh_compressed_pass(monkeypatch, host_status):
+    engine = types.SimpleNamespace(_last_compression_status="compacted", _probe_status="compacted", _probe_calls=3)
+    fake_compress_host(monkeypatch, lambda *a, **k: types.SimpleNamespace(status=host_status, after_messages=[]))
+    stale = probe.final_check(types.SimpleNamespace(context_compressor=engine), [], probe.io.StringIO())
+    assert stale["outcome"] != "published" and not stale["published"] and stale["engine_calls"] == 0
+
+    def fresh(*_a, **_k):  # the host ran and the engine committed a pass inside this invocation
+        engine._probe_calls, engine._probe_status = engine._probe_calls + 1, "compacted"
+        return types.SimpleNamespace(status="compressed", after_messages=[])
+    fake_compress_host(monkeypatch, fresh)
+    assert probe.final_check(types.SimpleNamespace(context_compressor=engine), [], probe.io.StringIO())["outcome"] == "published"
+
+
+def test_r14_a2_controls_never_hold_without_runs():
+    assert controls.check("PC-2", []) and controls.check("PC-3", [])
+    assert controls.check("PC-3", [], ["eva-0.21.5"])  # a requested host with no row is a problem
+    assert controls.CONTROLS["PC-3"]["refs"] == ["508f893517f52a400c2bfe0b37f914e864ff806c"]
+    row = {"plugin_ref": "v0.24.2", "host": "eva-0.21.5", "verdict": "FAIL", "failed_bars": {"B6": {}}}
+    rows = [dict(row, cell=c) for c in controls.CONTROLS["PC-2"]["cells"]]
+    assert controls.check("PC-2", rows, ["eva-0.21.5"]) == []
+    assert controls.check("PC-2", rows, ["eva-0.21.5", "upstream-main"])  # "all" = requested hosts, not row hosts
+
+
+def git_host(tmp_path):
+    repo = tmp_path / "host"
+    repo.mkdir()
+    (repo / "run_agent.py").write_text("X = 1\n")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "x"], check=True)
+    return repo, subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_r14_a3_git_host_identity_fails_closed(tmp_path):
+    repo, sha = git_host(tmp_path)
+    assert hosts.verify("h", {"src": str(repo), "sha": sha})["method"] == "git HEAD"
+    (repo / "hermes_state.py").write_text("SHADOW = 1\n")  # untracked module that would be imported
+    with pytest.raises(ValueError, match="untracked"):
+        hosts.verify("h", {"src": str(repo), "sha": sha})
+    (repo / "hermes_state.py").unlink()
+    (repo / ".git" / "HEAD").write_text("garbage\n")  # every git command now fails
+    with pytest.raises(ValueError, match="failed"):
+        hosts.verify("h", {"src": str(repo), "sha": sha})
+
+
+@pytest.mark.parametrize("missing", ["lcm.db", "state.db"])
+def test_r14_a4_a_failed_db_copy_is_error_and_not_scored(tmp_path, monkeypatch, missing):
+    home, dbdir = tmp_path / "home", tmp_path / "db"
+    home.mkdir()
+    dbdir.mkdir()
+    for name in {"lcm.db", "state.db"} - {missing}:
+        sqlite3.connect(home / name).close()
+    errors = run_matrix.copy_dbs(home, dbdir)
+    assert len(errors) == 1 and errors[0].startswith(missing)
+
+    def never(*_a, **_k):
+        raise AssertionError("scored despite a failed DB copy")
+    monkeypatch.setattr(run_matrix.bars, "score", never)
+    out = run_matrix.verdict_fields({"faults": []}, tmp_path, {"exit": "done"}, set(), {}, errors)
+    assert out["verdict"] == "ERROR" and missing in out["reason"]
+
+
+def test_r14_t17_an_unapplied_bar_is_not_covered():
+    row = {"cell": "native-long-prefix/rotation", "verdict": "PASS", "applicable_bars": ["B1", "B2", "B4", "B5", "B7"]}
+    assert report.issue_status([row], "", ("B6",))[0].startswith("NOT COVERED on B6")
+    assert report.issue_status([dict(row, applicable_bars=["B6"])], "", ("B6",))[0].startswith("target cells PASS")
+
+
+def test_r14_t32_a_summary_node_across_lineages_fails(tmp_path):
+    k = "[K01] user turn 1: alpha beta end."
+    events = clean_events(2) + [
+        {"phase": "A", "turn": 1, "event": "user_sent", "tag": "K01", "session_prefix": "K", "content": k, "persist": k},
+        {"phase": "A", "turn": 1, "event": "emit", "tag": "K01", "text": "reply to K01: noted item 1."},
+        {"phase": "A", "turn": 1, "event": "turn_end", "tag": "K01", "session_prefix": "K", "held": k,
+         "user_tags": {"K01": 1}, "session": "cron_job_01"}]
+    rows = clean_rows(2) + [("user", k), ("assistant", "reply to K01: noted item 1.")]
+    sids, parents = ["S0"] * 4 + ["cron_job_01"] * 2, {"S0": None, "cron_job_01": None}
+    ok = make(tmp_path, rows=rows, events=events, sids=sids, parents=parents, nodes=[[1, 2]])
+    assert ok["verdict"] == "PASS", ok["failed_bars"]
+    out = make(tmp_path / "x", rows=rows, events=events, sids=sids, parents=parents, nodes=[[1, 2, 5]])
+    assert out["failed_bars"]["B5"]["cross_lineage_nodes"] == [1]
+
+
+def test_r14_safety_refusals(tmp_path):
+    for key in ("LCM_DATABASE_PATH", "LCM_EXPORT_DIR", "LCM_EMBEDDING_API_KEY", "LCM_AUTH_TOKEN", "HOME"):
+        assert run_matrix.env_refusal({key: "x"}), key
+    assert run_matrix.env_refusal({"LCM_CONTEXT_THRESHOLD": "0.5"}) is None
+    src = tmp_path / "src"
+    src.mkdir()
+    path = tmp_path / "hosts.json"
+    for bad in ("../escape", "/abs", "a/b"):
+        path.write_text(json.dumps({"hosts": {bad: {"python": "p", "src": str(src), "sha": "s"}}}))
+        with pytest.raises(ValueError, match="safe path component"):
+            hosts.load(path, hermes_dir=tmp_path / ".hermes")

@@ -10,6 +10,7 @@ Last stdout line: ``{"exit": done|crash|clean_exit|tip_switch|unsupported, "next
 """
 import argparse
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -45,6 +46,8 @@ ANCHORS = {  # shape -> (host file, text on the cited line)
     "commit_telemetry": ("agent/conversation_compression.py", "context compression attempt telemetry: %s"),
     "failed_turn_notice": ("agent/turn_failure_copy.py", "FAILED_TURN_NOTICE = ("),
     "tool_dispatch": ("model_tools.py", "def handle_function_call("),
+    "gateway_key_start": ("agent/agent_init.py", 'conversation_id=getattr(agent, "_gateway_session_key", None)'),
+    "gateway_key_rotation": ("agent/conversation_compression.py", 'conversation_id=getattr(agent, "_gateway_session_key", None)'),
     "engine_tool_dispatch": ("agent/tool_executor.py", "agent.context_compressor.handle_tool_call(function_name"),
 }
 # Host modules whose executed file must lie in the verified host tree (import provenance).
@@ -135,6 +138,10 @@ def refusal(cell_dir):
     resolved = Path(cell_dir).resolve()
     if any(str(resolved) == p or str(resolved).startswith(p + "/") for p in ("/tmp", "/private/tmp")):
         return f"--cell-dir {resolved} is under /tmp"
+    for key, value in os.environ.items():  # an LCM path override may only point inside this cell
+        if key.startswith("LCM_") and re.search(r"(_PATH|_DIR|_HOME|_FILE)$", key) and value:
+            if resolved not in Path(value).expanduser().resolve().parents:
+                return f"{key}={value!r} points outside the cell dir"
     return None
 
 
@@ -213,7 +220,8 @@ def main():
               host_commits=buf.getvalue().count(COMMITTED) - cur["commits0"], **extra)
 
     needed = {"acp": ["acp_persist"] + (["acp_restore"] if phase != "A" else []),
-              "gateway": ["gateway_transcript", "gateway_user_text", "gateway_run"]}[cell["transport"]]
+              "gateway": ["gateway_transcript", "gateway_user_text", "gateway_run", "gateway_key_start",
+                          "gateway_key_rotation"]}[cell["transport"]]
     needed += [k for f in faults for k in FAULT_CITES.get(f, [])]
     needed += ["orphan_drop"] if cell.get("tool_plan") else []
     needed += ["commit_telemetry", "summary_aborted"] if cell.get("native_recovery") else []
@@ -276,12 +284,21 @@ def main():
     cur = {"turn": 0, "step": 0, "native": 0, "sess": "S0", "ended": None, "final": False, "commits0": 0,
            "issued": set(), "seen": set()}
 
-    def build(session_id, platform):
+    # A real gateway builds its agent with the chat's stable session key (gateway/run_turn_runner.py
+    # ``gateway_session_key=ctx.session_key``); the host forwards it to the engine as conversation_id.
+    gw_key = f"rel:{re.sub(r'[^A-Za-z0-9_.-]+', '__', cell['id'])}:chat1" if cell["transport"] == "gateway" else None
+    if gw_key and "gateway_session_key" not in inspect.signature(AIAgent.__init__).parameters:
+        finish("unsupported", reason="AIAgent takes no gateway_session_key at this host sha")
+        return
+    out["gateway_session_key"] = gw_key
+
+    def build(session_id, platform, key=None):
         with patch("agent.process_bootstrap.OpenAI"):
             ag = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", model="test/model",
                          quiet_mode=True, session_db=SessionDB(db_path=home / "state.db"), session_id=session_id,
                          skip_context_files=True, skip_memory=True, platform=platform,
-                         enabled_toolsets=cell.get("toolsets", ["todo", "context_engine", "file"]))
+                         enabled_toolsets=cell.get("toolsets", ["todo", "context_engine", "file"]),
+                         **({"gateway_session_key": key} if key else {}))
         ag.client, ag.tool_delay, ag.save_trajectories = MagicMock(), 0, False
         ag.compression_in_place = bool(cell["in_place"])
         ag._compression_feasibility_checked = True
@@ -295,7 +312,8 @@ def main():
     sid = "S0"
     if phase != "A" and cell["transport"] == "gateway":  # a restarted gateway binds the durable tip
         sid = sdb_read.get_compression_tip("S0") or "S0"
-    agent = build(sid, "acp")
+    agent = build(sid, "acp", gw_key)
+    out["platform"] = "acp"
     engine = agent.context_compressor
     out["engine"] = getattr(engine, "name", None)
     if out["engine"] != cell["plugin"]["engine"]:
@@ -310,7 +328,8 @@ def main():
         try:
             con = sqlite3.connect(f"file:{lcm_db}?mode=ro", uri=True)
             try:
-                return con.execute("SELECT COUNT(*) FROM summary_nodes WHERE depth = 0 AND source_type = 'messages'").fetchone()[0]
+                return con.execute("SELECT COUNT(*) FROM summary_nodes WHERE depth = 0 AND source_type = 'messages'"
+                                   " AND session_id NOT LIKE 'cron\\_job\\_%' ESCAPE '\\'").fetchone()[0]  # the chat lineage
             finally:
                 con.close()
         except sqlite3.Error:
@@ -323,6 +342,7 @@ def main():
     def traced_compress(self, messages, *args, **kwargs):
         result = orig_compress(self, messages, *args, **kwargs)
         status = getattr(self, "_last_compression_status", None)
+        self._probe_calls, self._probe_status = getattr(self, "_probe_calls", 0) + 1, status  # per-call evidence
         if status in ("compacted", "host_native"):  # a committed pass: LCM's own or the host-native summary
             counters["compacted_turns"].append(cur["turn"])
         event(turn=cur["turn"], event="compaction", session=getattr(self, "_session_id", None), final=cur["final"],
@@ -625,6 +645,7 @@ def final_check(agent, history, buf):
         entry = "_compress_context(force=True)"
     for _ in range(2):
         before, rec = buf.getvalue().count("publication_invariant_conflict"), {}
+        calls0 = getattr(engine, "_probe_calls", 0)
         saved = getattr(agent, "_session_db", None)
         try:
             agent._session_db = None  # "Stable ACP session id: suppress _compress_context's SQLite session split."
@@ -643,7 +664,8 @@ def final_check(agent, history, buf):
             rec["exception"] = repr(exc)[:500]
         finally:
             agent._session_db = saved
-        rec["engine_status"] = getattr(engine, "_last_compression_status", None)
+        rec["engine_calls"] = getattr(engine, "_probe_calls", 0) - calls0  # a compress() inside THIS invocation
+        rec["engine_status"] = getattr(engine, "_probe_status", None) if rec["engine_calls"] else None
         rec["noop_reason"] = getattr(engine, "_last_compression_noop_reason", None)
         rec["rejection"] = rejection(engine)
         rec["conflicts"] = buf.getvalue().count("publication_invariant_conflict") - before
@@ -653,7 +675,9 @@ def final_check(agent, history, buf):
     last = attempts[-1]
     ok = ("compacted", "host_native") if os.environ.get("LCM_NATIVE_RECOVERY") == "true" else ("compacted",)
     conflicts = sum(a["conflicts"] for a in attempts)
-    published = last["engine_status"] in ok and not conflicts and "exception" not in last
+    # Published only on a fresh host "compressed" AND an engine pass from this very invocation that committed.
+    published = (last.get("host_status") == "compressed" and last["engine_calls"] > 0 and last["engine_status"] in ok
+                 and not conflicts and "exception" not in last)
     failed = bool(conflicts or "exception" in last or last["engine_status"] == "error")
     return {**last, "attempts": attempts, "conflicts": conflicts, "published": published,
             "outcome": "published" if published else "failed" if failed else "inconclusive"}
