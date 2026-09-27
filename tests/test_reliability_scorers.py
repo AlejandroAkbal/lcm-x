@@ -54,7 +54,7 @@ def make(tmp_path, *, rows, events, nodes=(), phase=None, sids=None, parents=Non
             for i in range(cell_kw.pop("passes", 2))] + cell_kw.pop("extra_events", [])
     (d / "transcript.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events + comp))
     base = {"phase": "A", "log_counts": {}, "counters": {"failed": [], "orphan_drops": 0, "native_max": 1},
-            "compactions_logged": sum(e["compression_status"] == "compacted" for e in comp), "final_check": {"published": True}}
+            "compactions_logged": sum(e.get("compression_status") == "compacted" for e in comp), "final_check": {"published": True}}
     (d / "phase-A.json").write_text(json.dumps({**base, **(phase or {})}))
     cell = {"id": "t", "tool_plan": [], "native_recovery": False, "min_compactions": 2, "final_compaction_check": True,
             "bars": list(cells.BARS), **cell_kw}
@@ -186,6 +186,10 @@ def test_f2_native_pass_needs_its_own_host_commit(tmp_path):
     proven = make(tmp_path / "p", rows=clean_rows(), events=events, extra_events=native + final, passes=1, min_compactions=2)
     assert proven["verdict"] == "PASS", proven["failed_bars"]
     assert proven["numbers"]["B5"]["published"] == 2  # the final forced pass is B4 evidence, not counted here
+    crash = [{"phase": "A", "turn": 3, "event": "crash", "fault": "crash_after_rotation_before_child_row", "host_commits": 0}]
+    killed = make(tmp_path / "k", rows=clean_rows(), events=clean_events(), extra_events=native + crash)
+    assert killed["verdict"] == "PASS" and killed["numbers"]["B5"]["native_passes_interrupted_by_crash"] == ["A:T3"]
+    assert killed["numbers"]["B5"]["published"] == 2  # the interrupted native pass is not counted
     final_lcm = [{"phase": "A", "turn": 3, "event": "compaction", "compression_status": "compacted", "final": True, "depth0_nodes": 9}]
     logged = make(tmp_path / "l", rows=clean_rows(), events=clean_events(), extra_events=final_lcm, phase={"compactions_logged": 3})
     assert logged["verdict"] == "PASS" and logged["numbers"]["B5"]["published"] == 2  # final LCM pass logs, is not counted

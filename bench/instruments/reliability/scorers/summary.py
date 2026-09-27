@@ -32,15 +32,22 @@ def growth(events: list[dict], logged_publications: int, min_compactions: int) -
     stalls = [i for i in range(1, len(counts)) if counts[i] is None or counts[i - 1] is None or counts[i] <= counts[i - 1]]
     if counts and (counts[0] is None or counts[0] < 1):
         stalls.insert(0, 0)
-    commits, natives = {}, {}
+    commits, natives, crashed = {}, {}, set()
     for e in events:
         key = (e.get("phase"), e.get("session_prefix", "T"), e.get("turn"))
+        if e.get("event") == "crash":
+            crashed.add(key)
         if e.get("event") in ("turn_end", "crash") and e.get("host_commits") is not None:
             commits[key] = commits.get(key, 0) + e["host_commits"]
         if e.get("event") == "compaction" and e.get("compression_status") == "host_native" and not e.get("final"):
             natives[key] = natives.get(key, 0) + 1
-    unproven = sorted(f"{k[0]}:{k[1]}{k[2]}" for k, n in natives.items() if commits.get(k, 0) < n)
+    short = {k: n - commits.get(k, 0) for k, n in natives.items() if commits.get(k, 0) < n}
+    # An injected crash that killed the turn before the host commit interrupted that pass: it is not a
+    # published pass (not counted), and not a publication failure either. Anywhere else it is unproven.
+    unproven = sorted(f"{k[0]}:{k[1]}{k[2]}" for k in short if k not in crashed)
+    interrupted = sorted(f"{k[0]}:{k[1]}{k[2]}" for k in short if k in crashed)
+    published = published[:len(published) - sum(n for k, n in short.items() if k in crashed)]
     return {"published": len(published), "lcm_published": len(lcm), "logged": logged_publications,
             "min_compactions": min_compactions, "depth0_sequence": counts, "non_growing_passes": stalls,
-            "native_passes_without_host_commit": unproven,
+            "native_passes_without_host_commit": unproven, "native_passes_interrupted_by_crash": interrupted,
             "ok": not stalls and not unproven and len(published) >= min_compactions and logged_publications == len(lcm_all)}
