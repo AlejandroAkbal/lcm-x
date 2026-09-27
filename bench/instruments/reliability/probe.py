@@ -577,7 +577,7 @@ def main():
     history = []
     if phase != "A":  # ACP _restore reads the stable ACP id; a gateway reads the durable tip (load_transcript)
         history = sdb_read.get_messages_as_conversation(sid, repair_alternation=True)
-    turns, cancel = int(cell["turns"]), faults.get("cancel_then_retry")
+    cancel = faults.get("cancel_then_retry")
     backlog_log = out.setdefault("final_backlog", [])
 
     def low_backlog(last_turn):
