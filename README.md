@@ -680,6 +680,19 @@ let long sessions accumulate more noise before LCM intervenes. Leave it at `0`
 to keep ratio-based behavior. When the absolute override is active, Codex
 GPT-5.5 ratio auto-raise is suppressed so the absolute setpoint stays pinned.
 
+Profiles that switch between windows of very different sizes need one of these
+two settings, because a single fraction moves with the window. With
+`LCM_CONTEXT_THRESHOLD=0.75`, a 200k primary route triggers at 150k tokens, but a
+backup route that resolves to a 1,000,000-token window triggers at 750k, so
+compaction effectively never runs there. Either give the large route its own
+fraction (`LCM_MODEL_THRESHOLDS="glm-5.3:0.115"` gives about 115k on a 1M
+window and leaves every other route unchanged), or pin one trigger for every
+route with `LCM_ABSOLUTE_THRESHOLD_TOKENS`. The pin also applies to routes with
+a smaller window, so keep it below the smallest window you use. `/lcm status`
+reports the resolved `context_length`, `threshold_tokens` and
+`context_threshold_source` for the active route.
+
+
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the
 session.
