@@ -79,9 +79,16 @@ def registry() -> list[dict]:
             cell(f"cancel-retry/{m}", [493, 544], in_place=ip, faults=[{"kind": "cancel_then_retry", "turn": 22}],
                  doc="ACP cancel (request_hard_interrupt) during the provider call, then the same prompt re-sent: the "
                      "host re-attaches the cancelled prompt (acp_adapter/server.py _attach_interrupted_prompt)."),
-            cell(f"native-tool-dense/{m}", [509, 479, 464], in_place=ip, native=True,
+            cell(f"native-short-prefix/tool-dense/{m}", [], in_place=ip, native=True,
                  tool_plan=[{"turns": list(range(1, 61)), "calls": [{"name": "read_file", "args": {"path": "{files}/big.txt"}}]}],
-                 doc="Native recovery ON with a large real read_file result every turn: a tool-heavy protected tail (#509)."),
+                 doc="Data, not #509: native ON under tight tuning with a large read_file result every turn. Rejected "
+                     "BEFORE the summary call (prefix_too_short, compaction.py _compress_native_recovery)."),
+            cell(f"native-long-prefix/{m}", [509, 479, 464], in_place=ip, native=True, window=1000000, turns=80,
+                 repeat=3000, lcm_env={}, assistant={"real_usage": True}, min_compactions=2,
+                 doc="Native ON, LCM default tuning (threshold 0.35, fresh tail 32), 1M window, ~17k tokens a turn: the "
+                     "host's 0.8 threshold fires at ~46 turns with a ~30-turn prefix before the fresh tail (hundreds of "
+                     "k tokens), so the host ContextCompressor "
+                     "summary call runs (stubbed aux LLM) and LCM's post-summary checks decide (#509 field shape)."),
             cell(f"long-80/{m}", [], in_place=ip, turns=80, repeat=1000, lcm_env={},
                  assistant={"real_usage": True}, min_compactions=8,
                  doc="LCM default tuning with provider-reported usage, 80 turns (the LONG cells of the #553 probe file)."),
@@ -108,7 +115,12 @@ def registry() -> list[dict]:
              doc="The third publication attempt raises; later passes must recover."),
         cell("separator-heavy-retained/in-place", [545], in_place=True, user={"separator_turns": "all"}, faults=[crash],
              doc="Every prompt carries >=64 blank-line separators, so the dangling retained row does too (#545)."),
-        cell("native-baseline/in-place", [509, 479, 464], in_place=True, native=True, doc="Native recovery ON, no tools."),
+        cell("native-short-prefix/baseline/in-place", [], in_place=True, native=True,
+             doc="Data, not #509: native ON under tight tuning; rejected before the summary call (prefix_too_short)."),
+        cell("native-long-prefix/tool-dense/in-place", [509, 479, 464], in_place=True, native=True, window=1000000,
+             turns=60, repeat=400, lcm_env={}, assistant={"real_usage": True}, min_compactions=2, big_lines=400,
+             tool_plan=[{"turns": list(range(1, 61)), "calls": [{"name": "read_file", "args": {"path": "{files}/big.txt"}}]}],
+             doc="native-long-prefix with a ~20k-token read_file result every turn: a tool-heavy prefix and tail."),
         cell("pressure-disagreement/in-place", [420], in_place=True, assistant={"real_usage": True, "usage_scale": 1.3},
              doc="The provider reports 1.3x the tokens actually sent (#420)."),
         cell("window-1m/in-place", [], in_place=True, window=1000000, turns=60,

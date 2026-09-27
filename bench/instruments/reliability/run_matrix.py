@@ -36,7 +36,8 @@ def config_yaml(cell: dict, plugin: dict) -> str:
     return (f"context:\n  engine: {plugin['engine']}\n"
             f"compression:\n  enabled: true\n  threshold: 0.8\n  in_place: {'true' if cell['in_place'] else 'false'}\n"
             "  target_ratio: 0.3\n"
-            + ("lcm:\n  context_threshold: 0.5\n" if cell["lcm_env"] else "")
+            + (f"lcm:\n  context_threshold: {cell['lcm_env']['LCM_CONTEXT_THRESHOLD']}\n"
+               if "LCM_CONTEXT_THRESHOLD" in cell["lcm_env"] else "")
             + f"plugins:\n  enabled: [{plugin['enabled']}]\n  disabled: []\n")
 
 
@@ -65,7 +66,12 @@ def unfired_reason(cell: dict, fired: set, citations: dict) -> str | None:
     return f"fault trigger(s) {missing} never fired at this host sha"
 
 
-def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool) -> dict:
+def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
+             keep_dbs: str = "fail", lcm_env: dict | None = None) -> dict:
+    if lcm_env:  # a global override wins over the cell's tuning and is part of the cell record
+        cell = {**cell, "lcm_env": {**cell["lcm_env"], **lcm_env}, "global_lcm_env": lcm_env}
+        if "LCM_NATIVE_RECOVERY" in lcm_env:
+            cell["native_recovery"] = lcm_env["LCM_NATIVE_RECOVERY"].lower() == "true"
     d = out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"])
     if d.exists():
         shutil.rmtree(d)
@@ -78,7 +84,7 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name}, indent=1))
     env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
            "OPENROUTER_API_KEY": "test-key", "TMPDIR": str(d / "home"),
-           "LCM_NATIVE_RECOVERY": "true" if cell["native_recovery"] else "false", **cell["lcm_env"]}
+           **cell["lcm_env"], "LCM_NATIVE_RECOVERY": "true" if cell["native_recovery"] else "false"}
     rec = {"cell": cell["id"], "host": host_name, "host_sha": host["sha"], "plugin_ref": plugin["ref"],
            "plugin_sha": plugin["sha"], "targets": cell["targets"], "dir": str(d)}
     started, start_turn, last, phases_run = time.time(), 1, {}, []
@@ -120,10 +126,13 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     else:
         try:
             scored = bars.score(cell, d)
-            rec.update(verdict=scored["verdict"], failed_bars=scored["failed_bars"], numbers=scored["numbers"])
+            rec.update(verdict=scored["verdict"], failed_bars=scored["failed_bars"], numbers=scored["numbers"],
+                       inconclusive_bars=scored["inconclusive_bars"])
         except Exception as exc:  # a scorer failure is a harness ERROR, never a PASS
             rec.update(verdict="ERROR", reason=f"scoring failed: {exc!r}")
     (d / "verdict.json").write_text(json.dumps(rec, indent=1, default=str))
+    if keep_dbs == "fail" and rec["verdict"] == "PASS":  # a PASS cell's DBs are regenerable
+        shutil.rmtree(d / "db", ignore_errors=True)
     if not keep:
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(d / "files", ignore_errors=True)
@@ -141,20 +150,26 @@ def main(argv=None) -> int:
     ap.add_argument("--timeout", type=int, default=900, help="per-phase timeout, seconds")
     ap.add_argument("--out", required=True)
     ap.add_argument("--keep-homes", action="store_true")
+    ap.add_argument("--keep-dbs", choices=("fail", "all"), default="fail", help="keep db/ copies of non-PASS cells, or all")
+    ap.add_argument("--lcm-env", action="append", default=[], metavar="KEY=VAL",
+                    help="LCM_* override applied to every cell (repeatable)")
     a = ap.parse_args(argv)
     out = Path(a.out).resolve()
     if str(out) == "/tmp" or str(out).startswith(("/tmp/", "/private/tmp")):
         ap.error("--out must not be under /tmp")
+    lcm_env = dict(kv.split("=", 1) for kv in a.lcm_env)
+    if any(not k.startswith("LCM_") for k in lcm_env):
+        ap.error("--lcm-env keys must start with LCM_")
     hosts = H.load(H.hosts_file(a.hosts_file), None if a.hosts == "all" else a.hosts.split(","))
     selected = C.select(a.cells)
     plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins") for ref in a.plugin_ref.split(",")]
     out.mkdir(parents=True, exist_ok=True)
-    (out / "run.json").write_text(json.dumps({"argv": sys.argv, "hosts": hosts, "plugins": plugins,
+    (out / "run.json").write_text(json.dumps({"argv": sys.argv, "hosts": hosts, "plugins": plugins, "lcm_env": lcm_env,
                                               "cells": [c["id"] for c in selected]}, indent=1))
     jobs = [(c, h, hosts[h], p) for p in plugins for h in hosts for c in selected]
     started, results = time.time(), []
     with ThreadPoolExecutor(max_workers=a.jobs) as pool, open(out / "results.jsonl", "w") as sink:
-        futures = [pool.submit(run_cell, c, h, hd, p, out, a.timeout, a.keep_homes) for c, h, hd, p in jobs]
+        futures = [pool.submit(run_cell, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env) for c, h, hd, p in jobs]
         for fut in as_completed(futures):
             rec = fut.result()
             results.append(rec)
@@ -163,7 +178,7 @@ def main(argv=None) -> int:
             print(f"{rec['verdict']:<11} {rec['host']:<16} {rec['plugin_ref']:<12} {rec['cell']}"
                   + (f"  {sorted(rec.get('failed_bars', {}))}" if rec.get("failed_bars") else "")
                   + (f"  {str(rec.get('reason'))[:120]}" if rec.get("reason") else ""), flush=True)
-    report.write(out, results, time.time() - started)
+    report.write(out, results, time.time() - started, lcm_env)
     return 0
 
 

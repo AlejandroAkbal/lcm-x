@@ -243,7 +243,8 @@ def main():
             counters["compacted_turns"].append(cur["turn"])
         event(turn=cur["turn"], event="compaction", session=getattr(self, "_session_id", None),
               compression_status=status, noop_reason=getattr(self, "_last_compression_noop_reason", None),
-              depth0_nodes=depth0() if status == "compacted" else None)
+              depth0_nodes=depth0() if status == "compacted" else None,
+              rejection=rejection(self), native_attempts=cur["native"])
         return result
     etype.compress = traced_compress
 
@@ -385,7 +386,7 @@ def main():
         est = sum(len(str(m.get("content") or "")) for m in history) // 4 + len(text) // 4 + 800
         cur.update(turn=t, step=0, native=0)
         event(turn=t, event="user_sent" if kind != "retry" else "retry", tag=f"{prefix}{t:02d}", role="user",
-              session_prefix=prefix, content=text, persist=persist,
+              session_prefix=prefix, content=text, persist=persist if persist != text else None,
               content_sha256=hashlib.sha256(text.encode()).hexdigest())
         scripted(ag, prefix, t, est, cancel=kind == "cancel")
         result = ag.run_conversation(user_message=text, conversation_history=history, task_id=task_id,
@@ -397,7 +398,8 @@ def main():
         counters["native_max"] = max(counters["native_max"], cur["native"])
         for m in tools:
             event(turn=t, event="tool_result", role="tool", size=len(str(m.get("content") or "")))
-        event(turn=t, event="turn_end", tag=f"{prefix}{t:02d}", session_prefix=prefix, held=held, kind=kind,
+        event(turn=t, event="turn_end", tag=f"{prefix}{t:02d}", session_prefix=prefix, kind=kind,
+              **({"held_same": True} if held == persist else {"held": held}),
               reply=reply_text(prefix, t) if reply_held else None, failed=failed, native_attempts=cur["native"],
               interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags)
         return result
@@ -466,36 +468,57 @@ def session_count():
         return None
 
 
+def rejection(engine):
+    """LCM's native-recovery rejection reason for the call that just ended (it doubles as the noop reason)."""
+    reason = getattr(engine, "_last_native_recovery_rejection", None)
+    return reason if reason and reason == getattr(engine, "_last_compression_noop_reason", None) else None
+
+
 def final_check(agent, history, buf):
-    """Force one compaction the way the host's ACP ``/compress`` does (acp_adapter/commands.py)."""
-    before = buf.getvalue().count("publication_invariant_conflict")
-    engine, rec = agent.context_compressor, {}
-    saved = getattr(agent, "_session_db", None)
-    try:
-        agent._session_db = None  # "Stable ACP session id: suppress _compress_context's SQLite session split."
-        system = getattr(agent, "_cached_system_prompt", "") or ""
+    """Force a compaction through the host's own ACP ``/compress`` entry point (acp_adapter/commands.py
+    ``_cmd_compress``: ``compress_now`` where the host has it, else ``_compress_context(force=True)``). A first
+    attempt that only consumed LCM's one-shot preflight cleanup handoff (``sanitized``) is followed by one more
+    invocation of the same entry point on the installed history, as a user re-running /compress would."""
+    engine, attempts = agent.context_compressor, []
+    system = getattr(agent, "_cached_system_prompt", "") or ""
+    for _ in range(2):
+        before, rec = buf.getvalue().count("publication_invariant_conflict"), {}
+        saved = getattr(agent, "_session_db", None)
         try:
-            from agent.conversation_compression_manual import compress_now, parse_compress_args
-            from agent.conversation_compression import finalize_context_engine_compression_notification
-            res = compress_now(agent, history, parse_compress_args(""), system_message=system, task_id="S0")
-            rec["host_status"] = res.status
-            if res.status == "compressed":
-                finalize_context_engine_compression_notification(agent, committed=True)
-        except ImportError:  # older hosts: acp_adapter/commands.py _cmd_compress calls _compress_context directly
-            from acp_adapter.commands import _estimate_tokens
-            approx = _estimate_tokens(history, agent, system, getattr(agent, "tools", None) or None)
-            agent._compress_context(list(history), system, approx_tokens=approx, task_id="S0", force=True)
-            rec["host_status"] = "compressed"
-    except Exception as exc:
-        rec["exception"] = repr(exc)[:500]
-    finally:
-        agent._session_db = saved
-    rec["engine_status"] = getattr(engine, "_last_compression_status", None)
-    rec["noop_reason"] = getattr(engine, "_last_compression_noop_reason", None)
-    rec["conflicts"] = buf.getvalue().count("publication_invariant_conflict") - before
+            agent._session_db = None  # "Stable ACP session id: suppress _compress_context's SQLite session split."
+            try:
+                from agent.conversation_compression_manual import compress_now, parse_compress_args
+                from agent.conversation_compression import finalize_context_engine_compression_notification
+                rec["entry"] = "compress_now"
+                res = compress_now(agent, history, parse_compress_args(""), system_message=system, task_id="S0")
+                rec["host_status"] = res.status
+                if res.status == "compressed":
+                    finalize_context_engine_compression_notification(agent, committed=True)
+                    history = list(res.after_messages)
+            except ImportError:  # older hosts: _cmd_compress calls _compress_context directly
+                from acp_adapter.commands import _estimate_tokens
+                rec["entry"] = "_compress_context(force=True)"
+                approx = _estimate_tokens(history, agent, system, getattr(agent, "tools", None) or None)
+                history, _ = agent._compress_context(list(history), system, approx_tokens=approx, task_id="S0", force=True)
+                rec["host_status"] = "compressed"
+        except Exception as exc:
+            rec["exception"] = repr(exc)[:500]
+        finally:
+            agent._session_db = saved
+        rec["engine_status"] = getattr(engine, "_last_compression_status", None)
+        rec["noop_reason"] = getattr(engine, "_last_compression_noop_reason", None)
+        rec["rejection"] = rejection(engine)
+        rec["conflicts"] = buf.getvalue().count("publication_invariant_conflict") - before
+        attempts.append(rec)
+        if rec["engine_status"] != "sanitized" or "exception" in rec:
+            break
+    last = attempts[-1]
     ok = ("compacted", "host_native") if os.environ.get("LCM_NATIVE_RECOVERY") == "true" else ("compacted",)
-    rec["published"] = rec["engine_status"] in ok and not rec["conflicts"] and "exception" not in rec
-    return rec
+    conflicts = sum(a["conflicts"] for a in attempts)
+    published = last["engine_status"] in ok and not conflicts and "exception" not in last
+    failed = bool(conflicts or "exception" in last or last["engine_status"] == "error")
+    return {**last, "attempts": attempts, "conflicts": conflicts, "published": published,
+            "outcome": "published" if published else "failed" if failed else "inconclusive"}
 
 
 if __name__ == "__main__":

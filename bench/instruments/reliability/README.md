@@ -12,7 +12,8 @@ the real ACP/gateway processes, real transports or customer boxes.
 ```
 uv run --no-project python bench/instruments/reliability/run_matrix.py \
   --hosts-file <hosts.local.json> --hosts eva-0.21.5,customer-0.21.2 \
-  --plugin-ref origin/main[,v0.24.2,...] --cells 'crash-*,baseline/*' | all --jobs 8 --out <dir> [--keep-homes]
+  --plugin-ref origin/main[,v0.24.2,...] --cells 'crash-*,baseline/*' | all --jobs 8 --out <dir> [--keep-homes] [--keep-dbs fail|all] \
+  [--lcm-env LCM_KEY=VAL ...]
 ```
 - Hosts file: `--hosts-file`, else `$LCM_RELIABILITY_HOSTS`, else the host-prep lane's file; see
   `hosts.example.json`. A host under the live `~/.hermes` is refused.
@@ -20,6 +21,8 @@ uv run --no-project python bench/instruments/reliability/run_matrix.py \
   `plugins.enabled` entry and engine name are read from that tree (v0.23.x = `hermes-lcm`/`lcm`).
 - Per cell: `<out>/cells/<host>/<sha12>/<cell-slug>/` holds cell.json, transcript.jsonl, phase-*.json,
   probe logs, `db/` (sqlite backup-API copies) and verdict.json. `--keep-homes` keeps hermes-home.
+- `--keep-dbs fail` (default) drops the db/ copies of PASS cells (regenerable); `--lcm-env` overrides LCM_*
+  on every cell and is recorded in run.json and MATRIX.md.
 - Output: `results.jsonl`, `MATRIX.md`, `ISSUE-MAP.md`. Re-render: `python report.py <out>`.
 - Standalone scoring: `python -m bench.instruments.reliability.scorers.cli --db <lcm.db> --gauntlet-run <dir>`
   (copies the DB into a private temp dir first; the source file is never opened).
@@ -46,7 +49,9 @@ whose trigger never fires at that host sha.
   what the host held per attempt after its ACP strip and consecutive-user merge (a crashed prompt folded
   into the next composite counts once).
 - **B3** zero `publication_invariant_conflict` log lines across phases.
-- **B4** no failed turn, and the final forced compaction (the ACP `/compress` path) published.
+- **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
+  (`compress_now`, or `_compress_context(force=True)` on older hosts; re-invoked once after a cleanup-only
+  `sanitized`) does not end in error, conflict or exception. Ending `sanitized`/noop is INCONCLUSIVE.
 - **B5** depth-0 message-sourced summary nodes grow after every LCM pass; published passes (LCM or
   host-native) >= `min_compactions`; `LCM compaction #` log lines == LCM passes in the ledger.
 - **B6** (tool cells) no message-sourced summary covers part of a tool group (#559 invariant); zero host
@@ -54,7 +59,11 @@ whose trigger never fires at that host sha.
 - **B7** (native cells) no `native recovery did not produce a usable summary`, no host
   `summary_generation_aborted`, at most one native attempt per turn.
 
-Verdicts: PASS, FAIL (failed bars with numbers), ERROR (harness or host failure; never a PASS),
+Native cells: `native-short-prefix/*` are rejected before the host summary call (`prefix_too_short`) and are
+data; `native-long-prefix/*` (default tuning, 1M window) run the host ContextCompressor summary (stubbed aux
+LLM, so no slow-summary timeouts) and LCM's post-summary checks; every rejection reason is recorded.
+
+Verdicts: PASS, FAIL (failed bars with numbers), INCONCLUSIVE (no bar fails, one could not decide), ERROR (harness or host failure; never a PASS),
 UNSUPPORTED (with the reason). `sql_dup_counter.py`, `summary_nodes_report.py` and `compaction_ledger.py`
 are ported as `scorers/dupes.py` and `scorers/summary.py` (diagnostics and the B5 ledger).
 

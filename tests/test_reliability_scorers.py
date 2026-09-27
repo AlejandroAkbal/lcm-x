@@ -100,6 +100,20 @@ def test_b3_b4(tmp_path):
     assert out["failed_bars"]["B4"]["failed_turns"] == ["T03"]
     unpublished = make(tmp_path / "f", rows=clean_rows(), events=clean_events(), phase={"final_check": {"published": False}})
     assert set(unpublished["failed_bars"]) == {"B4"}
+    cleanup_only = {"outcome": "inconclusive", "engine_status": "sanitized", "attempts": [{}, {}], "entry": "x"}
+    unsure = make(tmp_path / "i", rows=clean_rows(), events=clean_events(), phase={"final_check": cleanup_only})
+    assert unsure["verdict"] == "INCONCLUSIVE" and unsure["failed_bars"] == {} and set(unsure["inconclusive_bars"]) == {"B4"}
+
+
+def test_compact_transcript_fields_mean_held_equals_persist(tmp_path):
+    events = clean_events()
+    for e in events:
+        if e["event"] == "turn_end":
+            del e["held"]
+            e["held_same"] = True
+        else:
+            e["persist"] = None
+    assert make(tmp_path, rows=clean_rows(), events=events)["verdict"] == "PASS"
 
 
 def test_b5_growth_minimum_and_log_parity(tmp_path):

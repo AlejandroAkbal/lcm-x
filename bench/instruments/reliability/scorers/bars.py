@@ -29,13 +29,14 @@ def attempts(events: list[dict]) -> list[dict]:
     out, open_ = [], {}
     for e in events:
         if e["event"] in ("user_sent", "retry"):
-            a = {"tag": e["tag"], "prefix": e.get("session_prefix", "T"), "content": e["content"], "persist": e["persist"],
+            a = {"tag": e["tag"], "prefix": e.get("session_prefix", "T"), "content": e["content"],
+                 "persist": e["persist"] if e.get("persist") is not None else e["content"],
                  "held": None, "reply": None, "user_tags": {}, "ended": False}
             out.append(a)
             open_[e["tag"]] = a
         elif e["event"] == "turn_end" and e["tag"] in open_:
             a = open_.pop(e["tag"])
-            a.update(held=e.get("held"), reply=e.get("reply"), user_tags=e.get("user_tags") or {}, ended=True)
+            a.update(held=a["persist"] if e.get("held_same") else e.get("held"), reply=e.get("reply"), user_tags=e.get("user_tags") or {}, ended=True)
     return out
 
 
@@ -103,8 +104,13 @@ def score(cell: dict, cell_dir: Path) -> dict:
     failed_turns = [t for p in phases for t in p.get("counters", {}).get("failed", [])]
     final = next((p["final_check"] for p in reversed(phases) if "final_check" in p), None)
     numbers["B4"] = {"failed_turns": failed_turns, "final_check": final}
-    if failed_turns or (cell.get("final_compaction_check", True) and not (final or {}).get("published")):
+    inconclusive = {}
+    outcome = (final or {}).get("outcome", "published" if (final or {}).get("published") else "failed")
+    if failed_turns or (cell.get("final_compaction_check", True) and outcome == "failed"):
         failed["B4"] = numbers["B4"]
+    elif cell.get("final_compaction_check", True) and outcome == "inconclusive":
+        inconclusive["B4"] = f"forced compaction ended {final.get('engine_status')!r} ({final.get('noop_reason')!r}) " \
+                             f"after {len(final.get('attempts', []))} attempt(s) of {final.get('entry')}"
     grow = summary.growth(events, sum(p.get("compactions_logged", 0) for p in phases), cell.get("min_compactions", 5))
     numbers["B5"] = grow
     if not grow["ok"]:
@@ -130,4 +136,8 @@ def score(cell: dict, cell_dir: Path) -> dict:
         "phases": len(phases), "session_count": phases[-1].get("session_count") if phases else None,
         "lcm_tool_calls": sum(p.get("counters", {}).get("lcm_tool_calls", 0) for p in phases),
         "summary_nodes": summary.nodes_report(db)}
-    return {"verdict": "FAIL" if failed else "PASS", "applicable_bars": applicable, "failed_bars": failed, "numbers": numbers}
+    inconclusive = {b: v for b, v in inconclusive.items() if b in applicable}
+    numbers["diagnostic"]["native_rejections"] = dict(Counter(e.get("rejection") for e in events
+                                                              if e["event"] == "compaction" and e.get("rejection")))
+    return {"verdict": "FAIL" if failed else "INCONCLUSIVE" if inconclusive else "PASS", "applicable_bars": applicable,
+            "failed_bars": failed, "inconclusive_bars": inconclusive, "numbers": numbers}
