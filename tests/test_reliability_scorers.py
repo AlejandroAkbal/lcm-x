@@ -613,3 +613,36 @@ def test_r15_b_safety_and_precision(tmp_path):
     tree = Path(__file__).resolve().parent.parent  # this repo's own config.py: the plugin's parser
     for value, want in (("1", True), ("yes", True), ("On", True), ("true", True), ("false", False), ("garbage", False)):
         assert plugin_tree.parse_bool(tree, "LCM_NATIVE_RECOVERY", value)[0] is want, value
+
+
+def test_r2a3_b5_a_counted_node_with_no_message_source_fails(tmp_path):
+    """Regression (R2a.3, #567 thread): a message-sourced node with source_ids [] counted toward depth-0 growth
+    and passed the cross-lineage check."""
+    assert make(tmp_path, rows=clean_rows(), events=clean_events(), nodes=[[1, 2]])["verdict"] == "PASS"
+    for i, bad in enumerate(([], "not-a-list", [99])):
+        out = make(tmp_path / str(i), rows=clean_rows(), events=clean_events(), nodes=[[1, 2], bad])
+        assert out["failed_bars"]["B5"]["empty_source_nodes"] == [2], bad
+    assert bars.source_ids("{unparseable") == [] and bars.source_ids("null") == [] and bars.source_ids("[1]") == [1]
+
+
+def test_r2a3_malformed_durable_tool_calls_are_b2_surplus(tmp_path):
+    """Regression (R2a.3, #567 thread): malformed or non-list tool_calls JSON was silently "no calls"."""
+    for i, calls in enumerate(("{not json", '{"id": "c1"}', '"x"', "[1]")):
+        out = make(tmp_path / str(i), rows=clean_rows() + [("assistant", "", calls)], events=clean_events())
+        assert out["failed_bars"]["B2"]["tool_surplus_rows"] == 1, calls
+        assert out["numbers"]["B2"]["tool_surplus"] == [["chat", "malformed_tool_calls", 7]], calls
+    assert make(tmp_path / "ok", rows=clean_rows() + [("assistant", "", "[]")], events=clean_events())["verdict"] == "PASS"
+
+
+def test_r2a3_b1_covers_three_digit_turn_tags(tmp_path):
+    """Regression (R2a.3, #570 thread): extend_turns can emit T101-T103 on a 100-turn cell; B1 parsed [A-Z]\\d\\d only."""
+    ok = make(tmp_path, rows=clean_rows(101), events=clean_events(101))
+    assert ok["verdict"] == "PASS" and ok["numbers"]["B1"]["user_tags"] == 101, ok["failed_bars"]
+    rows = [r for r in clean_rows(101) if r[1] != U.format(101, 101)]
+    out = make(tmp_path / "lost", rows=rows, events=clean_events(101))
+    assert out["failed_bars"]["B1"] == {"T101": {"expected": 1, "stored": 0}}
+    assert "T09" in bars.re.findall(r"\[([A-Z]\d{2,3})\] user", U.format(9, 9))  # leading zero kept below 100
+
+
+def test_r2a3_issue_566_is_decided_by_b5_too():
+    assert "B5" in cells.ISSUES[566][0]

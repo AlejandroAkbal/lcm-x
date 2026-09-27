@@ -206,14 +206,15 @@ GUARD = textwrap.dedent("""
     sys.path.insert(0, sys.argv[1])
     import probe
     seen = []
-    probe.guard_sockets(local_ok=sys.argv[2] == "1", on_refuse=lambda *a: seen.append(a[0]))
+    probe.guard_sockets(local_ok=sys.argv[2] == "1", on_refuse=lambda *a: seen.append(list(a[:2])))
     srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
     out = {}
     for name, fn in [("local", lambda: socket.create_connection(srv.getsockname(), timeout=1)),
                      ("remote", lambda: socket.socket().connect(("192.0.2.1", 80))),
                      ("remote_ex", lambda: socket.socket().connect_ex(("192.0.2.1", 80))),
                      ("udp", lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("192.0.2.1", 53))),
-                     ("dns", lambda: socket.getaddrinfo("example.com", 443))]:
+                     ("dns", lambda: socket.getaddrinfo("example.com", 443)),
+                     ("dns127", lambda: socket.getaddrinfo("127.attacker.example", 80))]:
         try:
             fn(); out[name] = "ok"
         except OSError:
@@ -228,8 +229,17 @@ def test_socket_guard_refuses_connect_ex_udp_literals_and_dns(local_ok):
     got = json.loads(subprocess.run([sys.executable, "-c", GUARD, rel, local_ok], capture_output=True, text=True,
                                     check=True).stdout)
     assert got["out"] == {"local": "ok" if local_ok == "1" else "refused", "remote": "refused", "remote_ex": "refused",
-                          "udp": "refused", "dns": "refused"}
-    assert {"connect", "connect_ex", "sendto", "getaddrinfo"} <= set(got["seen"])
+                          "udp": "refused", "dns": "refused", "dns127": "refused"}
+    assert {"connect", "connect_ex", "sendto", "getaddrinfo"} <= {what for what, _host in got["seen"]}
+    assert ["getaddrinfo", "127.attacker.example"] in got["seen"]  # R2a.3: refused and recorded
+
+
+def test_loopback_is_exact_names_or_loopback_literals():
+    """Regression (R2a.3, #570 thread): ``startswith("127.")`` let 127.attacker.example reach the real resolver."""
+    for host in ("localhost", "::1", "127.0.0.1", "127.5.6.7", b"127.0.0.1"):
+        assert probe.is_loopback(host), host
+    for host in ("127.attacker.example", "127.0.0.1.nip.io", "localhost.example", "10.0.0.1", "", "0.0.0.0"):
+        assert not probe.is_loopback(host), host
 
 
 def test_chronology_is_reported_per_lineage():
@@ -358,14 +368,22 @@ def test_extra_turns_only_when_a_pass_just_consumed_the_backlog(tmp_path):
     assert list(probe.extend_turns({**cell, "final_compaction_check": False}, 1, lambda t: True)) == [1, 2, 3, 4, 5]
 
 
+def full_set(transport=None, **over):
+    """One PASS row per expected cell of one (host, transport, plugin sha), with ``over`` = {cell: row fields}."""
+    extra = {"transport": transport} if transport else {}
+    return [{"verdict": "PASS", "host": "h", "plugin_sha": "s", "cell": c, "targets": [], **extra, **over.get(c, {})}
+            for c in ci.expected_cells(transport)]
+
+
 def test_ci_gate_fails_on_error_and_on_untracked_g_rel_1_fail():
-    rows = [{"verdict": "FAIL", "host": "h", "cell": "crash-after-rotation/rotation", "targets": [519, 549]},
-            {"verdict": "FAIL", "host": "h", "cell": "native-long-prefix/in-place", "targets": []},
-            {"verdict": "INCONCLUSIVE", "host": "h", "cell": "baseline/in-place/acp", "targets": []}]
+    rows = full_set(**{"crash-after-rotation/rotation": {"verdict": "FAIL", "targets": [519, 549]},
+                       "native-long-prefix/in-place": {"verdict": "FAIL"},
+                       "baseline/in-place/acp": {"verdict": "INCONCLUSIVE"}})
     assert ci.gate(rows, {549}) == []  # an open targeted issue, a cell outside G-REL-1, a non-FAIL
     assert len(ci.gate(rows, {1})) == 1
-    assert len(ci.gate([*rows, {"verdict": "ERROR", "host": "h", "cell": "long-80/in-place", "reason": "x"}], {549})) == 1
-    assert len(ci.gate([{"verdict": "FAIL", "host": "h", "cell": "baseline/rotation/acp", "targets": []}], {549})) == 1
+    err = full_set(**{"long-80/in-place": {"verdict": "ERROR", "reason": "x"}, "crash-after-rotation/rotation": {}})
+    assert len(ci.gate(err, {549})) == 1
+    assert len(ci.gate(full_set(**{"baseline/rotation/acp": {"verdict": "FAIL"}}), {549})) == 1
     assert all(h["sha"] and h["python_version"] for h in json.loads(ci.CI_HOSTS.read_text())["hosts"].values())
 
 
@@ -405,3 +423,31 @@ def test_colliding_suffixes_are_unrouted_and_unexpected(provider):
     forged = {"rid": 99, "method": "GET", "path": "/rogue/models", "route": "models"}  # a log line cannot vouch for itself
     (d / "provider-requests.jsonl").write_text(json.dumps(forged) + "\n")
     assert not PC.accounting(d, [])["ok"]
+
+
+def test_ci_gate_requires_a_complete_result_set():
+    """Regression (R2a.3, #570 thread): an empty or incomplete result set passed the gate."""
+    r1, r2 = full_set(), full_set("acp-process", **{"gateway-second-restart/in-place": {"verdict": "UNSUPPORTED"}})
+    assert ci.gate(r1 + r2, set()) == [] and len(r2) == len(r1) + 1  # UNSUPPORTED counts as present
+    assert ci.gate([], set()) == ["empty result set"]
+    for broken in (r1[1:], r1 + r1[:1], r1 + [dict(r1[0], cell="made-up/cell")], r2[:-1] + r1):
+        problems = ci.gate(broken, set())
+        assert len(problems) == 1 and problems[0].startswith("INCOMPLETE h"), problems
+
+
+def test_process_phase_deadline_is_an_error_with_its_cause(tmp_path):
+    """R2a.3 item 7: run_matrix --timeout was unused for process cells; a host that never answers a prompt now
+    ERRORs at the phase deadline instead of waiting out the per-request timeout."""
+    silent = PEER.replace('if m["method"] == "session/prompt":', 'if m["method"] == "session/prompt":\n        continue')
+    cell = next(c for c in cells.registry() if c["id"] == "baseline/in-place/acp")
+    run = PC.ProcessCell(cell, tmp_path, {"src": str(tmp_path)}, "acp-process", 300.0, phase_timeout=1.5)
+    run.work.mkdir(parents=True)
+    run.argv = lambda: [sys.executable, "-c", silent]
+    started = time.monotonic()
+    try:
+        last = run.run_phase(1)
+    finally:
+        run.proxy.stop()
+        run.provider.server.server_close()
+    assert time.monotonic() - started < 15
+    assert last["exit"] == "error" and "PhaseDeadline" in last["reason"] and "1.5s deadline" in last["reason"], last

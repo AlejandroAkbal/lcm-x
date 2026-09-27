@@ -3,7 +3,9 @@
     python -m bench.instruments.reliability.ci prep --host eva-0.21.5 --root "$RUNNER_TEMP/hosts" --out hosts.json
     python -m bench.instruments.reliability.ci gate r1/results.jsonl r2/results.jsonl --open-issues open-issues.txt
 
-The gate fails on any ERROR, and on a FAIL in the G-REL-1 cell set unless the cell targets an open issue.
+The gate fails on any ERROR, and on a FAIL in the G-REL-1 cell set unless the cell targets an open issue. It also
+fails on an empty set and, per (host, transport, plugin sha) present, on any missing, duplicate or unexpected cell
+row against the ``--cells all`` list run_matrix.py uses for that transport (UNSUPPORTED rows count as present).
 """
 from __future__ import annotations
 
@@ -25,8 +27,37 @@ def in_gate_set(cell_id: str) -> bool:
     return any(family == g or (g.endswith("-") and family.startswith(g)) for g in G_REL_1)
 
 
+def expected_cells(transport: str | None) -> list[str]:
+    """The cell ids run_matrix.py runs for ``--cells all`` on this transport (None: R1 in-process)."""
+    from bench.instruments.reliability import cells as C
+    extra = ()
+    if transport:
+        from bench.instruments.reliability import process_cell
+        extra = process_cell.R2_CELLS
+    return [c["id"] for c in C.select("all", extra=extra)]
+
+
+def completeness(results: list[dict]) -> list[str]:
+    """A non-empty set with exactly one row per expected cell for every (host, transport, plugin sha) present."""
+    if not results:
+        return ["empty result set"]
+    groups, problems = {}, []
+    for r in results:
+        groups.setdefault((r.get("host"), r.get("transport"), r.get("plugin_sha")), []).append(r.get("cell"))
+    for (host, transport, sha), got in sorted(groups.items(), key=str):
+        where = f"{host} {transport or 'in-process'} {str(sha)[:12]}"
+        want = expected_cells(transport)
+        missing = sorted(set(want) - set(got))
+        dupes = sorted({c for c in got if got.count(c) > 1})
+        unexpected = sorted({str(c) for c in got} - set(want))
+        for label, cells in (("missing", missing), ("duplicate", dupes), ("unexpected", unexpected)):
+            if cells:
+                problems.append(f"INCOMPLETE {where}: {len(cells)} {label} cell row(s): {cells[:5]}")
+    return problems
+
+
 def gate(results: list[dict], open_issues: set[int]) -> list[str]:
-    problems = []
+    problems = completeness(results)
     for r in results:
         where = f"{r['verdict']} {r['host']} {r['cell']} ({r.get('transport', 'in-process')})"
         if r["verdict"] == "ERROR":

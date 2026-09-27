@@ -65,9 +65,11 @@ def bind(atts: list[dict], lineage_of=lambda a: "chat") -> dict:
 
 
 def stored_keys(rows, lineage=lambda sid: "chat") -> Counter:
-    """rows: (store_id, session_id, role, content, tool_calls, tool_call_id)."""
+    """rows: (store_id, session_id, role, content, tool_calls, tool_call_id). An assistant row whose ``tool_calls``
+    is not a JSON list of objects is one ``(lineage, "malformed_tool_calls", store_id)`` key: never expected, so it is
+    B2 surplus, never silently "no calls"."""
     keys = Counter()
-    for _sid, session, role, content, calls, call_id in rows:
+    for store_id, session, role, content, calls, call_id in rows:
         g = lineage(session)
         if role == "tool":
             keys[(g, "tool", call_id, hashlib.sha256((content or "").encode()).hexdigest())] += 1
@@ -75,8 +77,11 @@ def stored_keys(rows, lineage=lambda sid: "chat") -> Counter:
             try:
                 entries = json.loads(calls)
             except ValueError:
-                entries = []
-            for c in entries if isinstance(entries, list) else []:
+                entries = None
+            if not isinstance(entries, list) or not all(isinstance(c, dict) for c in entries):
+                keys[(g, "malformed_tool_calls", store_id)] += 1
+                continue
+            for c in entries:
                 fn = c.get("function") or {}
                 keys[(g, "call", c.get("id"), fn.get("name"), canon(fn.get("arguments") or "{}"))] += 1
     return keys

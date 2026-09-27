@@ -227,7 +227,7 @@ def held_after(result, text_tag, reply, notices):
         idx = [i for i in users if f"[{text_tag}]" in msgs[i]["content"]]
     tags = {}
     for i in users:
-        for x in set(re.findall(r"\[([A-Z]\d\d)\] user turn", msgs[i]["content"])):
+        for x in set(re.findall(r"\[([A-Z]\d{2,3})\] user turn", msgs[i]["content"])):
             tags[x] = tags.get(x, 0) + 1
     if not idx:
         return None, False, [], tags, []
