@@ -239,7 +239,7 @@ def main():
     def traced_compress(self, messages, *args, **kwargs):
         result = orig_compress(self, messages, *args, **kwargs)
         status = getattr(self, "_last_compression_status", None)
-        if status == "compacted":
+        if status in ("compacted", "host_native"):  # a committed pass: LCM's own or the host-native summary
             counters["compacted_turns"].append(cur["turn"])
         event(turn=cur["turn"], event="compaction", session=getattr(self, "_session_id", None),
               compression_status=status, noop_reason=getattr(self, "_last_compression_noop_reason", None),
