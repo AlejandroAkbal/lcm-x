@@ -481,8 +481,10 @@ def final_check(agent, history, buf):
             rec["host_status"] = res.status
             if res.status == "compressed":
                 finalize_context_engine_compression_notification(agent, committed=True)
-        except ImportError:
-            agent._compress_context(list(history), system, task_id="S0", force=True)
+        except ImportError:  # older hosts: acp_adapter/commands.py _cmd_compress calls _compress_context directly
+            from acp_adapter.commands import _estimate_tokens
+            approx = _estimate_tokens(history, agent, system, getattr(agent, "tools", None) or None)
+            agent._compress_context(list(history), system, approx_tokens=approx, task_id="S0", force=True)
             rec["host_status"] = "compressed"
     except Exception as exc:
         rec["exception"] = repr(exc)[:500]
