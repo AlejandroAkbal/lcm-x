@@ -4,8 +4,9 @@ The probe logs, independently of the host result, each call the scripted provide
 name, args), each real host execution at the cited dispatch hook (``tool_dispatch``: model_tools
 ``handle_function_call`` with the call id, or the context engine's ``handle_tool_call``, bound by name + args),
 and each tool result as the next provider request carried it (``tool_seen``: id, sha256). Keys:
-``("call", id, name, canonical args)`` for an assistant tool-call entry and ``("tool", id, sha256(content))``
-for a tool result row; stored and expected keys must match as a multiset.
+``(lineage, "call", id, name, canonical args)`` for an assistant tool-call entry and ``(lineage, "tool", id,
+sha256(content))`` for a tool result row; stored and expected keys must match as a multiset within each session
+lineage, like user/assistant rows.
 """
 from __future__ import annotations
 
@@ -28,16 +29,16 @@ def completed(a: dict) -> bool:
     return bool(a["ended"]) and not end.get("failed") and end.get("kind") != "cancel"
 
 
-def bind(atts: list[dict]) -> dict:
+def bind(atts: list[dict], lineage_of=lambda a: "chat") -> dict:
     """Per completed attempt: gaps (dispatch never happened -> UNSUPPORTED), failures (wrong/failed/incomplete/unseen
     result, unplanned dispatch -> FAIL) and the expected keys. Calls of unfinished attempts may be stored at most once."""
     gaps, failures, expected, loose = [], [], Counter(), set()
     for a in atts:
-        issues = a.get("tool_issues", [])
+        issues, g = a.get("tool_issues", []), lineage_of(a)
         if not completed(a):
             for c in issues:
-                loose |= {("call", c["id"], c["name"], canon(c["args"]))}
-                loose |= {k for k in [("tool", c["id"], s["sha"]) for s in a.get("tool_seen", []) if s["id"] == c["id"]]}
+                loose |= {(g, "call", c["id"], c["name"], canon(c["args"]))}
+                loose |= {k for k in [(g, "tool", c["id"], s["sha"]) for s in a.get("tool_seen", []) if s["id"] == c["id"]]}
             continue
         free = [d for d in a.get("tool_dispatch", [])]
         seen = {s["id"]: s for s in a.get("tool_seen", [])}
@@ -54,21 +55,22 @@ def bind(atts: list[dict]) -> dict:
                 failures.append(f"{a['tag']}: {c['name']} ({c['id']}) failed: {d.get('detail')}")
             elif d.get("chars", 0) < (c.get("expect") or {}).get("min_chars", 0):
                 failures.append(f"{a['tag']}: {c['name']} result {d.get('chars')} chars < {c['expect']['min_chars']}")
-            expected[("call", c["id"], c["name"], canon(c["args"]))] += 1
+            expected[(g, "call", c["id"], c["name"], canon(c["args"]))] += 1
             if c["id"] in seen:
-                expected[("tool", c["id"], seen[c["id"]]["sha"])] += 1
+                expected[(g, "tool", c["id"], seen[c["id"]]["sha"])] += 1
             else:
                 failures.append(f"{a['tag']}: the result of {c['id']} never reached the next provider request")
         failures += [f"{a['tag']}: unplanned host dispatch of {d['name']}" for d in free]
     return {"gaps": gaps, "failures": failures, "expected": expected, "loose": loose}
 
 
-def stored_keys(rows) -> Counter:
+def stored_keys(rows, lineage=lambda sid: "chat") -> Counter:
     """rows: (store_id, session_id, role, content, tool_calls, tool_call_id)."""
     keys = Counter()
-    for _sid, _session, role, content, calls, call_id in rows:
+    for _sid, session, role, content, calls, call_id in rows:
+        g = lineage(session)
         if role == "tool":
-            keys[("tool", call_id, hashlib.sha256((content or "").encode()).hexdigest())] += 1
+            keys[(g, "tool", call_id, hashlib.sha256((content or "").encode()).hexdigest())] += 1
         elif role == "assistant" and calls:
             try:
                 entries = json.loads(calls)
@@ -76,7 +78,7 @@ def stored_keys(rows) -> Counter:
                 entries = []
             for c in entries if isinstance(entries, list) else []:
                 fn = c.get("function") or {}
-                keys[("call", c.get("id"), fn.get("name"), canon(fn.get("arguments") or "{}"))] += 1
+                keys[(g, "call", c.get("id"), fn.get("name"), canon(fn.get("arguments") or "{}"))] += 1
     return keys
 
 
@@ -86,4 +88,4 @@ def compare(expected: Counter, loose: set, stored: Counter) -> dict:
                if stored[k] > expected[k] + (1 if k in loose else 0)}
     return {"tool_items": sum(expected.values()), "tool_missing_rows": sum(missing.values()),
             "tool_surplus_rows": sum(surplus.values()),
-            "tool_missing": [list(k[:3]) for k in list(missing)[:5]], "tool_surplus": [list(k[:3]) for k in list(surplus)[:5]]}
+            "tool_missing": [list(k[:4]) for k in list(missing)[:5]], "tool_surplus": [list(k[:4]) for k in list(surplus)[:5]]}

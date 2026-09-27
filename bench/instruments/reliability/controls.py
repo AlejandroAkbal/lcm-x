@@ -12,7 +12,9 @@ CONTROLS = {
     "PC-1": {"refs": ["47bd28e7", "ae1fb16d"], "hosts": ["eva-0.21.5", "rs34-0.21.5", "upstream-main"],
              "cells": ["baseline/in-place/acp", "acp-trailing/in-place"],
              "expect": {("47bd28e7", "baseline/in-place/acp"): "PASS", ("47bd28e7", "acp-trailing/in-place"): "FAIL",
-                        ("ae1fb16d", "baseline/in-place/acp"): "PASS", ("ae1fb16d", "acp-trailing/in-place"): "PASS"}},
+                        ("ae1fb16d", "baseline/in-place/acp"): "PASS", ("ae1fb16d", "acp-trailing/in-place"): "PASS"},
+             # the re-stored batch (#494) is a surplus: R1.3/R1.4 pc1 47bd28e7 acp-trailing failed B1-B5 on all 3 hosts
+             "bars": ["B1", "B2"]},
     "PC-2": {"refs": ["v0.24.2"], "hosts": "all", "cells": ["parallel-tool-group/in-place", "parallel-tool-group/rotation"],
              "expect": {("v0.24.2", "*"): "FAIL"}, "bars": ["B6"]},
     # Pinned known-bad main before the #553 fix (a moving origin/main is not a control).

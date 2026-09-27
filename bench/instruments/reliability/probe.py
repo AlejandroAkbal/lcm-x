@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 
 ANCHORS = {  # shape -> (host file, text on the cited line)
     "acp_persist": ("acp_adapter/server.py", "persist_user_message=user_text"),
+    "acp_strip": ("acp_adapter/server.py", "user_text = _extract_text(prompt).strip()"),
     "acp_restore": ("acp_adapter/session.py", "get_messages_as_conversation(session_id, repair_alternation=True)"),
     "acp_cancel": ("acp_adapter/server.py", "request_hard_interrupt(state.agent)"),
     "acp_retry": ("acp_adapter/server.py", "def _attach_interrupted_prompt"),
@@ -139,7 +140,7 @@ def refusal(cell_dir):
     if any(str(resolved) == p or str(resolved).startswith(p + "/") for p in ("/tmp", "/private/tmp")):
         return f"--cell-dir {resolved} is under /tmp"
     for key, value in os.environ.items():  # an LCM path override may only point inside this cell
-        if key.startswith("LCM_") and re.search(r"(_PATH|_DIR|_HOME|_FILE)$", key) and value:
+        if key.upper().startswith("LCM_") and re.search(r"(_PATH|_DIR|_HOME|_FILE)$", key, re.I) and value:
             if resolved not in Path(value).expanduser().resolve().parents:
                 return f"{key}={value!r} points outside the cell dir"
     return None
@@ -219,7 +220,7 @@ def main():
         event(turn=turn, event="crash" if kind.startswith("crash") else kind, fault=kind, session_prefix=cur.get("prefix", "T"),
               host_commits=buf.getvalue().count(COMMITTED) - cur["commits0"], **extra)
 
-    needed = {"acp": ["acp_persist"] + (["acp_restore"] if phase != "A" else []),
+    needed = {"acp": ["acp_persist", "acp_strip"] + (["acp_restore"] if phase != "A" else []),
               "gateway": ["gateway_transcript", "gateway_user_text", "gateway_run", "gateway_key_start",
                           "gateway_key_rotation"]}[cell["transport"]]
     needed += [k for f in faults for k in FAULT_CITES.get(f, [])]

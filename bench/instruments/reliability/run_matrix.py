@@ -68,12 +68,12 @@ def copy_dbs(home: Path, dbdir: Path) -> list[str]:
 
 def verdict_fields(cell: dict, d: Path, last: dict, fired: set, citations: dict, backup_errors: list[str]) -> dict:
     """The record's verdict. The scorers only run on a finished probe with complete DB copies."""
+    if backup_errors:  # takes precedence over every other outcome
+        return {"verdict": "ERROR", "reason": "database copy failed, not scored: " + "; ".join(backup_errors)}
     if last["exit"] == "unsupported":
         return {"verdict": "UNSUPPORTED", "reason": last.get("reason")}
     if last["exit"] != "done":
         return {"verdict": "ERROR", "reason": last.get("reason") or last}
-    if backup_errors:
-        return {"verdict": "ERROR", "reason": "database copy failed, not scored: " + "; ".join(backup_errors)}
     if reason := unfired_reason(cell, fired, citations):
         return {"verdict": "UNSUPPORTED", "reason": reason}
     try:
@@ -101,10 +101,13 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
              keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None) -> dict:
     if lcm_env:  # a global override wins over the cell's tuning and is part of the cell record
         cell = {**cell, "lcm_env": {**cell["lcm_env"], **lcm_env}, "global_lcm_env": lcm_env}
-        if "LCM_NATIVE_RECOVERY" in lcm_env:
-            cell["native_recovery"] = lcm_env["LCM_NATIVE_RECOVERY"].lower() == "true"
+        if "LCM_NATIVE_RECOVERY" in lcm_env:  # decided by the plugin's own parser at this ref, not "== true"
+            cell["native_recovery"], cell["native_recovery_parser"] = plugin_tree.parse_bool(
+                Path(plugin["tree"]), "LCM_NATIVE_RECOVERY", lcm_env["LCM_NATIVE_RECOVERY"])
     d = out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"])
-    if (out / "cells").resolve() not in d.resolve().parents:
+    if (out / "cells").is_symlink():
+        raise ValueError(f"{out / 'cells'} is a symlink; refused")
+    if (out / "cells").resolve() not in d.resolve().parents or out.resolve() not in d.resolve().parents:
         raise ValueError(f"cell dir {d} is not under {out / 'cells'}")
     if d.exists():
         shutil.rmtree(d)
@@ -167,9 +170,9 @@ def env_refusal(lcm_env: dict) -> str | None:
     for k in lcm_env:
         if not k.startswith("LCM_"):
             return f"--lcm-env key {k} must start with LCM_"
-        if re.search(r"(_PATH|_DIR|_HOME|_FILE)$", k) or k == "LCM_DATABASE_PATH":
+        if re.search(r"(_PATH|_DIR|_HOME|_FILE)$", k, re.I):
             return f"--lcm-env key {k} is path-valued; refused"
-        if re.search(r"KEY|TOKEN|SECRET|PASSWORD", k):
+        if re.search(r"KEY|TOKEN|SECRET|PASSWORD", k, re.I):
             return f"--lcm-env key {k} is secret-shaped; refused"
     return None
 

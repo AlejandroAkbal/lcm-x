@@ -188,8 +188,8 @@ def score(cell: dict, cell_dir: Path) -> dict:
             "stored_rows_not_expected", "split_keys")
     numbers["B2"] = {k: sum(m[k] for m in b2_parts.values()) for k in keys}
     numbers["B2"]["per_session"] = {g: m["verdict"] for g, m in b2_parts.items()}
-    bound = tool_calls.bind(atts)
-    tools = tool_calls.compare(bound["expected"], bound["loose"], tool_calls.stored_keys(full))
+    bound = tool_calls.bind(atts, lambda a: attempt_group(a, group))
+    tools = tool_calls.compare(bound["expected"], bound["loose"], tool_calls.stored_keys(full, group))
     numbers["B2"].update(tools)
     if tools["tool_missing_rows"] or tools["tool_surplus_rows"]:
         failed["B2"] = dict(numbers["B2"])

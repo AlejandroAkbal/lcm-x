@@ -191,9 +191,9 @@ def test_b7_native_health(tmp_path):
 
 
 def test_multiset_normalisation_passes_and_a_split_reply_fails():  # R1.2 F1: a split is surplus, never PASS
-    assert multiset.score([("user", "a  b\n")], [(1, "S", "user", "a b")])["verdict"] == "PASS"
+    assert multiset.score([("user", "a  b\n")], [(1, "S", "user", " a  b")])["verdict"] == "PASS"  # edge strip only
     out = multiset.score([("user", "a  b\n"), ("assistant", "one two")],
-                         [(1, "S", "user", "a b"), (2, "S", "assistant", "one"), (3, "S", "assistant", "two")])
+                         [(1, "S", "user", "a  b"), (2, "S", "assistant", "one "), (3, "S", "assistant", "two")])
     assert out["verdict"] == "FAIL" and out["split_keys"] == 1 and out["surplus_rows"] == 2
 
 
@@ -410,7 +410,8 @@ def test_d7_pc1_is_a_differential_encoded_as_data():
     assert exp[("47bd28e7", "acp-trailing/in-place")] == "FAIL" != exp[("ae1fb16d", "acp-trailing/in-place")]
 
     def rows(old_baseline):
-        return [{"plugin_ref": ref, "cell": c, "host": h, "verdict": exp[(ref, c)] if (ref, c) != ("47bd28e7", "baseline/in-place/acp")
+        return [{"plugin_ref": ref, "cell": c, "host": h, "failed_bars": {"B1": {}, "B2": {}},
+                 "verdict": exp[(ref, c)] if (ref, c) != ("47bd28e7", "baseline/in-place/acp")
                  else old_baseline} for ref in pc1["refs"] for c in pc1["cells"] for h in pc1["hosts"]]
     assert controls.check("PC-1", rows("PASS")) == []
     # round 1's PC-1 shape: the old tree fails the baseline too, so the red is not attributable to the transform
@@ -534,3 +535,82 @@ def test_r14_safety_refusals(tmp_path):
         path.write_text(json.dumps({"hosts": {bad: {"python": "p", "src": str(src), "sha": "s"}}}))
         with pytest.raises(ValueError, match="safe path component"):
             hosts.load(path, hermes_dir=tmp_path / ".hermes")
+
+
+def test_r15_a1_b2_is_exact_on_internal_whitespace(tmp_path):
+    events = clean_events()
+    sep = U.format(2, 2).replace(" alpha", "\n\nalpha")  # a prompt with planted paragraph separators (#545)
+    for e in events:
+        if e.get("tag") == "T02" and e["event"] == "user_sent":
+            e["content"] = e["persist"] = sep
+        if e.get("tag") == "T02" and e["event"] == "turn_end":
+            e["held"] = sep
+    rows = [r if r[1] != U.format(2, 2) else ("user", sep) for r in clean_rows()]
+    assert make(tmp_path, rows=rows, events=events)["verdict"] == "PASS"
+    collapsed = [r if r[1] != sep else ("user", sep.replace("\n\n", " ")) for r in rows]
+    out = make(tmp_path / "c", rows=collapsed, events=events)
+    assert "B2" in out["failed_bars"] and out["numbers"]["B2"]["missing_keys"] == 1
+
+
+def test_r15_a2_tool_rows_are_scored_per_lineage(tmp_path):
+    events, rows, plan = tool_cell()
+    parents = {"S0": None, "cron_job_01": None}
+    right = make(tmp_path, rows=rows, events=events, nodes=[[1, 2, 3, 4, 5]], sids=["S0"] * len(rows), parents=parents, **plan)
+    assert right["verdict"] == "PASS", right["failed_bars"]
+    wrong = ["S0", "S0", "cron_job_01", "cron_job_01", "cron_job_01"] + ["S0"] * (len(rows) - 5)  # tool rows in cron
+    out = make(tmp_path / "w", rows=rows, events=events, nodes=[[1, 2]], sids=wrong, parents=parents, **plan)
+    assert out["numbers"]["B2"]["tool_missing_rows"] == 4 and out["numbers"]["B2"]["tool_surplus_rows"] == 4
+
+
+def test_r15_a3_a_modified_cached_export_is_never_reused(tmp_path):
+    repo = tmp_path / "lcm"
+    repo.mkdir()
+    (repo / "plugin.yaml").write_text("name: hermes-lcm-x\n")
+    (repo / "plugin_identity.py").write_text('ENGINE_NAME = "lcm-x"\n')
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "x"], check=True)
+    first = plugin_tree.export(repo, "HEAD", tmp_path / "plugins")
+    assert plugin_tree.export(repo, "HEAD", tmp_path / "plugins")["reused"] is True
+    (Path(first["tree"]) / "plugin_identity.py").write_text('ENGINE_NAME = "tampered"\n')
+    again = plugin_tree.export(repo, "HEAD", tmp_path / "plugins")
+    assert again["reused"] is False and again["engine"] == "lcm-x"
+
+
+def test_r15_a4_directory_symlinks_are_in_the_tree_hash(tmp_path):
+    root = tmp_path / "tree"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "m.py").write_text("X = 1\n")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "m.py").write_text("X = 1\n")
+    before = hosts.tree_hash(root)
+    import shutil
+    shutil.rmtree(root / "pkg")
+    (root / "pkg").symlink_to(tmp_path / "other")  # same bytes behind it, but now a directory symlink
+    assert hosts.tree_hash(root) != before
+
+
+def test_r15_a5_pc1_must_fail_its_intended_bars():
+    pc1 = controls.CONTROLS["PC-1"]
+    assert pc1["bars"] == ["B1", "B2"]
+    rows = [{"plugin_ref": ref, "cell": c, "host": h, "verdict": pc1["expect"][(ref, c)],
+             "failed_bars": {"B5": {}} if pc1["expect"][(ref, c)] == "FAIL" else {}}
+            for ref in pc1["refs"] for c in pc1["cells"] for h in pc1["hosts"]]
+    assert len(controls.check("PC-1", rows)) == len(pc1["hosts"])  # red for another reason does not HOLD
+
+
+def test_r15_b_safety_and_precision(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (out / "cells").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(ValueError, match="symlink"):
+        run_matrix.run_cell({"id": "x", "lcm_env": {}}, "h", {}, {"sha": "a" * 40}, out, 1, False)
+    for key in ("LCM_database_path", "LCM_api_secret"):
+        assert key in (run_matrix.env_refusal({key: "x"}) or "")
+    rec = run_matrix.verdict_fields({"faults": []}, tmp_path, {"exit": "unsupported"}, set(), {}, ["lcm.db: missing"])
+    assert rec["verdict"] == "ERROR"
+    tree = Path(__file__).resolve().parent.parent  # this repo's own config.py: the plugin's parser
+    for value, want in (("1", True), ("yes", True), ("On", True), ("true", True), ("false", False), ("garbage", False)):
+        assert plugin_tree.parse_bool(tree, "LCM_NATIVE_RECOVERY", value)[0] is want, value
