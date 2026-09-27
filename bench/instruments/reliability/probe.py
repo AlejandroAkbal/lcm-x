@@ -391,11 +391,15 @@ def main():
                 for x in set(re.findall(r"\[([A-Z]\d\d)\] user turn", m["content"])):
                     tags[x] = tags.get(x, 0) + 1
         if not idx:
-            return None, False, [], tags
+            return None, False, [], tags, []
         after = msgs[idx[-1] + 1:]
         reply = reply_text(prefix, t)
+        # Assistant rows the host itself wrote after the prompt (agent/turn_failure_copy.py: an interrupted
+        # turn's "Your request was not processed" row) are held rows too.
+        own = [m["content"] for m in after if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+               and m["content"].strip() and m["content"] != reply and not m.get("tool_calls")]
         return (msgs[idx[-1]]["content"], any(m.get("role") == "assistant" and m.get("content") == reply for m in after),
-                [m for m in after if m.get("role") == "tool"], tags)
+                [m for m in after if m.get("role") == "tool"], tags, own)
 
     def run_turn(ag, prefix, t, history, kind="normal", persist_strip=None, task_id="S0"):
         text = user_text(cell, prefix, t)
@@ -411,7 +415,7 @@ def main():
         scripted(ag, prefix, t, est, cancel=kind == "cancel")
         result = ag.run_conversation(user_message=text, conversation_history=history, task_id=task_id,
                                      persist_user_message=persist)
-        held, reply_held, tools, user_tags = held_after(result, text, prefix, t)
+        held, reply_held, tools, user_tags, host_replies = held_after(result, text, prefix, t)
         failed = bool(result.get("failed")) or not result.get("completed", True)
         if failed and kind != "cancel":
             counters["failed"].append(f"{prefix}{t:02d}")
@@ -421,7 +425,7 @@ def main():
         event(turn=t, event="turn_end", tag=f"{prefix}{t:02d}", session_prefix=prefix, kind=kind,
               **({"held_same": True} if held == persist else {"held": held}),
               reply=reply_text(prefix, t) if reply_held else None, failed=failed, native_attempts=cur["native"],
-              interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags,
+              interrupted=bool(result.get("interrupted")), session=ag.session_id, user_tags=user_tags, host_replies=host_replies,
               tools_planned=len(cur["issued"]), tools_answered=len(cur["seen"]),
               host_commits=buf.getvalue().count(COMMITTED) - cur["commits0"])
         return result

@@ -36,13 +36,13 @@ def attempts(events: list[dict]) -> list[dict]:
         if e["event"] in ("user_sent", "retry"):
             a = {"tag": e["tag"], "prefix": e.get("session_prefix", "T"), "content": e["content"],
                  "persist": e["persist"] if e.get("persist") is not None else e["content"],
-                 "held": None, "reply": None, "user_tags": {}, "ended": False, "turn": e.get("turn")}
+                 "held": None, "reply": None, "user_tags": {}, "ended": False, "turn": e.get("turn"), "host_replies": []}
             out.append(a)
             open_[e["tag"]] = a
         elif e["event"] == "turn_end" and e["tag"] in open_:
             a = open_.pop(e["tag"])
             a.update(held=a["persist"] if e.get("held_same") else e.get("held"), reply=e.get("reply"), user_tags=e.get("user_tags") or {},
-                     ended=True, end=e)
+                     ended=True, end=e, host_replies=e.get("host_replies") or [])
     return out
 
 
@@ -115,6 +115,7 @@ def expected_items(atts: list[dict]) -> list[tuple[str, str]]:
             items.append(("user", text))
         if a["reply"]:
             items.append(("assistant", a["reply"]))
+        items += [("assistant", x) for x in a["host_replies"]]
     return items
 
 
