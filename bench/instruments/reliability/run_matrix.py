@@ -128,7 +128,7 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     (home / "config.yaml").write_text(config_yaml(cell, plugin))
     (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name, "host_src": host["src"],
                                              "host_python": host["python"]}, indent=1))
-    env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
+    env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(d / "pycache"),
            "OPENROUTER_API_KEY": "test-key", "TMPDIR": str(d / "home"),
            **cell["lcm_env"], "LCM_NATIVE_RECOVERY": "true" if cell["native_recovery"] else "false"}
     rec = {"cell": cell["id"], "host": host_name, "host_sha": host["sha"], "plugin_ref": plugin["ref"],
@@ -227,7 +227,7 @@ def main(argv=None) -> int:
         except (ValueError, OSError) as exc:
             identities[name] = {"error": str(exc)}
     selected = C.select(a.cells)
-    plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins") for ref in a.plugin_ref.split(",")]
+    plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins", out) for ref in a.plugin_ref.split(",")]
     if len({p["sha"] for p in plugins}) < len(plugins):
         ap.error(f"--plugin-ref values resolve to the same commit: {[(p['ref'], p['sha'][:12]) for p in plugins]}")
     out.mkdir(parents=True, exist_ok=True)

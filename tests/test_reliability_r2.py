@@ -9,12 +9,14 @@ import subprocess
 import sys
 import textwrap
 import time
+import types
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bench.instruments.reliability import acp_driver as AD, cells, fake_provider as FP, process_cell as PC  # noqa: E402
+from bench.instruments.reliability import acp_driver as AD, cells, fake_provider as FP, hosts, plugin_tree, probe  # noqa: E402
+from bench.instruments.reliability import process_cell as PC, run_matrix as RM  # noqa: E402
 from bench.instruments.reliability.scorers import chronology  # noqa: E402
 
 
@@ -238,3 +240,81 @@ def test_accounting_matches_requests_to_scripted_steps(tmp_path):
     acct = PC.accounting(tmp_path, events)
     assert acct["ok"] and acct["requests_by_role"] == {"main": 2, "lcm-summary": 1}
     assert not PC.accounting(tmp_path, events[:1])["ok"]
+
+
+def test_plugins_root_symlink_or_escape_is_refused_before_any_cache_write(tmp_path):
+    outside, out = tmp_path / "outside", tmp_path / "out"
+    (outside / "keep").mkdir(parents=True)
+    out.mkdir()
+    (out / "plugins").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        plugin_tree.export(tmp_path, "HEAD", out / "plugins", out)
+    with pytest.raises(ValueError):
+        plugin_tree.export(tmp_path, "HEAD", outside, out)
+    assert (outside / "keep").is_dir() and list(outside.iterdir()) == [outside / "keep"]
+
+
+@pytest.mark.parametrize("broken", ["missing_other_module", "bad_name", "legacy_host"])
+def test_final_check_falls_back_only_when_the_manual_module_is_missing(monkeypatch, broken):
+    fallback = []
+    mods = {"agent": types.SimpleNamespace(), "acp_adapter": types.SimpleNamespace(),
+            "acp_adapter.commands": types.SimpleNamespace(_estimate_tokens=lambda *a: 1),
+            "agent.conversation_compression_manual": types.SimpleNamespace(compress_now=None, parse_compress_args=None),
+            "agent.conversation_compression": types.SimpleNamespace(finalize_context_engine_compression_notification=None)}
+    if broken == "missing_other_module":
+        mods["agent.conversation_compression"] = None  # ModuleNotFoundError, but for another module
+    elif broken == "bad_name":
+        mods["agent.conversation_compression"] = types.SimpleNamespace()  # plain ImportError: name not found
+    else:
+        mods["agent.conversation_compression_manual"] = None
+    for name, mod in mods.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    engine = types.SimpleNamespace(_last_compression_status="compacted")
+    agent = types.SimpleNamespace(context_compressor=engine, _compress_context=lambda *a, **k: fallback.append(1) or (a[0], None))
+    out = probe.final_check(agent, [], probe.io.StringIO())
+    if broken == "legacy_host":
+        assert fallback and out["entry"] == "_compress_context(force=True)"
+    else:
+        assert out["outcome"] == "failed" and out["exception"] and not fallback
+
+
+def test_host_processes_get_a_private_pycache_and_sourceless_pyc_is_refused(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["env"] = kw["env"]
+        return types.SimpleNamespace(stdout='{"exit": "error", "reason": "x"}', stderr="", returncode=1)
+    monkeypatch.setattr(RM.subprocess, "run", fake_run)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    plugin = {"ref": "r", "sha": "a" * 40, "tree": str(tree), "dir": "p", "enabled": "p", "engine": "e"}
+    cell = cells.select("baseline/in-place/acp")[0]
+    RM.run_cell(cell, "h", {"python": sys.executable, "src": str(tmp_path), "sha": "s"}, plugin, tmp_path / "out", 5,
+                False, identity={"method": "test"})
+    assert seen["env"]["PYTHONPYCACHEPREFIX"].endswith("/pycache") and str(tmp_path / "out") in seen["env"]["PYTHONPYCACHEPREFIX"]
+    run = PC.ProcessCell(cell, tmp_path / "c", {"python": sys.executable, "src": str(tmp_path)}, "acp-process", 5)
+    try:
+        assert run.env()["PYTHONPYCACHEPREFIX"] == str(tmp_path / "c" / "pycache")
+    finally:
+        run.proxy.stop()
+    src = tmp_path / "src"
+    (src / "__pycache__").mkdir(parents=True)
+    (src / "m.py").write_text("")
+    (src / "__pycache__" / "m.cpython-311.pyc").write_bytes(b"")
+    assert hosts.sourceless_pyc(src) == []
+    (src / "__pycache__" / "gone.cpython-311.pyc").write_bytes(b"")
+    (src / "loose.pyc").write_bytes(b"")
+    assert sorted(hosts.sourceless_pyc(src)) == ["__pycache__/gone.cpython-311.pyc", "loose.pyc"]
+    with pytest.raises(ValueError, match="sourceless"):
+        hosts.verify("h", {"src": str(src), "sha": "s"})
+
+
+def test_extra_turns_only_when_a_pass_just_consumed_the_backlog(tmp_path):
+    cell = {"turns": 5, "final_compaction_check": True}
+    (tmp_path / "transcript.jsonl").write_text(json.dumps({"event": "compaction", "turn": 4, "compression_status": "compacted"}) + "\n")
+    log = []
+    assert list(probe.extend_turns(cell, 1, lambda t: probe.backlog_low(tmp_path, t, log))) == [1, 2, 3, 4, 5, 6, 7]
+    assert [c["turns_since_pass"] for c in log] == [1, 2, 3]
+    (tmp_path / "transcript.jsonl").write_text(json.dumps({"event": "compaction", "turn": 1, "compression_status": "compacted"}) + "\n")
+    assert list(probe.extend_turns(cell, 4, lambda t: probe.backlog_low(tmp_path, t, []))) == [4, 5]
+    assert list(probe.extend_turns({**cell, "final_compaction_check": False}, 1, lambda t: True)) == [1, 2, 3, 4, 5]

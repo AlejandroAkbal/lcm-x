@@ -578,7 +578,11 @@ def main():
     if phase != "A":  # ACP _restore reads the stable ACP id; a gateway reads the durable tip (load_transcript)
         history = sdb_read.get_messages_as_conversation(sid, repair_alternation=True)
     turns, cancel = int(cell["turns"]), faults.get("cancel_then_retry")
-    for t in range(first, turns + 1):
+    backlog_log = out.setdefault("final_backlog", [])
+
+    def low_backlog(last_turn):
+        return backlog_low(cell_dir, last_turn, backlog_log)
+    for t in extend_turns(cell, first, low_backlog):
         f = faults.get("clean_exit_before_turn")
         if f and phase != "A" and t == f.get("turn", first + f.get("after_restart", 0)) and t != first \
                 and "clean_exit_before_turn" not in fired:
@@ -605,7 +609,7 @@ def main():
             cron_run(t // int(cell["cron_every"]))
     if cell.get("final_compaction_check", True):
         cur["final"] = True  # its compaction events are B4 evidence, not B5 passes
-        out["final_check"] = final_check(agent, history, buf)
+        out["final_check"] = {**final_check(agent, history, buf), "backlog_checks": backlog_log}
     finish("done", next_turn=None)
 
 
@@ -660,6 +664,35 @@ def guard_sockets(local_ok, on_refuse=None):
     socket.getaddrinfo, socket.create_connection = getaddrinfo, create_connection
 
 
+MIN_BACKLOG_TURNS, MAX_EXTRA_TURNS = 3, 3
+
+
+def backlog_low(cell_dir, last_turn, log):
+    """True when an automatic pass committed within the last MIN_BACKLOG_TURNS turns, so the final forced
+    compaction would find no raw backlog outside the fresh tail (LCM ingests lazily, so lcm.db cannot show the
+    backlog before that compaction). Read from the cell's own ``compaction`` events; every check is recorded."""
+    path = Path(cell_dir) / "transcript.jsonl"
+    events = [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+    passes = [e["turn"] for e in events if e.get("event") == "compaction" and not e.get("final")
+              and e.get("compression_status") in ("compacted", "host_native")]
+    since = last_turn - max(passes) if passes else None
+    log.append({"after_turn": last_turn, "last_pass_turn": max(passes) if passes else None, "turns_since_pass": since})
+    return since is not None and since < MIN_BACKLOG_TURNS
+
+
+def extend_turns(cell, first, low):
+    """The cell's turns from ``first``, then up to MAX_EXTRA_TURNS extra scripted turns (tagged and scored like any
+    turn) while ``low()`` says the final forced compaction has no backlog. Shared by R1 and R2."""
+    turns = int(cell["turns"])
+    yield from range(first, turns + 1)
+    if not cell.get("final_compaction_check", True):
+        return
+    for t in range(max(first, turns + 1), turns + MAX_EXTRA_TURNS + 1):
+        if not low(t - 1):
+            return
+        yield t
+
+
 def session_count():
     try:
         con = sqlite3.connect(f"file:{Path(os.environ['HERMES_HOME']) / 'state.db'}?mode=ro", uri=True)
@@ -688,7 +721,10 @@ def final_check(agent, history, buf):
         from agent.conversation_compression_manual import compress_now, parse_compress_args
         from agent.conversation_compression import finalize_context_engine_compression_notification
         entry = "compress_now"
-    except ImportError:  # older hosts: _cmd_compress calls _compress_context directly
+    except ImportError as exc:  # older hosts (no manual-compression module): _cmd_compress calls _compress_context
+        if not (isinstance(exc, ModuleNotFoundError) and exc.name == "agent.conversation_compression_manual"):
+            return {"entry": "compress_now", "exception": repr(exc)[:500], "engine_calls": 0, "engine_status": None,
+                    "attempts": [], "conflicts": 0, "published": False, "outcome": "failed"}
         from acp_adapter.commands import _estimate_tokens
         entry = "_compress_context(force=True)"
     for _ in range(2):

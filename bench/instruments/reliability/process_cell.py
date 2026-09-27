@@ -84,7 +84,11 @@ def config_yaml(cell: dict, plugin: dict, base_url: str) -> str:
             f"auxiliary:\n  compression:\n    {route}    model: rel/aux\n  title_generation:\n    {route}    model: rel/aux-title\n"
             "  background_review:\n    enabled: false\n"
             "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n  nudge_interval: 0\n"
-            "skills:\n  creation_nudge_interval: 0\nmodel_catalog:\n  enabled: false\n"
+            "skills:\n  creation_nudge_interval: 0\n"
+            # enabled: the model catalog fetch (hermes_cli/model_catalog.py); excluded_providers (hermes_cli/
+            # inventory.py:54 at customer-0.21.2): the keyless opencode-free provider, whose live /models fetch
+            # ACP session/new runs via model_catalog.build_model_state -> _fetch_opencode_free_models.
+            "model_catalog:\n  enabled: false\n  excluded_providers: [opencode-free]\n"
             f"platform_toolsets:\n  acp: [{', '.join(cell.get('toolsets', ['todo', 'context_engine', 'file']))}]\n")
 
 
@@ -165,7 +169,7 @@ class ProcessCell:
         self.cell, self.d, self.host, self.transport, self.turn_timeout = cell, d, host, transport, turn_timeout
         self.home, self.files, self.work = d / "hermes-home", d / "files", d / "home" / "work"
         self.transcript, self.proc, self.sid, self.text_tag = d / "transcript.jsonl", None, None, None
-        self.phase, self.log_mark, self.fired = "A", 0, set()
+        self.phase, self.log_mark, self.fired, self.backlog_log, self.last_turn = "A", 0, set(), [], 0
         self.scenario = Scenario(self)
         self.provider = FP.FakeProvider(d / "provider-requests.jsonl", main=self.scenario.main,
                                         usage_scale=float(cell["assistant"].get("usage_scale", 1.0)))
@@ -207,7 +211,7 @@ class ProcessCell:
     # -- the host process ------------------------------------------------------------------------------------
     def env(self) -> dict:
         env = {"HOME": str(self.d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(self.home),
-               "TMPDIR": str(self.d / "home"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
+               "TMPDIR": str(self.d / "home"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(self.d / "pycache"), "PYTHONUNBUFFERED": "1",
                "PYTHONPATH": str(OBSERVER), "REL_OBSERVER_DIR": str(self.d), "REL_PHASE": self.phase,
                "HERMES_ACP_SKIP_CONFIGURED_MCP": "1", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
                "LCM_SUMMARY_MODEL": "rel/lcm-summary",
@@ -226,7 +230,7 @@ class ProcessCell:
     def turn(self, t: int, kind: str = "normal") -> str | None:
         text = P1.user_text(self.cell, "T", t)
         n = int(self.cell["user_text"].get("identical_turns", {}).get(str(t), t))
-        self.text_tag = None if text == "continue" else f"T{n:02d}"
+        self.text_tag, self.last_turn = None if text == "continue" else f"T{n:02d}", t
         (self.d / "turn.json").write_text(json.dumps({"prefix": "T", "t": t, "kind": kind, "text": text,
                                                       "text_tag": self.text_tag, "reply": reply_text(self.cell, "T", t)}))
         self.scenario.begin(t, kind, self.phase, self.first)
@@ -239,7 +243,7 @@ class ProcessCell:
 
     def final_check(self) -> dict:
         """The ACP ``/compress`` command, re-sent once after a cleanup-only ``sanitized`` pass (R1 final_check)."""
-        attempts, t = [], int(self.cell["turns"])
+        attempts, t = [], self.last_turn
         for _ in range(2):
             (self.d / "turn.json").write_text(json.dumps({"prefix": "T", "t": t, "kind": "final", "text": "/compress"}))
             self.scenario.begin(None, "final", self.phase, self.first)
@@ -271,7 +275,7 @@ class ProcessCell:
             else:  # ACP _restore: the stable ACP id, restored from state.db by the fresh process
                 self.proc.load_session(self.sid, self.files, self.turn_timeout)
             cancel = next((f for f in self.cell["faults"] if f["kind"] == "cancel_then_retry"), None)
-            for t in range(first, int(self.cell["turns"]) + 1):
+            for t in P1.extend_turns(self.cell, first, self.low_backlog):
                 if cancel and t == cancel["turn"] and "cancel_then_retry" not in self.fired:
                     self.turn(t, "cancel")
                     end = [n for n in self.notes("turn_end") if n["tag"] == f"T{t:02d}" and n["turn_kind"] == "cancel"]
@@ -280,7 +284,8 @@ class ProcessCell:
                         self.turn(t, "retry")
                 else:
                     self.turn(t)
-            final = self.final_check() if self.cell.get("final_compaction_check", True) else None
+            final = {**self.final_check(), "backlog_checks": self.backlog_log} \
+                if self.cell.get("final_compaction_check", True) else None
             return {"exit": "done", "next_turn": None, **({"final_check": final} if final else {})}
         except AD.ProcessGone as exc:
             if self.proc.killed and "crash_after_compaction_before_reply" in self.fired:
@@ -292,6 +297,9 @@ class ProcessCell:
         finally:
             rc = self.proc.close()
             self.event(event="host_exit", returncode=rc, killed=self.proc.killed)
+
+    def low_backlog(self, last_turn: int) -> bool:
+        return P1.backlog_low(self.d, last_turn, self.backlog_log)
 
     def stderr_tail(self) -> str:
         path = self.d / f"host-{self.phase}.stderr"

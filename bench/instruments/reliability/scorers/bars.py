@@ -212,7 +212,8 @@ def score(cell: dict, cell_dir: Path) -> dict:
         failed["B4"] = numbers["B4"]
     elif cell.get("final_compaction_check", True) and outcome == "inconclusive":
         inconclusive["B4"] = f"forced compaction ended {final.get('engine_status')!r} ({final.get('noop_reason')!r}) " \
-                             f"after {len(final.get('attempts', []))} attempt(s) of {final.get('entry')}"
+                             f"after {len(final.get('attempts', []))} attempt(s) of {final.get('entry')}; backlog checks " \
+                             f"{[c.get('turns_since_pass') for c in final.get('backlog_checks') or []]}"
     grow = summary.growth(events, sum(p.get("compactions_logged", 0) for p in phases), cell.get("min_compactions", 5))
     session_of = {r[0]: r[1] for r in full}
     crossing = [nid for nid, sid, src in nodes  # a summary must only cover rows of its own session lineage
