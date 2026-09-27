@@ -137,6 +137,29 @@ def test_b_summary_never_claims_a_row_whose_text_is_not_in_its_input(tmp_path, s
         engine.shutdown()
 
 
+def test_r4_one_live_occurrence_never_hides_a_second_stored_one(tmp_path, summaries):
+    """Two identical occurrences at one host stamp, the host view keeps one of them plus later rows:
+    the owed occurrence is rehydrated with its bytes, or the frontier stays below it; publication
+    never trips on a coverage hole."""
+    engine = _engine(tmp_path)
+    x = _u("same payload twice" + PAD, 500.0)
+    head = _turns(1, 3, 0.0)
+    try:
+        engine.ingest([*head, dict(x), dict(x)])
+        live = [*head, dict(x), _a("reply to x", 501.0), *_turns(10, 4, 600.0)]
+        engine.ingest(live)
+        engine.compress(live)
+        x_ids = [int(row["store_id"]) for row in _rows(engine) if row["content"] == x["content"]]
+        assert len(x_ids) == 2
+        assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
+        claimed = _assert_claims_are_in_the_input(engine, summaries)
+        frontier = int(engine._last_compacted_store_id or 0)
+        assert all(store_id in claimed or store_id > frontier for store_id in x_ids)
+        assert summaries[-1].count("same payload twice") == 2 or x_ids[1] > frontier
+    finally:
+        engine.shutdown()
+
+
 def test_c_same_conversation_sibling_session_gets_no_carry(tmp_path, summaries):
     """A session that merely shares the conversation id is not a compression child: its replay of
     the other session's rows gets no carry, and its publication claims only its own rows."""

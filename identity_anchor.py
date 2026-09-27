@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
 from .message_content import normalize_content_value, text_content_for_pattern_matching
@@ -499,10 +499,11 @@ class IdentityAnchorMixin:
         """The summarizer input for ``chunk`` built TOGETHER with what each input row may claim:
         ``[(input_row, [store_id, ...]), ...]``, or None (today's input and mapping).
         - A live composite LCM recorded (R2 witness) claims its constituents: their text is in it.
-        - An owned, host-stamped user row above the frontier that no live row maps, whose identity the
-          host ``view`` no longer shows, and that sits below the chunk's last mapped row (a host merge
-          absorbed it, a persist override rewrote its survivor, ...) is REHYDRATED from its stored
-          bytes, in store order, and claims only itself.
+        - An owned, host-stamped user row above the frontier that no live row maps, that no unmapped
+          occurrence of the host ``view`` accounts for (occurrence for occurrence: one live row never
+          hides two stored ones), and that sits below the chunk's last mapped row (a host merge absorbed
+          it, a persist override rewrote its survivor, ...) is REHYDRATED from its stored bytes, in store
+          order, and claims only itself.
         Nothing is claimed without its text in the input; rows with valid coverage (<= frontier) keep it."""
         if not identity_anchor_enabled() or not isinstance(full_map, dict) or not chunk:
             return None
@@ -542,17 +543,25 @@ class IdentityAnchorMixin:
         last = max([full_map[id(m)] for m in chunk if id(m) in full_map] + list(claimed), default=0)
         gaps = []
         if last > frontier:
-            shown = {self._message_replay_identity(message, strip_carrier=False) for message in view}
+            shown = Counter(self._message_replay_identity(message, strip_carrier=False)  # a retained anchor, ...
+                            for message in view if id(message) not in full_map)
+
+            def unshown(row) -> bool:
+                form = next((form for form in self._stored_row_forms(row) if shown[form] > 0), None)
+                if form is not None:
+                    shown[form] -= 1
+                return form is None
+
             rows = self._store.get_range(str(self._session_id), start_id=frontier + 1, end_id=last - 1, limit=100000)
             for source, start, end in carry:
                 if end > frontier and start < last:
                     rows += self._store.get_range(source, start_id=max(start, frontier) + 1, end_id=min(end, last - 1), limit=100000)
-            gaps = sorted((row for row in rows if row.get("role") == "user" and owned(row)
-                           and row.get("observed_at") is not None
-                           and int(row["store_id"]) not in mapped | claimed
-                           and not self._stored_row_forms(row) & shown
-                           and not self._matches_ignore_message_patterns(row, stored_row=True)),
-                          key=lambda row: int(row["store_id"]))
+            gaps = [row for row in sorted(rows, key=lambda row: int(row["store_id"]))
+                    if row.get("role") == "user" and owned(row)
+                    and row.get("observed_at") is not None
+                    and int(row["store_id"]) not in mapped | claimed
+                    and not self._matches_ignore_message_patterns(row, stored_row=True)
+                    and unshown(row)]
         if not gaps and not claims:
             return None
         out, pending = [], list(gaps)
