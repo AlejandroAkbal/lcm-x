@@ -207,6 +207,15 @@ def test_f3_unproven_scenarios_are_unsupported(tmp_path):
     assert no_native["verdict"] == "UNSUPPORTED" and "zero native" in no_native["reason"]
 
 
+def test_host_written_assistant_row_is_held_not_surplus(tmp_path):
+    notice = "Your request was not processed. Send it again if you still want me to carry it out."
+    rows = clean_rows() + [("assistant", notice)]
+    assert "B2" in make(tmp_path, rows=rows, events=clean_events())["failed_bars"]
+    events = clean_events()
+    events[-1]["host_replies"] = [notice]  # the host appended its own interrupted-turn row after T03
+    assert make(tmp_path / "h", rows=rows, events=events)["verdict"] == "PASS"
+
+
 def test_f3_continue_rows_are_position_bound(tmp_path):
     events = clean_events(3)
     events[2]["content"] = events[2]["persist"] = events[3]["held"] = "continue"
