@@ -895,6 +895,41 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    # -- #436 identity anchor: host-time lookup ------------------------------
+
+    def _ensure_identity_anchor_schema(self) -> None:
+        """Additive, created on first anchored use: one non-unique index."""
+        if getattr(self, "_identity_anchor_schema_ready", False):
+            return
+        with self._write_lock:
+            self._conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_msg_conversation_observed ON messages(conversation_id, observed_at);
+            """)
+        self._identity_anchor_schema_ready = True
+
+    def find_rows_by_observed_at(
+        self, conversation_id: str, session_ids: List[str], observed_ats: List[float],
+    ) -> List[Dict[str, Any]]:
+        """Rows of ``session_ids`` in ``conversation_id`` whose host ``observed_at`` is one of
+        ``observed_ats``, in store order (indexed; bounded by the distinct stamps asked for)."""
+        values, sessions = sorted(set(observed_ats)), set(session_ids)
+        if not values or not sessions:
+            return []
+        self._ensure_identity_anchor_schema()
+        found: dict[tuple[int, float], Dict[str, Any]] = {}
+        for start in range(0, len(values), 500):
+            chunk = values[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self._conn.execute(  # a row stored before its session had a conversation id carries ''
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE conversation_id IN (?, '') AND observed_at IN ({marks})",
+                [_normalize_conversation_id_value(conversation_id), *chunk],
+            ).fetchall()
+            for r in rows:
+                row = self._row_to_dict(r)
+                if str(row.get("session_id") or "") in sessions:
+                    found[(int(row["store_id"]), float(row["observed_at"]))] = row
+        return [found[key] for key in sorted(found)]
+
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
         row = self._conn.execute(
