@@ -4,7 +4,7 @@
     python -m bench.instruments.reliability.ci gate r1/results.jsonl r2/results.jsonl --open-issues open-issues.txt
 
 The gate fails on any ERROR, and on a FAIL in the G-REL-1 cell set unless the cell targets an open issue. It also
-fails on an empty set and, per (host, transport, plugin sha) present, on any missing, duplicate or unexpected cell
+fails on an empty results file, a host missing from any file, an empty set and, per (host, transport, plugin sha) present, on any missing, duplicate or unexpected cell
 row against the ``--cells all`` list run_matrix.py uses for that transport (UNSUPPORTED rows count as present).
 """
 from __future__ import annotations
@@ -56,8 +56,19 @@ def completeness(results: list[dict]) -> list[str]:
     return problems
 
 
-def gate(results: list[dict], open_issues: set[int]) -> list[str]:
-    problems = completeness(results)
+def file_coverage(per_file: dict[str, list[dict]]) -> list[str]:
+    """Every input results file (one lane: R1, R2) is non-empty and covers every host any file has: a wholly
+    missing lane leaves no group for completeness() to check."""
+    problems = [f"empty result file: {name}" for name, rows in per_file.items() if not rows]
+    hosts = {r.get("host") for rows in per_file.values() for r in rows}
+    for name, rows in per_file.items():
+        if rows and (missing := sorted(hosts - {r.get("host") for r in rows}, key=str)):
+            problems.append(f"result file {name} has no rows for host(s) {missing}")
+    return problems
+
+
+def gate(results: list[dict], open_issues: set[int], per_file: dict[str, list[dict]] | None = None) -> list[str]:
+    problems = (file_coverage(per_file) if per_file is not None else []) + completeness(results)
     for r in results:
         where = f"{r['verdict']} {r['host']} {r['cell']} ({r.get('transport', 'in-process')})"
         if r["verdict"] == "ERROR":
@@ -97,9 +108,10 @@ def main(argv=None) -> int:
     if a.cmd == "prep":
         prep(a.host, Path(a.root).resolve(), Path(a.out))
         return 0
-    results = [json.loads(line) for f in a.results for line in Path(f).read_text().splitlines() if line.strip()]
+    per_file = {f: [json.loads(line) for line in Path(f).read_text().splitlines() if line.strip()] for f in a.results}
+    results = [r for rows in per_file.values() for r in rows]
     open_issues = {int(n) for n in Path(a.open_issues).read_text().split()}
-    problems = gate(results, open_issues)
+    problems = gate(results, open_issues, per_file)
     for line in problems:
         print(f"GATE: {line}")
     print(f"GATE {'FAILS' if problems else 'PASSES'}: {len(results)} cells, {len(problems)} gating")

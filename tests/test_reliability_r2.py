@@ -442,7 +442,7 @@ def test_process_phase_deadline_is_an_error_with_its_cause(tmp_path):
     cell = next(c for c in cells.registry() if c["id"] == "baseline/in-place/acp")
     run = PC.ProcessCell(cell, tmp_path, {"src": str(tmp_path)}, "acp-process", 300.0, phase_timeout=1.5)
     run.work.mkdir(parents=True)
-    run.argv = lambda: [sys.executable, "-c", silent]
+    run.argv, run.env = lambda: [sys.executable, "-c", silent], lambda: {"PATH": "/usr/bin:/bin"}  # no observer: tmp_path may be /tmp
     started = time.monotonic()
     try:
         last = run.run_phase(1)
@@ -460,6 +460,7 @@ def test_process_phase_deadline_is_checked_before_a_done_return(tmp_path):
     run = PC.ProcessCell(cell, tmp_path, {"src": str(tmp_path)}, "acp-process", 300.0, phase_timeout=1.0)
     run.work.mkdir(parents=True)
     run.argv = lambda: [sys.executable, "-c", PEER]  # answers every request at once
+    run.env = lambda: {"PATH": "/usr/bin:/bin"}  # no observer (it refuses a /tmp cell dir, as tmp_path is on Linux)
     event = run.event
     run.event = lambda **ev: (event(**ev), ev.get("event") == "acp_response" and time.sleep(1.3))
     try:
@@ -469,3 +470,21 @@ def test_process_phase_deadline_is_checked_before_a_done_return(tmp_path):
         run.provider.server.server_close()
     assert any(json.loads(x).get("event") == "acp_response" for x in run.transcript.read_text().splitlines())
     assert last["exit"] == "error" and "PhaseDeadline" in last["reason"], last
+
+
+def test_ci_gate_fails_a_missing_lane_or_host(tmp_path, capsys):
+    """Regression (R2a.3 bot thread): the gate flattened its files, so an empty R2 file left no group to check."""
+    r1, r2 = tmp_path / "r1.jsonl", tmp_path / "r2.jsonl"
+    issues = tmp_path / "open-issues.txt"
+    issues.write_text("")
+
+    def run(a, b):
+        r1.write_text("".join(json.dumps(r) + "\n" for r in a))
+        r2.write_text("".join(json.dumps(r) + "\n" for r in b))
+        rc = ci.main(["gate", str(r1), str(r2), "--open-issues", str(issues)])
+        return rc, capsys.readouterr().out
+    assert run(full_set(), full_set("acp-process"))[0] == 0
+    rc, out = run(full_set(), [])
+    assert rc == 1 and f"empty result file: {r2}" in out
+    rc, out = run(full_set(), [dict(r, host="B") for r in full_set("acp-process")])
+    assert rc == 1 and "has no rows for host(s) ['B']" in out and "has no rows for host(s) ['h']" in out
