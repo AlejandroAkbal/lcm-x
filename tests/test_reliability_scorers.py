@@ -580,14 +580,13 @@ def test_r15_a3_a_modified_cached_export_is_never_reused(tmp_path):
 
 def test_r15_a4_directory_symlinks_are_in_the_tree_hash(tmp_path):
     root = tmp_path / "tree"
-    (root / "pkg").mkdir(parents=True)
-    (root / "pkg" / "m.py").write_text("X = 1\n")
+    (root / "pkg").mkdir(parents=True)  # an empty package dir
+    (root / "a.py").write_text("A = 1\n")
     (tmp_path / "other").mkdir()
-    (tmp_path / "other" / "m.py").write_text("X = 1\n")
+    (tmp_path / "other" / "shadow.py").write_text("X = 1\n")
     before = hosts.tree_hash(root)
-    import shutil
-    shutil.rmtree(root / "pkg")
-    (root / "pkg").symlink_to(tmp_path / "other")  # same bytes behind it, but now a directory symlink
+    (root / "pkg").rmdir()
+    (root / "pkg").symlink_to(tmp_path / "other")  # now a directory symlink to importable code outside the tree
     assert hosts.tree_hash(root) != before
 
 
