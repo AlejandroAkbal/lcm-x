@@ -493,3 +493,27 @@ def test_t4_ancestry_is_cached_only_after_a_completed_read(tmp_path):
         assert engine._identity_anchor_chain() == ["P"]
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("path", ["delete_session_messages", "doctor_clean"])
+def test_t7_relations_are_deleted_with_their_rows(tmp_path, path):
+    """#572 T7: a deleted row's relations (as head or member) go in the same transaction; a reused
+    store_id never inherits one."""
+    import hermes_lcm.command as command_mod
+
+    engine = _engine(tmp_path)
+    try:
+        r, u = _u("R prompt" + PAD, 500.0), _u("U prompt" + PAD, 510.0)
+        head = [SYSTEM, *_turns(1, 3, 0.0)]
+        engine.ingest([*head, r, u])
+        engine.ingest([*head, _u(r["content"] + "\n\n" + u["content"], 500.0), _a("reply to U", 511.0)])
+        assert _relations(engine)
+        if path == "delete_session_messages":
+            engine._store.delete_session_messages("S")
+        else:
+            engine.on_session_start("other", platform="cli", context_length=200_000, conversation_id="conv2")
+            command_mod._delete_clean_candidates_atomically(engine, {"S"})
+            assert not engine._store.get_session_messages("S")
+        assert _relations(engine) == []
+    finally:
+        engine.shutdown()

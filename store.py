@@ -262,6 +262,17 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
     )
 
 
+def delete_message_relations(conn: sqlite3.Connection, rows_sql: str, args: tuple = ()) -> None:
+    """#436 T7: the ``message_relations`` of rows about to be deleted (``rows_sql`` selects their
+    store_ids) go with them, on the caller's connection and transaction: a store_id reused after the
+    delete must never inherit a stale relation."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_relations'").fetchone():
+        conn.execute(
+            f"DELETE FROM message_relations WHERE store_id IN ({rows_sql}) OR related_store_id IN ({rows_sql})",
+            (*args, *args),
+        )
+
+
 class MessageStore:
     """SQLite-backed immutable message store."""
 
@@ -560,6 +571,7 @@ class MessageStore:
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
+            delete_message_relations(self._conn, "SELECT store_id FROM messages WHERE session_id = ?", (session_id,))
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
