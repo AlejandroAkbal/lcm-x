@@ -49,7 +49,11 @@ whose trigger never fires at that host sha.
 ## Bars (all applicable bars must pass)
 B1 and B2 are scored per session lineage: the chat lineage is S0 and its compression children (state.db
 `parent_session_id`), each cron fire its own lineage; a row stored in the wrong lineage fails both.
-- **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as the host holds,
+The expected assistant rows come from the provider log, not the host result: exactly one scripted reply per
+completed non-cancel attempt (a reply the host dropped is a deficit), plus the host's own cited failed-turn copy
+(`agent/turn_failure_copy.py` `FAILED_TURN_NOTICE`/`PARTIAL_FAILED_TURN_NOTICE`, exact text) only on an attempt
+the host reported `interrupted`. Any other assistant row is surplus.
+- **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as expected,
   and every stored `continue` row is followed by the reply of its own turn (position-bound).
 - **B2** multiset-v1 (port of the gauntlet's `lossless_bar_multiset.py`): per (role, sha256(NFC,
   whitespace-collapsed)) stored count == expected count; surplus and deficit reported apart. Every
@@ -65,7 +69,13 @@ B1 and B2 are scored per session lineage: the chat lineage is S0 and its compres
   host `commit_status: committed` telemetry line in the same turn; published passes (LCM or host-native,
   the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes.
 - **B6** (tool cells) no message-sourced summary covers part of a tool group (#559 invariant); zero host
-  orphan-tool-result drops.
+  orphan-tool-result drops; every planned call (name, id, args) ran for real at the cited host dispatch hook
+  (`model_tools.handle_function_call` with its call id, or the context engine's `handle_tool_call` via
+  `agent/tool_executor.py`, bound by name + args) with a successful, complete result (`read_file`: the whole
+  file; `expect.min_chars` where a cell asks for a large result), and no unplanned dispatch. Tool rows are in B2:
+  `(call id, name, args)` per tool-call entry and `(call id, sha256 of the result the next provider request
+  carried)` per result row, stored vs expected as a multiset. A planned call the host never dispatched is
+  UNSUPPORTED.
 - **B7** (native cells) no `native recovery did not produce a usable summary`, no host
   `summary_generation_aborted`, at most one native attempt per turn.
 
@@ -77,12 +87,17 @@ Verdicts: PASS, FAIL (failed bars with numbers), INCONCLUSIVE (no bar fails, one
 UNSUPPORTED (with the reason). A cell must prove its scenario ran or it is UNSUPPORTED, never PASS: every
 planned tool call dispatched and its result seen by the next provider call, at least one stored tool group
 for B6, at least one native attempt in a native cell, a cancel that reported `interrupted` before the
-retry, and every host citation its faults and transport need. A runner job that raises is ERROR.
+retry, and every host citation its faults and transport need. A runner job that raises is ERROR, and so is a
+phase whose imported host modules (every loaded `run_agent`, `hermes_*`, `agent.*`, `model_tools`, `tools.*`,
+`acp_adapter.*`, `gateway.*`, `cron.*`, plus each cited module) do not resolve under the verified host `src`,
+whose plugin module is not the exported tree, or whose interpreter is not the host's (receipt:
+`provenance` in phase-*.json).
 `sql_dup_counter.py`, `summary_nodes_report.py` and `compaction_ledger.py`
 are ported as `scorers/dupes.py` and `scorers/summary.py` (diagnostics and the B5 ledger).
 
 ## Positive controls
-PC-1 is a differential: lcm-x `47bd28e7` (before #498, the #494 fix) vs `ae1fb16d` on eva-0.21.5, rs34-0.21.5
+`controls.py` holds each control's refs, hosts, cells and expected red/green pattern; `run_matrix.py --control
+PC-1 --out <dir>` runs it and writes CONTROL.json (HOLDS or the mismatches). PC-1 is a differential: lcm-x `47bd28e7` (before #498, the #494 fix) vs `ae1fb16d` on eva-0.21.5, rs34-0.21.5
 and upstream-main: `baseline/in-place/acp` PASSes at both, `acp-trailing/in-place` FAILs only at
 `47bd28e7` (the host's post-commit-proof persist strip). customer-0.21.2 passes both refs (no such strip).
 
