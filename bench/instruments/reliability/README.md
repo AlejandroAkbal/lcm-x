@@ -111,3 +111,20 @@ and upstream-main: `baseline/in-place/acp` PASSes at both, `acp-trailing/in-plac
 In-process only: no real `hermes acp`/gateway process, transport, model or timing. Gateway timestamp
 rendering stays at its default (off). Upgrades from pre-fix DBs (#485/#542) and the Desktop/tui transport
 (#463) are not covered; see ISSUE-MAP.md for every uncovered issue and the capability it needs.
+
+## R2 transport cells (`--transport acp-process`)
+`run_matrix.py ... --transport acp-process` runs the same cell ids and scorers through `<host venv>/bin/hermes acp`
+over stdio (`acp_driver.py`, ported from the WS3 gauntlet driver), one process per phase, HERMES_HOME/HOME under the
+cell dir. Every model route (main, `LCM_SUMMARY_MODEL`, host aux) is the localhost `fake_provider.py` (OpenAI JSON/SSE,
+Anthropic messages, `/v1/models`); its request log is reconciled with the transcript (`accounting` in verdict.json).
+`observer/` is put on the host's PYTHONPATH and records, without changing arguments or results, the host seams R1's
+probe traces (R1's transcript schema). Faults are real: SIGKILL of the host process group while the provider holds the
+turn's request; ACP `session/cancel` while it is in flight; the final check is the ACP `/compress` command.
+Containment: localhost base URLs, no API-key env, every proxy variable at a recording sink that refuses
+(`proxy-attempts.jsonl`), model catalog off, a seeded models.dev cache, macOS `sandbox-exec` (localhost-only
+network), and the socket guard; any attempt makes the cell ERROR (STOP). The R2 summariser runs with
+`LCM_SUMMARY_SPEND_MAX_CALLS=100000` (60 turns in ~20 s would trip the per-window spend guard). Cells whose fault is
+injected in-process (publication failure, crash between end/start, crash after rotation), cron cells and the R1
+gateway cells are UNSUPPORTED with the reason; `--transport gateway-process` is UNSUPPORTED with per-host citations
+(the webhook platform is one-shot per delivery; api_server bypasses TurnRunner). `scorers/chronology.py` reports
+(never gates) user-row tag order per lineage.
