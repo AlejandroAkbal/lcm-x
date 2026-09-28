@@ -438,7 +438,9 @@ def main():
 
         def inject(conn, conversation_id, session_id, *args, **kwargs):
             stages["n"] += 1
-            if (pf["where"] == "rotation_child" and session_id != "S0") or pf["where"] == f"pass_{stages['n']}":
+            # rotation_child: only the first child publication (#541's bar), unless the cell asks for every one
+            child = pf["where"] == "rotation_child" and session_id != "S0" and (pf.get("persistent") or pf["kind"] not in fired)
+            if child or pf["where"] == f"pass_{stages['n']}":
                 if pf["kind"] not in fired:
                     fire(pf["kind"], cur["turn"], where=pf["where"])
                 raise err(f"injected publication failure ({pf['where']})")

@@ -20,11 +20,13 @@ CI_HOSTS = Path(__file__).with_name("hosts.ci.json")
 G_REL_1 = ("baseline", "acp-trailing", "preflight-continue", "repeat-identical-replies", "long-80", "window-1m",
            "pressure-disagreement", "lcm-tool-mid-turn", "parallel-tool-group", "crash-", "gateway-second-restart",
            "cancel-retry", "publication-failure")
+# Data cells inside a gate family that never gate (still expected rows for completeness).
+NON_GATE = ("publication-failure/rotation-child-persistent",)
 
 
 def in_gate_set(cell_id: str) -> bool:
     family = cell_id.split("/")[0]
-    return any(family == g or (g.endswith("-") and family.startswith(g)) for g in G_REL_1)
+    return cell_id not in NON_GATE and any(family == g or (g.endswith("-") and family.startswith(g)) for g in G_REL_1)
 
 
 def expected_cells(transport: str | None) -> list[str]:

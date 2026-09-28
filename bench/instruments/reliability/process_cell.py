@@ -473,7 +473,7 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
         return done(verdict="ERROR", reason=f"provider request log does not account for the transcript: {acct}")
     rec.update(RM.verdict_fields({**cell, "chat_root": run.sid}, d, last, run.fired, rec["citations"], backup_errors))
     done()
-    if keep_dbs == "fail" and rec["verdict"] == "PASS":
+    if keep_dbs == "fail" and rec["verdict"] == "PASS" and not any(RM.report.licensed(rec)):
         shutil.rmtree(d / "db", ignore_errors=True)
     if not keep:
         shutil.rmtree(home, ignore_errors=True)

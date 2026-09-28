@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bench.instruments.reliability import cells, controls, hosts, plugin_tree, probe, report, run_matrix  # noqa: E402
+from bench.instruments.reliability import ci, cells, controls, hosts, plugin_tree, probe, report, run_matrix  # noqa: E402
 from bench.instruments.reliability.scorers import bars, dupes, multiset  # noqa: E402
 
 U = "[T{:02d}] user turn {}: alpha beta end."
@@ -56,13 +56,16 @@ def tool_cell(**dispatch):
         {"name": n, "args": a} for n, a in PLAN]}]}
 
 
-def make(tmp_path, *, rows, events, nodes=(), phase=None, sids=None, parents=None, **cell_kw):
+def make(tmp_path, *, rows, events, nodes=(), phase=None, sids=None, parents=None, host=None, **cell_kw):
     d = tmp_path / "cell"
     (d / "db").mkdir(parents=True)
-    if parents is not None:
+    if parents is not None or host is not None:  # host: state.db (session, role, content, active) rows
         con = sqlite3.connect(d / "db" / "state.db")
         con.execute("create table sessions (id text primary key, parent_session_id text)")
-        con.executemany("insert into sessions values (?,?)", parents.items())
+        con.executemany("insert into sessions values (?,?)", (parents or {"S0": None}).items())
+        if host is not None:
+            con.execute("create table messages (id integer primary key, session_id text, role text, content text, active integer)")
+            con.executemany("insert into messages (session_id, role, content, active) values (?,?,?,?)", host)
         con.commit()
         con.close()
     con = sqlite3.connect(d / "db" / "lcm.db")
@@ -646,3 +649,91 @@ def test_r2a3_b1_covers_three_digit_turn_tags(tmp_path):
 
 def test_r2a3_issue_566_is_decided_by_b5_too():
     assert "B5" in cells.ISSUES[566][0]
+
+
+TREE = {"tree": str(Path(__file__).resolve().parent.parent)}  # this checkout is an lcm-x plugin tree
+
+
+def held(n=3, sid="S0"):
+    return [(sid, role, text, 1) for role, text in clean_rows(n)]
+
+
+def test_r2a4_a_host_parity_duplicate_is_licensed(tmp_path):
+    dup = ("S0", "user", U.format(2, 2), 1)  # the host durably holds T02 twice in one view (H2 rows 105/106)
+    out = make(tmp_path, rows=clean_rows() + [("user", U.format(2, 2))], events=clean_events(), host=held() + [dup], plugin=TREE)
+    assert out["verdict"] == "PASS", out["failed_bars"]
+    lic = out["numbers"]["B2"]["host_parity_licensed"]
+    assert lic["rows"] == 1 and out["numbers"]["B1"]["host_parity_licensed"]["rows"] == 1
+    assert lic["records"][0] | {"sha256": None} == {
+        "role": "user", "sha256": None, "expected": 1, "stored": 2, "host": 2, "licensed": 1, "store_ids": [3, 7],
+        "host_row_ids": [3, 7], "tags": ["T02"], "session": "chat"}
+    assert "host-dup=B2:1/B1:1" in report.signature({"verdict": "PASS", **out})
+
+
+def test_r2a4_b_an_lcm_only_duplicate_is_not_licensed(tmp_path):
+    copies = [("S0", "user", U.format(2, 2), 0),  # an in-place generation copy (inactive)
+              ("child", "user", U.format(2, 2), 1)]  # a rotation copy in a child session
+    out = make(tmp_path, rows=clean_rows() + [("user", U.format(2, 2))], events=clean_events(),
+               host=held() + copies, parents={"S0": None, "child": "S0"}, plugin=TREE)
+    assert {"B1", "B2"} <= set(out["failed_bars"]) and out["numbers"]["B2"]["surplus_rows"] == 1
+    assert out["numbers"]["B2"]["host_parity_licensed"]["rows"] == 0
+    # H1 re-issues a row with a fresh timestamp per in-place generation: still one occurrence
+    fresh = [("S0", "user", U.format(2, 2), 0)] * 3
+    assert "B2" in make(tmp_path / "f", rows=clean_rows() + [("user", U.format(2, 2))], events=clean_events(),
+                        host=held() + fresh, plugin=TREE)["failed_bars"]
+
+
+def test_r2a4_c_a_deficit_is_never_licensed(tmp_path):
+    out = make(tmp_path, rows=clean_rows()[:-2] + [clean_rows()[-1]], events=clean_events(),
+               host=held() + [("S0", "user", U.format(3, 3), 1)], plugin=TREE)
+    assert out["numbers"]["B2"]["deficit_rows"] == 1 and {"B1", "B2"} <= set(out["failed_bars"])
+
+
+def test_r2a4_d_a_licence_is_per_lineage(tmp_path):
+    other = ("cron_job_01", "user", U.format(2, 2), 1)  # the second copy is held in another lineage
+    out = make(tmp_path, rows=clean_rows() + [("user", U.format(2, 2))], events=clean_events(),
+               host=held() + [other], parents={"S0": None, "cron_job_01": None}, plugin=TREE)
+    assert {"B1", "B2"} <= set(out["failed_bars"]) and out["numbers"]["B2"]["host_parity_licensed"]["rows"] == 0
+
+
+def test_r2a4_no_host_evidence_no_licence(tmp_path):
+    rows, events = clean_rows() + [("user", U.format(2, 2))], clean_events()
+    for i, kw in enumerate(({}, {"parents": {"S0": None}},  # no state.db; a state.db with no messages table
+                            {"host": held() + [("S0", "user", U.format(2, 2), 1)]})):  # no plugin tree: no carrier markers
+        out = make(tmp_path / str(i), rows=rows, events=events, **kw)
+        assert out["verdict"] == "FAIL" and out["numbers"]["B2"]["host_parity_licensed"]["unavailable"]
+
+
+def test_r2a4_reports_licences_visibly(tmp_path):
+    out = make(tmp_path, rows=clean_rows() + [("user", U.format(2, 2))], events=clean_events(),
+               host=held() + [("S0", "user", U.format(2, 2), 1)], plugin=TREE)
+    rec = {"cell": "baseline/in-place/acp", "host": "h", "plugin_ref": "r", "plugin_sha": "a" * 40, "host_sha": "b" * 40,
+           "targets": [], **out}
+    report.write(tmp_path, [rec], 1.0)
+    matrix, im = (tmp_path / "MATRIX.md").read_text(), (tmp_path / "ISSUE-MAP.md").read_text()
+    assert "| host-dup |" in matrix and "| h: B2 1/B1 1 |" in matrix
+    assert "- `baseline/in-place/acp` on h: B2 1 / B1 1 rows licensed" in matrix
+    assert "lcm [3, 7] host rows [3, 7]" in im and "tags T02" in im
+
+
+def test_r2a4_541_gate_cell_injects_once_and_the_persistent_cell_is_data():
+    by = {c["id"]: c for c in cells.select("publication-failure/*")}
+    once, always = by["publication-failure/rotation-child"], by["publication-failure/rotation-child-persistent"]
+    assert not once["faults"][0].get("persistent") and always["faults"][0]["persistent"] and not always["targets"]
+    assert ci.in_gate_set(once["id"]) and not ci.in_gate_set(always["id"])
+    for transport in (None, "acp-process"):
+        assert always["id"] in ci.expected_cells(transport)
+    src = Path(probe.__file__).read_text()
+    assert 'pf.get("persistent") or pf["kind"] not in fired' in src
+
+
+def test_r2a4_an_echoed_lcm_carrier_is_never_licensed(tmp_path):
+    carrier = "[Recent Summary (d0, node 1)]\nStub summary #1 covers T01.\n\n" + U.format(2, 2)  # carrier-headed composite
+    rows = clean_rows() + [("user", carrier)]
+    host = held() + [("S0", "user", carrier, 1)]  # the host echoed it durably, active
+    out = make(tmp_path, rows=rows, events=clean_events(), host=host, plugin=TREE)
+    assert out["numbers"]["B2"]["host_parity_licensed"]["rows"] == 0 and {"B1", "B2"} <= set(out["failed_bars"])
+    todo = "[Your active task list was preserved across context compression]\n- item"
+    out = make(tmp_path / "t", rows=clean_rows() + [("user", todo)], events=clean_events(),
+               host=held() + [("S0", "user", todo, 1)], plugin=TREE)
+    assert out["numbers"]["B2"]["host_parity_licensed"]["rows"] == 0 and "B2" in out["failed_bars"]
