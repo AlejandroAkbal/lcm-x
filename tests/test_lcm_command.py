@@ -537,19 +537,21 @@ def test_lcm_doctor_reports_health_checks(engine):
 
 
 def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engine):
-    """A persisted survival fit (#601): a rollback to an older plugin restores the pre-upgrade lcm.db
-    backup with the plugin; a plugin-only rollback re-stores rows the older version cannot compact."""
+    """A persisted survival fit (#601, #603): within the 0.24.x line a rollback restores the pre-upgrade
+    lcm.db backup with the plugin; a rollback to v0.23.3 keeps lcm.db and needs native recovery on."""
     record = {"count": 2, "last_reason": "publication_invariant_conflict"}
     engine._store.write_metadata_json(["survival_fit:counter"], json.dumps(record, sort_keys=True))
 
     result = handle_lcm_command("doctor", engine)
 
     observation = next(line for line in result.splitlines() if "survival_fit: applied 2 time(s)" in line)
-    assert "rollback" in observation and "lcm.db backup" in observation
+    assert "within the 0.24.x line" in observation and "v0.23.3" in observation
     line = next(line for line in result.splitlines() if line.startswith("- survival_fit:") and " — " in line)
-    assert "restore the lcm.db backup taken before the upgrade together with the plugin" in line
-    assert "plugin-only rollback" in line and "cannot compact" in line
+    for phrase in ("within the 0.24.x line", "restore the lcm.db backup taken before the upgrade together with the plugin",
+                   "v0.23.3", "LCM_NATIVE_RECOVERY=true", "keep lcm.db", "never a backup restore"):
+        assert phrase in line, phrase
     assert "rows stored after that backup leave the LCM store" in line and "host session" in line
+    assert not any("a rollback to an older plugin restores" in text for text in (observation, line))
 
 
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):

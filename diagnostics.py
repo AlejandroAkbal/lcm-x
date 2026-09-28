@@ -158,10 +158,12 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         rationale = "context pressure is an operating state, not persisted-state corruption"
     elif name == "survival_fit":
         command = ("inspect the 'LCM survival fit applied' log lines and the compaction failure reason; the dropped "
-                   "turns stay stored verbatim (lcm_grep / lcm_load_session); nothing needs deleting. Rollback (#601): "
-                   "a plugin-only rollback to an older version re-stores rows and that version cannot compact the "
-                   "store, so restore the lcm.db backup taken before the upgrade together with the plugin (rows "
-                   "stored after that backup leave the LCM store; they remain in the host session)")
+                   "turns stay stored verbatim (lcm_grep / lcm_load_session); nothing needs deleting. Rollback "
+                   "(#601, #603): within the 0.24.x line a plugin-only rollback re-stores rows the older version "
+                   "cannot compact, so restore the lcm.db backup taken before the upgrade together with the plugin "
+                   "(rows stored after that backup leave the LCM store; they remain in the host session). To "
+                   "v0.23.3: reinstall it with LCM_NATIVE_RECOVERY=true and keep lcm.db as it is — never with "
+                   "native recovery off, and never a backup restore (it drops rows and does not avoid the conflict).")
         warning_only = True
         rationale = "a survival fit kept an over-window session alive; it points at a compaction that could not publish"
     elif name == "cleanup_candidates":
