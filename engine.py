@@ -2976,7 +2976,10 @@ class LCMEngine(
             return
         if state.last_reset_at is not None and (state.last_finalized_at or 0) < state.last_reset_at:
             return
-        state = self._lifecycle.bind_session(self._session_id, conversation_id=state.conversation_id)
+        # R6-2: the read above can be stale (another session may bind in between): compare-and-bind.
+        state = self._lifecycle.rebind_own_finalized(self._session_id, state.conversation_id)
+        if state is None:
+            return  # another session holds the row now: nothing written, the frontier unchanged
         frontier = int(state.current_frontier_store_id or 0)
         if int(self._last_compacted_store_id or 0) != frontier:
             logger.warning(

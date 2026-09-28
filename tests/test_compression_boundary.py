@@ -504,8 +504,16 @@ def _compress_next(engine, host):
 
 
 def _spy_binds(engine, monkeypatch):
-    calls, bind = [], engine._lifecycle.bind_session
+    calls, bind, rebind = [], engine._lifecycle.bind_session, engine._lifecycle.rebind_own_finalized
     monkeypatch.setattr(engine._lifecycle, "bind_session", lambda *a, **k: calls.append(a) or bind(*a, **k))
+
+    def spy_rebind(*a, **k):  # the row-state rebind's compare-and-bind (R6-2): a write is a bind
+        state = rebind(*a, **k)
+        if state is not None:
+            calls.append(a)
+        return state
+
+    monkeypatch.setattr(engine._lifecycle, "rebind_own_finalized", spy_rebind)
     return calls
 
 
@@ -640,6 +648,50 @@ def test_r5_3a_another_clone_unbinding_the_row_never_costs_the_bound_engine_a_co
     conflicts = [r.getMessage() for r in caplog.records if "publication_invariant_conflict" in r.getMessage()]
     assert not conflicts and turn_engine._last_compression_status == "compacted", conflicts[:1]
     assert after[0] == sid and after[1] > frontier
+
+
+def test_r6_2_a_stale_rebind_never_overwrites_a_session_that_bound_after_its_read(tmp_path, monkeypatch, caplog):
+    """R6-2: stale engine A reads the row unbound and last finalized by A; B binds before A acts. A's
+    rebind is a compare-and-bind: it writes nothing, B stays bound at its frontier, and A's compress
+    publishes nothing against B's row."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(lcm_engine_module, "summarize_with_escalation", _stub_summarizer())
+    cfg = LCMConfig(database_path=str(tmp_path / "lcm.db"), fresh_tail_count=6, leaf_chunk_tokens=400,
+                    large_output_externalization_path=str(tmp_path / "ext"))
+    proto = LCMEngine(config=cfg, hermes_home=str(tmp_path / "home"))
+    stale, other = proto.clone_for_agent(), proto.clone_for_agent()
+    stale.on_session_start("A", platform="telegram", context_length=200_000, conversation_id=_CLONE_CONV)
+    host = []
+    try:
+        for i in range(1, 13):
+            host.extend(_turn(i))
+            stale.ingest(host)
+        stale.compress(list(host), force=True)
+        assert stale._last_compacted_store_id > 0
+        stale.on_session_end("A", [])  # a normal end: the row is unbound, last finalized by A
+        read, fired = stale._lifecycle.get_by_conversation, []
+
+        def racing(conversation_id):
+            state = read(conversation_id)
+            if not fired:  # B's start lands between A's eligibility read and its bind
+                fired.append(1)
+                other.on_session_start("B", platform="telegram", context_length=200_000, conversation_id=_CLONE_CONV)
+            return state
+
+        monkeypatch.setattr(stale._lifecycle, "get_by_conversation", racing)
+        stale._rebind_after_unadopted_compaction_commit()
+        monkeypatch.setattr(stale._lifecycle, "get_by_conversation", read)
+        held = ("B", 0)  # B bound as a new session of the conversation
+        assert fired and _lifecycle_row(other)[:2] == held
+        nodes = len(stale._dag.get_session_nodes("A"))
+        for i in range(13, 20):
+            host.extend(_turn(i))
+            stale.ingest(host)
+        stale.compress(list(host), force=True)
+        assert _lifecycle_row(other)[:2] == held and len(stale._dag.get_session_nodes("A")) == nodes
+    finally:
+        stale.shutdown()
+        other.shutdown()
 
 
 def test_r5_3b_an_orphaned_tool_result_is_claimed_on_the_next_pass(tmp_path, monkeypatch, caplog):
