@@ -195,6 +195,29 @@ def test_b_native_on_off_host_summary_chunk_leaves_cover_the_stored_rows(tmp_pat
         engine.shutdown()
 
 
+def test_c_leaf_stops_at_another_conversations_row_under_the_session(tmp_path, summaries):
+    """Eva thread 1: the bound session also holds rows stamped with ANOTHER conversation id. The proof
+    cannot cover them, so the leaf stops before them: a named no-op, never a conflict."""
+    engine = _engine(tmp_path, fresh_tail_count=2, leaf_chunk_tokens=300)
+    own = [row for i in range(1, 4) for row in _turn(f"T{i}", 10.0 * i)]
+    tail = [row for i in range(8, 10) for row in _turn(f"T{i}", 10.0 * i)]
+    try:
+        engine.ingest(own)
+        foreign = [engine._store.append("S", {"role": "assistant", "content": f"[X{i}] other conversation" + PAD},
+                                        conversation_id="other") for i in range(3)]
+        view = [*own, *tail]
+        engine.ingest(view)
+        statuses = []
+        for _ in range(3):
+            view = engine.compress(view)
+            statuses.append(engine._last_compression_status)
+        assert "error" not in statuses and statuses[0] == "compacted", (statuses, engine._last_compression_noop_reason)
+        assert engine._last_compression_noop_reason == "leaf would reach a row of another conversation under this session"
+        assert 0 < _frontier(engine) < min(foreign) and set(foreign).isdisjoint(_covered(engine))
+    finally:
+        engine.shutdown()
+
+
 # -- (d) the carry set ----------------------------------------------------------------------------------
 
 def _state_db(tmp_path, sessions):

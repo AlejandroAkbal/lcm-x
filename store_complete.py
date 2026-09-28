@@ -103,7 +103,7 @@ class StoreCompleteMixin:
         (the first owned row above the frontier is a retained occurrence); None: today's input."""
         from .identity_anchor import _match_occurrences
 
-        self._store_complete_excluded, self._store_complete_cut = [], False
+        self._store_complete_excluded, self._store_complete_cut, self._store_complete_foreign = [], False, False
         in_chunk = {id(message) for message in chunk}
         claims = {key: list(ids) for key, ids in claims.items()}
         # Rows this pass accounts for elsewhere: its exclusions (anchors, scaffold, committed replay)
@@ -170,7 +170,8 @@ class StoreCompleteMixin:
             if store_id in taken or store_id in passive:
                 continue
             if str(row.get("conversation_id") or "").strip() not in {"", str(self._conversation_id or "")}:
-                complete = False  # another conversation's row under this session id: publication cannot own it
+                # another conversation's row under this session id: the publication proof cannot cover it
+                complete, self._store_complete_foreign = False, True
                 break
             if store_id in covered or role == "system" or (dependent and role in ("assistant", "tool")):
                 excluded.append(store_id)
