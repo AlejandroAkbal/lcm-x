@@ -177,6 +177,9 @@ def main():
         sys.exit(3)
     cell = json.loads(Path(a.cell).read_text())
     cell_dir, phase, first = Path(a.cell_dir), a.phase, a.start_turn
+    switched = cell_dir / "faults-fired.jsonl"  # native-on-off: the older ref is the plugin until the switch
+    if cell.get("from_plugin") and not (switched.exists() and "plugin_switch" in switched.read_text()):
+        cell = {**cell, "plugin": cell["from_plugin"]}
     out = {"phase": phase, "start_turn": first, "citations": {k: cite(k) for k in ANCHORS}}
     tfile = open(cell_dir / "transcript.jsonl", "a", encoding="utf-8")
     buf = io.StringIO()
