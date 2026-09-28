@@ -278,7 +278,16 @@ class IdentityAnchorMixin:
         for idx in range(start, n):
             identity = identity_at(idx) if idx in stamps and idx not in plan["replayed"] else None
             if identity is not None and identity[0] == "user":
+                row = self._identity_anchor_ws_row(identity, stamps[idx], [r for r, _f in by_stamp[stamps[idx]]], consumed)
+                if row is not None:  # R1-ws: the host persisted this occurrence without its edge whitespace
+                    plan.setdefault("ws", []).append((row, identity_messages[idx]))
+                    self._identity_anchor_take(idx, [row], consumed, matched, plan)
+                    continue
                 self._identity_anchor_user_row(idx, identity, stamps[idx], by_stamp, consumed, matched, plan, view_count)
+            elif idx not in stamps and idx not in plan["replayed"]:  # D-D plan (ii): H1 merged LCM's carrier
+                group = self._identity_anchor_carrier_group(identity_messages[idx], consumed)
+                if group is not None:
+                    self._identity_anchor_take(idx, group, consumed, matched, plan)
         if start < cursor:
             self._identity_anchor_audit(messages, identity_messages, cursor, start, stamps, identity_at, consumed, plan)
         self._identity_anchor_tool_segments(messages, plan["cursor"], plan["replayed"], matched, plan.get("positional", ()))
@@ -288,6 +297,7 @@ class IdentityAnchorMixin:
         plan["explained"] = plan["replayed"] - plan.get("positional", set())
         plan["replayed"] = {idx for idx in plan["replayed"] if idx >= plan["cursor"]}
         plan["carry"] = [row for idx in plan["replayed"] | set(plan["remainders"]) for row in matched.get(idx, ())]
+        plan["carry"] += [row for row, _message in plan.get("ws", ())]  # R1-ws matches the audit proved too
         if plan["replayed"] and any(str(row.get("session_id")) in chain for row in plan["carry"]):
             # A rotation child resuming onto its ancestors' rows: LCM's own DAG-verified carrier heading
             # the list is compress() output, not a host message (R8).
@@ -322,6 +332,11 @@ class IdentityAnchorMixin:
                     or self._matches_ignore_message_patterns(messages[idx])):
                 continue
             copies = [row for row in held.get(_proof_user_identity(identity), ()) if int(row["store_id"]) not in consumed]
+            ws = self._identity_anchor_ws_row(identity, stamps[idx], copies, consumed)
+            if ws is not None:  # R1-ws: the same occurrence (same stamp, edge whitespace only), recorded
+                consumed.add(int(ws["store_id"]))
+                plan.setdefault("ws", []).append((ws, identity_messages[idx]))
+                continue
             if copies:
                 consumed.add(int(copies[0]["store_id"]))
                 if (len(copies) == 1 and copies[0].get("observed_at") is None
@@ -399,6 +414,47 @@ class IdentityAnchorMixin:
                 consumed.update(int(row["store_id"]) for row in group)
                 matched[idx] = group
                 plan["remainders"][idx] = (rest, stamp, group)
+
+    def _identity_anchor_ws_row(self, identity, stamp, rows, consumed) -> Optional[dict]:
+        """R1-ws (D-D'): the first unconsumed stored user row at the SAME host stamp whose content differs from
+        the view's by edge whitespace only (H1 persists ``prompt.strip()``); stripped texts equal, non-empty."""
+        text = identity[1].strip()
+        if identity[0] != "user" or not text or stamp is None:
+            return None
+        for row in rows:
+            stored = self._message_replay_identity(row, stored_row=True)
+            if (row.get("role") == "user" and int(row["store_id"]) not in consumed
+                    and _normalize_observed_at(row.get("observed_at")) == stamp and stored != identity
+                    and stored[1].strip() == text and tuple(stored[2:]) == tuple(identity[2:])):
+                return row
+        return None
+
+    def _identity_anchor_carrier_group(self, message, consumed) -> Optional[list]:
+        """D-D plan (ii): H1 merged LCM's DAG-verified carrier (R8) with user rows: the remainder's one exact
+        R2 decomposition into the stored user run right after the carrier's coverage end, else None (bytes)."""
+        if (message.get("role") != "user" or message.get("tool_calls")
+                or self._generated_context_carrier_remainder(message) is None):
+            return None
+        rest = self._message_replay_identity(message)[1]  # the carrier stripped (DAG-verified, #483)
+        parts = self._verified_lcm_summary_prefix(normalize_content_value(message.get("content")) or "")[1]
+        covered = self._dag.coverage_end(parts) if parts and "\n\n" in rest else None
+        if not covered:
+            return None
+        rows = sorted((row for session in [str(self._session_id), *self._identity_anchor_chain()]
+                       for row in self._store.get_range(session, start_id=covered + 1, end_id=covered + _POOL_WINDOW,
+                                                        limit=_POOL_WINDOW)), key=lambda row: int(row["store_id"]))
+        run = []
+        for row in rows:  # the host merged consecutive user rows: the run ends at the first other row
+            if row.get("role") != "user" or int(row["store_id"]) in consumed:
+                break
+            run.append(row)
+        self._load_host_rewrite_overrides(run)
+        forms = [{form[1] for form in self._stored_row_forms(row)} for row in run]
+        found = _decompositions(rest, set().union(*forms), partial=False) if run else None
+        full = [parts for parts, remainder in found or () if not remainder]
+        if len(full) != 1 or len(full[0]) > len(run) or any(text not in forms[i] for i, text in enumerate(full[0])):
+            return None
+        return run[:len(full[0])]
 
     def _identity_anchor_constituent_copy(self, idx, identity, stamp, consumed, matched, plan) -> None:
         """R3 + R5: a later timestamped copy of a remainder U whose own stamp was unknown: the host view
@@ -559,7 +615,15 @@ class IdentityAnchorMixin:
         scope = [str(self._session_id), *self._identity_anchor_chain()]
         for message in chunk:
             stamp = _normalize_observed_at(message.get("timestamp"))
-            if id(message) in full_map or stamp is None:
+            if id(message) in full_map:
+                continue
+            if stamp is None:  # D-D plan (ii): LCM's carrier merged with stored rows claims them (text in it)
+                group = self._identity_anchor_carrier_group(message, set()) or ()
+                ids = [int(row["store_id"]) for row in group if owned(row) and int(row["store_id"]) > frontier
+                       and int(row["store_id"]) not in mapped | claimed]
+                if ids:
+                    claimed.update(ids)
+                    claims[id(message)] = ids
                 continue
             # #563: a live row the ordered mapper left unmapped (the host put it after a row stored
             # later) claims its R1-key occurrence; its own bytes are this input row.
@@ -654,9 +718,12 @@ class IdentityAnchorMixin:
         """#563: a live user row that no store row maps and whose text is exactly a recorded composite
         (R2 witness) or its survivor, every constituent already covered (at or below the frontier)."""
         stamp = _normalize_observed_at(message.get("timestamp"))
-        if message.get("role") != "user" or id(message) in full_map or stamp is None:
+        if message.get("role") != "user" or id(message) in full_map:
             return False
         frontier = int(self._last_compacted_store_id or 0)
+        if stamp is None:  # D-D plan (ii): a carrier-headed composite of covered rows
+            group = self._identity_anchor_carrier_group(message, set())
+            return bool(group) and all(int(row["store_id"]) <= frontier for row in group)
         donors = [row for row in self._store.find_rows_by_observed_at(
             str(self._conversation_id or ""), [str(self._session_id), *self._identity_anchor_chain()], [stamp]
         ) if row.get("role") == "user"]
@@ -712,10 +779,19 @@ class IdentityAnchorMixin:
                       for idx, store_id in remainder_ids.items()]
         if groups:
             self._store.add_message_relations(groups)
+        for row, message in plan.get("ws", ()) if remainder_ids is None else ():
+            self._record_ws_host_rewrite(row, message)
         for store_id, stamp in plan["backfill"] if remainder_ids is None else ():
             self._store.backfill_observed_at(store_id, stamp)
         if remainder_ids is None and plan["carry"]:
             self._register_identity_anchor_carry(plan["carry"])
+
+    def _record_ws_host_rewrite(self, row, message) -> None:
+        """R1-ws: record the view's form as a #498 host-rewrite override; the stored row is never modified."""
+        store_id, stored = int(row["store_id"]), normalize_content_value(row.get("content")) or ""
+        identity = self._message_replay_identity(row, stored_row=True)
+        self._host_rewrite_state()[0][store_id] = (identity, stored, [message])  # the capture consumes it
+        self._capture_host_rewrite(store_id, identity, stored, message)
 
     def _note_identity_anchor_version(self, store_id, message) -> None:
         """R6: this process stored ``store_id`` from ``message`` and now observes the SAME host object

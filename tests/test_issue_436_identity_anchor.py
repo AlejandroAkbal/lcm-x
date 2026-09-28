@@ -517,3 +517,90 @@ def test_t7_relations_are_deleted_with_their_rows(tmp_path, path):
         assert _relations(engine) == []
     finally:
         engine.shutdown()
+
+
+
+# -- D-D' R1-ws + plan (ii): H1 persists a prompt's stripped bytes; H1 merges LCM's carrier -------------------
+
+T13 = f"[T13] user turn 13:{PAD}"
+
+
+def _crash_child(tmp_path, stored: list[dict]) -> LCMEngine:
+    """Parent P stored the in-process bytes a crash left (before H1's persist strip); the host resumes in C."""
+    _state_db(tmp_path, [("P", None, "compression"), ("C", "P", None)])
+    engine = _engine(tmp_path, "P")
+    engine.ingest([SYSTEM, *_turns(1, 3, 0.0), *stored])
+    engine.on_session_start("C", platform="cli", context_length=200_000, conversation_id="conv")
+    return engine
+
+
+def _t13(engine, session):
+    return [row for row in _rows(engine, session) if str(row["content"]).startswith("[T13]")]
+
+
+@pytest.mark.parametrize("path", ["fresh-child", "host-reload"])
+def test_r1ws_a_stripped_view_at_the_same_stamp_is_the_stored_occurrence(tmp_path, summaries, path):
+    """D-D' target: ``T13\\n`` stored, the child's ``T13`` at the SAME stamp is that occurrence; it publishes."""
+    engine = _crash_child(tmp_path, [_u(T13 + "\n", 130.0)])
+    head, t14 = [SYSTEM, *_turns(1, 3, 0.0)], _u("[T14] user turn 14:" + PAD, 140.0)
+    live = [*head, _u(T13, 130.0), t14, _a("reply to T14", 141.0), *_turns(20, 4, 600.0)]
+    try:
+        if path == "host-reload":  # the first child list lacks T13; the host reloads it before the cursor
+            engine.ingest([*head, t14, _a("reply to T14", 141.0)])
+        engine.ingest(live)
+        [parent] = _t13(engine, "P")
+        assert parent["content"] == T13 + "\n" and engine._host_rewrite_override_content(parent) == T13
+        assert not _t13(engine, "C")
+        for _ in range(6):
+            live = engine.compress(live)
+            assert engine._last_compression_status != "error", engine._last_compression_noop_reason
+        assert int(parent["store_id"]) in _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("stored, view", [
+    ([T13 + "\n"], (T13, 135.0)),  # another stamp
+    ([T13 + "\n"], (T13.replace("alpha beta", "alpha  beta", 1), 130.0)),  # an internal byte
+    ([T13 + "\n", T13 + "\n"], (T13, 130.0)),  # two stored occurrences, one view: consumes one
+])
+def test_r1ws_negatives_nothing_else_is_absorbed(tmp_path, stored, view):
+    engine = _crash_child(tmp_path, [_u(text, 130.0) for text in stored])
+    try:
+        engine.ingest([SYSTEM, *_turns(1, 3, 0.0), _u(*view), _a("reply to T13", 136.0)])
+        overrides = [engine._host_rewrite_override_content(row) for row in _t13(engine, "P")]
+        if len(stored) == 2:
+            assert overrides == [T13, None] and not _t13(engine, "C")
+        else:
+            assert overrides == [None] and [row["content"] for row in _t13(engine, "C")] == [view[0]]
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("carrier", ["verified", "unverifiable"])
+def test_dd_plan_ii_a_carrier_headed_composite_is_its_stored_rows(tmp_path, summaries, carrier):
+    """H1 merges LCM's carrier with the user rows after it (no stamp): verified, it is those rows; else bytes."""
+    _state_db(tmp_path, [("P", None, "compression"), ("C", "P", None)])
+    engine = _engine(tmp_path, "P")
+    r, u = _u("R prompt" + PAD, 500.0), _u("U prompt" + PAD, 510.0)
+    live = [SYSTEM, *_turns(1, 6, 0.0), r, u]
+    try:
+        engine.ingest(live)
+        pre, live = list(live), engine.compress(live)
+        head = next(m["content"] for m in live if str(m.get("content")).startswith("[Recent Summary"))
+        head = head if carrier == "verified" else head.replace("Earlier", "Edited", 1)
+        engine.on_session_end("P", pre)
+        engine.on_session_start("C", boundary_reason="compression", old_session_id="P", platform="cli",
+                                context_length=200_000, conversation_id="conv")
+        merged = _u(head + "\n\n" + r["content"] + "\n\n" + u["content"], None)
+        live = [live[0], merged, _a("reply to U", 511.0), *_turns(20, 4, 600.0)]
+        engine.ingest(live)
+        stored = [row["content"] for row in _rows(engine, "C")]
+        assert (merged["content"] in stored) is (carrier == "unverifiable")
+        assert len(stored) == len(live) - 2 + (carrier == "unverifiable")
+        for _ in range(6):
+            live = engine.compress(live)
+            assert engine._last_compression_status != "error", engine._last_compression_noop_reason
+        _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()
