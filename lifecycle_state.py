@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import (
+    configure_connection,
+    owned_conversation_clause,
+    refuse_schema_version_too_new,
+    run_versioned_migrations,
+)
 
 
 _OWNERSHIP_QUERY_MAX_RANGES = 200
@@ -1053,12 +1058,15 @@ class LifecycleStateStore:
             # #581: the obligation is this conversation's rows (and blank ones); another
             # conversation's rows under the same session follow that conversation's lifecycle
             # and are never accepted as coverage (checked above). `IN (?, '')` keeps every
-            # range a seek on idx_msg_conversation_session (writes store the id stripped, '' blank).
+            # range a seek on idx_msg_conversation_session (writes store the id stripped, '' blank);
+            # a store holding legacy unnormalized ids adds those values, so no owned row is missed.
+            owned_clause, owned_args = owned_conversation_clause(conn, conversation_id)
             for row in conn.execute(
                 "SELECT store_id, session_id FROM messages WHERE ("
                 + ownership_clause
-                + ") AND conversation_id IN (?, '')",
-                [*ownership_args, conversation_id],
+                + ") AND "
+                + owned_clause,
+                [*ownership_args, *owned_args],
             ).fetchall():
                 rows_by_store_id[int(row[0])] = row
         rows = [rows_by_store_id[store_id] for store_id in sorted(rows_by_store_id)]

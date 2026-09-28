@@ -641,18 +641,67 @@ def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
     )
 
 
+# #581: per store, the stored conversation ids that are not in their written form (NULL, or not equal to
+# their strip()), keyed by the normalized id they stand for. Writes strip with default '' (store.py), so
+# only legacy rows can land here; an empty map (every store written by this code) keeps the fast path.
+_LEGACY_CONVERSATION_IDS: dict[str, dict[str, list]] = {}
+
+
+def _conversation_store_key(conn: sqlite3.Connection) -> str:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        row = None
+    return str(row[2]) if row and row[2] else f"memory:{id(conn)}"
+
+
+def refresh_legacy_conversation_ids(conn: sqlite3.Connection) -> dict[str, list]:
+    """ONE probe per store (engine bind): DISTINCT stored conversation ids over the conversation index."""
+    legacy: dict[str, list] = {}
+    try:
+        values = [row[0] for row in conn.execute("SELECT DISTINCT conversation_id FROM messages").fetchall()]
+    except sqlite3.OperationalError:
+        values = []
+    for value in values:
+        if value is None or str(value) != str(value).strip():
+            legacy.setdefault(str(value or "").strip(), []).append(value)
+    _LEGACY_CONVERSATION_IDS[_conversation_store_key(conn)] = legacy
+    return legacy
+
+
+def owned_conversation_values(conn: sqlite3.Connection, conversation_id: str) -> list:
+    """The stored ``conversation_id`` values owned by ``conversation_id``: it and '' (blank), plus any
+    legacy value that normalizes (strip, NULL -> '') to either. None stands for NULL."""
+    legacy = _LEGACY_CONVERSATION_IDS.get(_conversation_store_key(conn))
+    if legacy is None:
+        legacy = refresh_legacy_conversation_ids(conn)
+    wanted = dict.fromkeys((str(conversation_id or "").strip(), ""))
+    return list(wanted) + [value for key in wanted for value in legacy.get(key, ())]
+
+
+def owned_conversation_clause(conn: sqlite3.Connection, conversation_id: str, column: str = "conversation_id"):
+    """(``column IN (...)`` [OR ``column IS NULL``], args) for :func:`owned_conversation_values`."""
+    values = owned_conversation_values(conn, conversation_id)
+    given = [value for value in values if value is not None]
+    clause = f"{column} IN ({', '.join('?' for _ in given)})"
+    if len(given) < len(values):
+        clause = f"({clause} OR {column} IS NULL)"
+    return clause, given
+
+
 def select_conversation_range(conn: sqlite3.Connection, columns: str, session_id: str, conversation_id: str,
                               after_store_id: int, end_store_id: int | None = None,
                               limit: int | None = None) -> list:
     """#581: a session's rows in ``(after_store_id, end_store_id]`` whose conversation is ``conversation_id``
-    or blank, in store order (``columns`` starts with ``store_id``). One seek per value on
+    or blank, in store order (``columns`` starts with ``store_id``). One seek per owned value on
     idx_msg_conversation_session, so another conversation's rows under the same session are never
-    walked. Writes store the id stripped with default '' (store.py append), so '' is the only blank."""
+    walked; a legacy unnormalized id (NULL, padded, whitespace-only) is one more seek, never a miss."""
     rows: list = []
-    for value in dict.fromkeys((str(conversation_id or ""), "")):
+    for value in owned_conversation_values(conn, conversation_id):
         sql = (f"SELECT {columns} FROM messages INDEXED BY idx_msg_conversation_session "
-               "WHERE conversation_id = ? AND session_id = ? AND store_id > ?")
-        args: list = [value, session_id, int(after_store_id)]
+               + ("WHERE conversation_id IS NULL" if value is None else "WHERE conversation_id = ?")
+               + " AND session_id = ? AND store_id > ?")
+        args: list = ([] if value is None else [value]) + [session_id, int(after_store_id)]
         if end_store_id is not None:
             sql += " AND store_id <= ?"
             args.append(int(end_store_id))

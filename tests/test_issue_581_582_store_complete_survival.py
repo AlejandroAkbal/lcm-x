@@ -294,6 +294,34 @@ def test_r3_owned_reads_seek_the_conversation_index(tmp_path):
         engine.shutdown()
 
 
+@pytest.mark.parametrize("legacy", ["   ", "\t", None, " conv "], ids=["spaces", "tab", "null", "padded"])
+def test_r4_a_legacy_unnormalized_conversation_row_stays_owned(tmp_path, legacy):
+    """R4-1: a legacy row whose conversation id is whitespace-only, NULL or padded (writes strip; older
+    stores may not) is in the leaf's owned read and in the proof's obligation: the frontier cannot pass it."""
+    engine = _engine(tmp_path)
+    try:
+        ids = _mixed_rows(engine)
+        conn = engine._store.connection
+        try:
+            conn.execute("UPDATE messages SET conversation_id = ? WHERE store_id = ?", (legacy, ids["B"]))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pytest.skip("this schema refuses a NULL conversation id")
+    finally:
+        engine.shutdown()
+    engine = _engine(tmp_path)  # a fresh bind probes the store once
+    try:
+        rows, _truncated = engine._store_complete_owned_rows(0, None, [])
+        assert [int(r["store_id"]) for r in rows] == [ids["A"], ids["B"], ids["C"]]
+        with pytest.raises(LifecyclePublicationConflictError, match="not contiguous"):
+            _stage(engine, 0, [ids["A"], ids["C"]])
+        assert _frontier(engine) == 0
+        _stage(engine, 0, [ids["A"], ids["B"], ids["C"]])
+        assert _frontier(engine) == ids["C"]
+    finally:
+        engine.shutdown()
+
+
 def test_proof_rejects_covering_another_conversations_row(tmp_path):
     """A leaf that claims another conversation's row as coverage is still refused."""
     engine = _engine(tmp_path)

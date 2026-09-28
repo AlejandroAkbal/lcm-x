@@ -139,6 +139,7 @@ from .compaction import CompactionMixin
 from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
 from .store_complete import StoreCompleteMixin
 from .survival_fit import SurvivalFitMixin, _carries_survival_notice
+from .db_bootstrap import refresh_legacy_conversation_ids
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -3401,6 +3402,12 @@ class LCMEngine(
     def _on_session_start_unlocked(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+        if getattr(self, "_legacy_conversation_ids_store", None) is not self._store:
+            try:  # #581: one probe per bound store for legacy unnormalized conversation ids
+                refresh_legacy_conversation_ids(self._store.connection)
+                self._legacy_conversation_ids_store = self._store
+            except Exception:
+                logger.debug("LCM legacy conversation-id probe failed; probed on first use", exc_info=True)
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
