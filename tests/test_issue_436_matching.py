@@ -11,6 +11,7 @@ from hermes_lcm import identity_anchor
 from hermes_lcm.identity_anchor import _match_occurrences
 
 KEYS = ("a", "b", "c")
+BOUND = 20.0  # s: >= 20x the measured times (<= 0.9 s) on a shared box; the no-WARNING asserts are the guard
 
 
 def _instance(rng, max_keys):
@@ -66,7 +67,7 @@ def _untripped(caplog, rows, keys_of, occurrences, bound):
 def test_scale_identical_rows_and_occurrences(caplog):
     rows = [{"store_id": i} for i in range(100_000)]
     for n in (100_000, 10):
-        assert len(_untripped(caplog, rows, lambda _row: {"k"}, [(j, "k") for j in range(n)], 2.0)) == n
+        assert len(_untripped(caplog, rows, lambda _row: {"k"}, [(j, "k") for j in range(n)], BOUND)) == n
 
 
 def test_scale_adversarial_chain(caplog):
@@ -75,7 +76,7 @@ def test_scale_adversarial_chain(caplog):
     n, key = 20_000, (lambda i: (1.0, f"k{i:05d}"))
     rows = [{"store_id": i, "keys": {key(i), key(i + 1)}} for i in range(n)] + [{"store_id": n, "keys": {key(0)}}]
     rows += [{"store_id": n + e, "keys": {key(n)}} for e in range(1, 1001)]
-    assert len(_untripped(caplog, rows, lambda row: row["keys"], [(j, key(j)) for j in range(n + 1)], 5.0)) == n + 1
+    assert len(_untripped(caplog, rows, lambda row: row["keys"], [(j, key(j)) for j in range(n + 1)], BOUND)) == n + 1
 
 
 def test_scale_hub_of_distinct_types(caplog):
@@ -85,14 +86,14 @@ def test_scale_hub_of_distinct_types(caplog):
     rows += [{"store_id": n + i, "keys": {("b", i)}} for i in range(n // 2)]
     rows += [{"store_id": 2 * n + i, "keys": {"a"}} for i in range(n // 2)]
     occurrences = [(j, "a") for j in range(n)] + [(n + i, ("b", i)) for i in range(n)]
-    assert len(_untripped(caplog, rows, lambda row: row["keys"], occurrences, 2.0)) == 2 * n
+    assert len(_untripped(caplog, rows, lambda row: row["keys"], occurrences, BOUND)) == 2 * n
 
 
 def test_scale_hub_of_one_type(caplog):
     n = 50_000
     rows = [{"store_id": i, "keys": {"a", "c"}} for i in range(n)] + [{"store_id": n + i, "keys": {"a"}} for i in range(n)]
     occurrences = [(j, "a") for j in range(n)] + [(n + j, "c") for j in range(n)]
-    assert len(_untripped(caplog, rows, lambda row: row["keys"], occurrences, 2.0)) == 2 * n
+    assert len(_untripped(caplog, rows, lambda row: row["keys"], occurrences, BOUND)) == 2 * n
 
 
 def test_a_spent_budget_leaves_a_valid_deterministic_direct_matching(caplog, monkeypatch):

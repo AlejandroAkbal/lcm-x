@@ -228,3 +228,23 @@ def test_r3_r1_a_multi_form_row_leaves_the_single_form_row_its_occurrence(tmp_pa
         assert [row["content"] for row in _rows(engine)].count("xval") == 1
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["steady", "restart"])
+@pytest.mark.parametrize("text", ["foo", LONG], ids=["short", "long"])
+def test_r3f_a_null_stored_row_the_host_shows_stamped_is_reserved(tmp_path, text, restart):
+    """Bot P1: LCM stored U before the host stamped it (NULL); the host then shows U at its state.db stamp below
+    the cursor and folds a new U repeating its text into R: stored U@NULL, R@3; shown U@1, "R\\n\\nU"@3."""
+    engine = _engine(tmp_path)
+    try:
+        r = _u("[R] failed turn" + PAD, 3.0)
+        engine.ingest([_u(text, None), r])
+        if restart:
+            engine.shutdown()
+            engine = _engine(tmp_path)
+        engine.ingest([_u(text, 1.0), _u(r["content"] + "\n\n" + text, 3.0), _a("reply to R+U", 5.0)])
+        expected = [("user", text)] * 2 + [("user", r["content"]), ("assistant", "reply to R+U")]
+        assert _stored(_rows(engine)) == Counter(expected + [("user", text)] * restart)  # restart re-store: as above
+        _assert_shown_row_is_no_constituent(engine, text)
+    finally:
+        engine.shutdown()

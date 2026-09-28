@@ -386,12 +386,23 @@ class IdentityAnchorMixin:
         if "\n\n" not in content:
             return
         # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
-        # A stamped row answers only its own stamp, a NULL-stamped (legacy) row only an unstamped occurrence.
+        # A stamped row answers only its own stamp. A NULL-stamped row (stored before the host stamped it, or
+        # legacy) answers an unstamped occurrence or any stamp its form is shown at; stamped rows are matched
+        # first and keep theirs. Over-reserving stores a composite whole (visible duplication), never a loss.
         pool, reserved = self._identity_anchor_pool(donors, consumed), set()
         if pool:
-            reserved = set(_match_occurrences(pool, lambda row: {(_normalize_observed_at(row.get("observed_at")), form)
-                                                                for form in self._stored_row_forms(row)},
-                                              list(enumerate(shown(idx).elements()))))
+            occurrences = list(enumerate(shown(idx).elements()))
+            stamps_of: dict = defaultdict(set)
+            for _occurrence, (shown_stamp, form) in occurrences:
+                if shown_stamp is not None:
+                    stamps_of[form].add(shown_stamp)
+
+            def keys_of(row) -> set:
+                own = _normalize_observed_at(row.get("observed_at"))
+                forms = self._stored_row_forms(row)
+                return {(s, form) for form in forms for s in ({own} if own is not None else {None, *stamps_of[form]})}
+            stamped_first = sorted(pool, key=lambda row: _normalize_observed_at(row.get("observed_at")) is None)
+            reserved = set(_match_occurrences(stamped_first, keys_of, occurrences))
         pool = [row for row in pool if int(row["store_id"]) not in reserved]
         donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
