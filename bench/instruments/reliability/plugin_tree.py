@@ -72,3 +72,21 @@ def parse_bool(tree: Path, key: str, value: str) -> tuple[bool, str]:
     ns = {"os": SimpleNamespace(environ={key: value})}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "config.py", "exec"), ns)  # noqa: S102 - the plugin's parser
     return bool(ns["_parse_bool_env"](key, False)), f"config.py:{fn.lineno}"
+
+
+def carrier_markers(tree: Path) -> tuple[re.Pattern, tuple[str, ...]]:
+    """The plugin's OWN generated-carrier markers at this tree: engine.py ``_LCM_SUMMARY_PART_HEADER_RE`` (the
+    ``[Recent|Session Arc|Durable|Depth-N Summary (dN, node N)]`` part header its carrier detection verifies) and every
+    ``_PRESERVED_*_PREFIX`` string constant in engine.py/reconcile.py (objective/todo carriers). Raises if absent."""
+    header, prefixes = None, []
+    for name in ("engine.py", "reconcile.py"):
+        for node in ast.walk(ast.parse((Path(tree) / name).read_text())):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target, value = node.targets[0].id, node.value
+                if target == "_LCM_SUMMARY_PART_HEADER_RE" and isinstance(value, ast.Call) and value.args:
+                    header = ast.literal_eval(value.args[0])
+                elif re.fullmatch(r"_PRESERVED_\w+_PREFIX", target) and isinstance(value, ast.Constant):
+                    prefixes.append(value.value)
+    if not header or not prefixes:
+        raise ValueError(f"no generated-carrier markers in {tree}")
+    return re.compile(header), tuple(prefixes)

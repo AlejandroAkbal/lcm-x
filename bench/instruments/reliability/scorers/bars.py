@@ -165,7 +165,9 @@ def score(cell: dict, cell_dir: Path) -> dict:
     group = lineage(cell_dir, cell.get("chat_root", "S0"))
     groups = sorted({attempt_group(a, group) for a in atts} | {group(sid) for _s, sid, _r, _c in stored})
     notices = {x for p in phases for x in p.get("failed_turn_notices") or []}
-    host, host_why = host_parity.load(cell_dir / "db" / "state.db", group)
+    plugin = cell.get("plugin") or (json.loads((cell_dir / "cell.json").read_text()).get("plugin")
+                                    if (cell_dir / "cell.json").exists() else None) or {}
+    host, host_why = host_parity.load(cell_dir / "db" / "state.db", group, plugin.get("tree"))
     per = {g: (expected_items([a for a in atts if attempt_group(a, group) == g], notices),
                [r for r in stored if group(r[1]) == g]) for g in groups}
     applicable = [b for b in cell.get("bars") or ALL_BARS
