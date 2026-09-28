@@ -521,7 +521,6 @@ class IdentityAnchorMixin:
     def _identity_anchor_pool(self, donors, consumed) -> list:
         """Candidate constituents: unconsumed user rows of the lineage near each stamp donor, plus the
         bound session's recent rows (bounded); never a row stored before every donor (B-ID-1)."""
-        first = min((int(row["store_id"]) for row in donors), default=0)
         rows: dict[int, dict] = {}
         for donor in donors:
             store_id = int(donor["store_id"])
@@ -531,7 +530,7 @@ class IdentityAnchorMixin:
         for row in self._store.get_session_tail(str(self._session_id), limit=64):
             rows[int(row["store_id"])] = row
         return [row for store_id, row in sorted(rows.items())
-                if row.get("role") == "user" and store_id not in consumed and store_id >= first]
+                if row.get("role") == "user" and store_id not in consumed]
 
     def _identity_anchor_assign(self, parts, pool, donors, consumed) -> Optional[list]:
         """Bind each part to one stored occurrence (a donor for a donor's text first), each used once:
@@ -541,9 +540,7 @@ class IdentityAnchorMixin:
         group = []
         for text in parts:
             options = sorted((row for row in pool if self._identity_text(row) == text
-                              and int(row["store_id"]) not in taken
-                              and (int(row["store_id"]) > int(group[-1]["store_id"]) if group
-                                   else int(row["store_id"]) in donor_ids)),
+                              and int(row["store_id"]) not in taken),
                              key=lambda row: (int(row["store_id"]) not in donor_ids, int(row["store_id"])))
             if not options:
                 return None
