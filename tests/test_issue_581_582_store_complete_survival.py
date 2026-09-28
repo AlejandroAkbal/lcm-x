@@ -718,6 +718,21 @@ def test_rc2_projection_followers_read_only_the_sources_conversation(tmp_path, f
         engine.shutdown()
 
 
+def test_rc2_projection_followers_bind_to_the_named_source(tmp_path):
+    """Two identical user rows under one stamp; the projection names the later one. Matched to the earlier
+    row, the walk would read the earlier reply as this one: it takes nothing unless the row is the source."""
+    engine = _engine(tmp_path)
+    try:
+        user = {"role": "user", "content": "[N] newest " + "word " * 600, "timestamp": 99.0}
+        earlier = engine._store.append("S", dict(user), conversation_id="conv")
+        engine._store.append("S", {"role": "assistant", "content": "ok reply"}, conversation_id="conv")
+        later = engine._store.append("S", dict(user), conversation_id="conv")
+        view = [_projection_of(engine, later), {"role": "assistant", "content": "ok reply"}]
+        assert engine._survival_projection_followers(view, 0, engine._store.get(earlier), {0: 99.0}) == []
+    finally:
+        engine.shutdown()
+
+
 def test_rc2_a_new_reply_after_a_projected_user_row_is_stored(tmp_path, summaries, host_estimator):
     """B-ROLL-1 (rc2) control: only the rows stored right after the projection's source are its replies; a
     different reply in that place is new and is stored."""

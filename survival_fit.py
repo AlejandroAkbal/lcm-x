@@ -272,9 +272,10 @@ class SurvivalFitMixin:
         it. A projected newest user row has no positional replay proof, so without this its replies are
         stored again on a cold resume."""
         role = str(messages[idx].get("role") or "")
-        if self._survival_projection_source(messages[idx], role, normalize_content_value(
-                messages[idx].get("content")) or "") is None:
-            return []
+        source = self._survival_projection_source(messages[idx], role, normalize_content_value(
+            messages[idx].get("content")) or "")
+        if source is None or int(source["store_id"]) != int(row["store_id"]):
+            return []  # the replies follow the row the projection names, never an identical earlier one
         stored = self._store.get_range(str(row["session_id"]), start_id=int(row["store_id"]) + 1,
                                        limit=max(len(messages) - idx - 1, 1),  # the source's conversation only
                                        conversation_id=row.get("conversation_id"), include_blank_conversation=True)
