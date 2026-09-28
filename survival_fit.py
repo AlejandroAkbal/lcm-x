@@ -302,7 +302,7 @@ class SurvivalFitMixin:
         key = str(self._conversation_id or self._session_id or "")
         if key not in self._survival_fit_warned:
             self._survival_fit_warned.add(key)
-            self._survival_fit_pending_warning = _WARNING.format(n=count)
+            self._survival_fit_pending_warning = (key, _WARNING.format(n=count))  # R6-4: owned by its conversation
             self.emit_automatic_compaction_status = True  # the host asks the hook below once more
 
     def get_automatic_compaction_status_message(self, *, phase: str, default_message: str, **context: Any):
@@ -310,4 +310,6 @@ class SurvivalFitMixin:
         pending = getattr(self, "_survival_fit_pending_warning", None)
         self._survival_fit_pending_warning = None
         self.emit_automatic_compaction_status = False
-        return pending
+        if not pending or pending[0] != str(self._conversation_id or self._session_id or ""):
+            return None  # R6-4: another conversation's warning is never delivered here
+        return pending[1]

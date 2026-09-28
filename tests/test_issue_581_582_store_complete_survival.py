@@ -924,6 +924,28 @@ def test_r6_3_a_failed_legacy_probe_is_retried_not_cached_empty(tmp_path, monkey
         engine.shutdown()
 
 
+def test_r6_4_a_pending_fit_warning_never_crosses_to_another_conversation(tmp_path, summaries, host_estimator):
+    """R6-4: a fit in conversation A leaves its warning pending; the engine re-binds to B: A's warning is
+    not delivered in B, and B's first fit warns."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    try:
+        view = _long_view()
+        engine.ingest(view)
+        _conflicted(engine)
+        engine.compress(view, current_tokens=host_estimator(view))
+        assert engine._survival_fit_pending_warning
+        engine.on_session_start("S2", platform="telegram", context_length=WINDOW, conversation_id="convB")
+        assert engine.get_automatic_compaction_status_message(phase="compress", default_message="x") is None
+        view_b = [{"role": "system", "content": "system prompt"},
+                  *[r for i in range(24) for r in _turn(f"B{i}", 2000.0 + i, tool=i % 3 == 0)]]
+        engine.ingest(view_b)
+        _conflicted(engine)
+        engine.compress(view_b, current_tokens=host_estimator(view_b))
+        assert engine.get_automatic_compaction_status_message(phase="compress", default_message="x")
+    finally:
+        engine.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"

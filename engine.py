@@ -602,7 +602,7 @@ class LCMEngine(
         # #582 survival fit: the failure reason of this compress(), the last fit, and the one-shot warning.
         self._survival_fit_reason: Optional[str] = None
         self._last_survival_fit: Optional[Dict[str, Any]] = None
-        self._survival_fit_pending_warning: Optional[str] = None
+        self._survival_fit_pending_warning: Optional[tuple[str, str]] = None  # (conversation key, text)
         self._survival_fit_warned: set = set()
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
@@ -887,6 +887,9 @@ class LCMEngine(
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        # R6-4: survival-fit warnings belong to the store they were raised on.
+        self._survival_fit_pending_warning, self._survival_fit_warned = None, set()
+        self.emit_automatic_compaction_status = False
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
