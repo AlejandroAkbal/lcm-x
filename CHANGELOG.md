@@ -12,7 +12,8 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
   recovery was ON, older duplicate copies); the leaf input is a bounded, contiguous run of the conversation's stored
   rows. Sessions that ended every pass in `publication_invariant_conflict` publish again. (#581, #591)
 - Fix: when a compaction cannot shrink the context under the model window, the oldest whole user turns are dropped from
-  that turn's context until it fits (`LCM_SURVIVAL_FIT`, default on; nothing is deleted). (#582, #591)
+  that turn's context until it fits, or until nothing more can leave, in which case a WARNING says so
+  (`LCM_SURVIVAL_FIT`, default on; nothing is deleted). (#582, #591)
 - Fix: a compaction the host refused, or another agent's session end on the shared lifecycle row, no longer leaves the
   next compaction conflicting at frontier 0. (#594, #591)
 
