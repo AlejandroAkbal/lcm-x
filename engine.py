@@ -5734,7 +5734,7 @@ class LCMEngine(
             config=self._config,
             hermes_home=self._hermes_home,
         )
-        recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(
+        recovery_tool_result_indices = self._active_replay_recovery_tool_result_indices(
             active_replay_messages
         )
         for (absolute_idx, _replay_msg), protected_msg in zip(
@@ -5769,7 +5769,7 @@ class LCMEngine(
             active_message = active_replay_messages[absolute_idx]
             stubbed_message = self._maybe_stub_active_tool_result(
                 active_message,
-                recovery_tool_call_ids=recovery_tool_call_ids,
+                is_recovery_tool_result=(absolute_idx in recovery_tool_result_indices),
             )
             if stubbed_message is not None:
                 if active_replay_messages is replay_messages:
@@ -6303,29 +6303,44 @@ class LCMEngine(
                 return False
         return True
 
-    def _active_replay_recovery_tool_call_ids(
+    def _active_replay_recovery_tool_result_indices(
         self,
         messages: List[Dict[str, Any]],
-    ) -> set[str]:
-        recovery_tool_call_ids: set[str] = set()
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
+    ) -> set[int]:
+        latest_tool_name_by_call_id: dict[str, str] = {}
+        recovery_tool_result_indices: set[int] = set()
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
                 continue
-            for tool_call in message.get("tool_calls") or []:
-                if not isinstance(tool_call, dict):
-                    continue
-                call_id = _tool_call_id(tool_call)
-                function = tool_call.get("function") or {}
-                tool_name = str(function.get("name") or "") if isinstance(function, dict) else ""
-                if call_id and tool_name in {"lcm_describe", "lcm_expand"}:
-                    recovery_tool_call_ids.add(call_id)
-        return recovery_tool_call_ids
+            if message.get("role") == "assistant":
+                for tool_call in message.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    call_id = _tool_call_id(tool_call)
+                    function = tool_call.get("function") or {}
+                    tool_name = (
+                        str(function.get("name") or "")
+                        if isinstance(function, dict)
+                        else ""
+                    )
+                    if call_id:
+                        latest_tool_name_by_call_id[call_id] = tool_name
+                continue
+            if message.get("role") != "tool":
+                continue
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if latest_tool_name_by_call_id.get(call_id) in {
+                "lcm_describe",
+                "lcm_expand",
+            }:
+                recovery_tool_result_indices.add(index)
+        return recovery_tool_result_indices
 
     def _maybe_stub_active_tool_result(
         self,
         message: Dict[str, Any],
         *,
-        recovery_tool_call_ids: set[str],
+        is_recovery_tool_result: bool,
     ) -> Dict[str, Any] | None:
         if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
             return None
@@ -6334,7 +6349,7 @@ class LCMEngine(
         if not isinstance(message, dict) or message.get("role") != "tool":
             return None
         tool_call_id = str(message.get("tool_call_id") or "").strip()
-        if not tool_call_id or tool_call_id in recovery_tool_call_ids:
+        if not tool_call_id or is_recovery_tool_result:
             return None
         content = message.get("content")
         if not self._is_textual_tool_result_content(content):
@@ -6391,7 +6406,9 @@ class LCMEngine(
         if eligible_end <= 0:
             return messages
 
-        recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(messages)
+        recovery_tool_result_indices = self._active_replay_recovery_tool_result_indices(
+            messages
+        )
 
         result = list(messages)
         stubbed_count = 0
@@ -6399,7 +6416,7 @@ class LCMEngine(
         for idx, message in enumerate(messages[:eligible_end]):
             replacement = self._maybe_stub_active_tool_result(
                 message,
-                recovery_tool_call_ids=recovery_tool_call_ids,
+                is_recovery_tool_result=(idx in recovery_tool_result_indices),
             )
             if replacement is None:
                 continue
