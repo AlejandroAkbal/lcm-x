@@ -444,47 +444,66 @@ def test_a_list_over_the_survival_budget_is_fitted_during_a_hold(tmp_path, summa
         engine.shutdown()
 
 
-# -- 9. a request the provider rejected comes back shorter ----------------------------------------------------
+# -- 9. a recovery attempt comes back under the compaction threshold ------------------------------------------
 
-def _rejected_state(tmp_path, monkeypatch, clock, *, spend=True):
+THRESHOLD = 3_000  # below the request of _view(8) plus 1,000 host tokens (3,896), below the ceiling (5,100)
+HOST_TOKENS = 1_000  # system prompt and tool schemas the host adds to its request estimate
+
+
+def _rejected_state(tmp_path, monkeypatch, clock, *, spend=True, turns=8, threshold=THRESHOLD):
     """Window 6,000 (ceiling 5,100); every sweep spends its budget in its first map when ``spend``."""
     engine = _engine(tmp_path, context_length=6_000)
+    engine.threshold_tokens = threshold
     if spend:
         _advance_on_call(monkeypatch, engine, "_get_store_id_map_for_messages", clock, 121.0, call=None)
-    view = _view(8)
+    view = _view(turns)
     engine.ingest(view)
     return engine, view
 
 
 def _shorter_by_host_score(engine, result, messages) -> bool:
+    """The host's shrink score (compress_scored_by_tokens): fewer messages, or the estimate under 95%."""
     return len(result) < len(messages) or engine._survival_measure(result) < 0.95 * engine._survival_measure(messages)
+
+
+def _request(engine, messages) -> int:
+    return engine._survival_measure(messages) + HOST_TOKENS
 
 
 def _fit_spy(monkeypatch, engine) -> list:
     caps = []
     original = engine._survival_fit
 
-    def spy(*args, window_cap=None, **kwargs):
-        caps.append(window_cap)
-        return original(*args, window_cap=window_cap, **kwargs)
+    def spy(*args, window_cap=None, request_cap=None, **kwargs):
+        caps.append((window_cap, request_cap))
+        return original(*args, window_cap=window_cap, request_cap=request_cap, **kwargs)
 
     monkeypatch.setattr(engine, "_survival_fit", spy)
     return caps
 
 
+def _fit_records(engine) -> int:
+    return int((engine._store.read_metadata_json("survival_fit:counter") or {}).get("count") or 0)
+
+
+def _dropped_rows_are_stored(engine, view, result) -> bool:
+    stored = {(r["role"], r["content"]) for r in engine._store.get_session_messages("S", limit=100_000)}
+    kept = {(m["role"], m["content"]) for m in result}
+    return all((m["role"], m["content"]) in stored for m in view[1:] if (m["role"], m["content"]) not in kept)
+
+
 def test_rejected_request_after_a_no_leaf_stop_comes_back_shorter(tmp_path, summaries, clock, monkeypatch):
-    """C1: below the ceiling, recovery attempt, the request estimate as current_tokens: a shorter list whose
-    dropped rows are all stored, the fit named provider_overflow, no error."""
+    """C1: below the ceiling, recovery attempt, the request estimate as current_tokens: the result plus the
+    host tokens is under 95% of the threshold, the dropped rows are all stored, reason recovery_attempt."""
     engine, view = _rejected_state(tmp_path, monkeypatch, clock)
-    request = engine._survival_measure(view) + 1_000  # the host adds its system prompt and tools
-    assert request < int(6_000 * 0.85)
+    request = _request(engine, view)
+    assert THRESHOLD < request < int(6_000 * 0.85)
     try:
         result = engine.compress(view, current_tokens=request, bypass_cooldown=True)
         assert _shorter_by_host_score(engine, result, view) and summaries == []
-        stored = {(r["role"], r["content"]) for r in engine._store.get_session_messages("S", limit=100_000)}
-        kept = {(m["role"], m["content"]) for m in result}
-        assert all((m["role"], m["content"]) in stored for m in view[1:] if (m["role"], m["content"]) not in kept)
-        assert engine._last_survival_fit["reason"].startswith("provider_overflow:")
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(THRESHOLD * 0.95)
+        assert _dropped_rows_are_stored(engine, view, result)
+        assert engine._last_survival_fit["reason"].startswith("recovery_attempt:")
         assert engine._last_compression_status == "noop"
     finally:
         engine.shutdown()
@@ -500,15 +519,16 @@ def test_same_state_without_a_recovery_attempt_returns_the_identical_list(tmp_pa
         engine.shutdown()
 
 
-def test_a_recovery_attempt_that_shortens_the_list_runs_no_capped_fit(tmp_path, summaries, clock, monkeypatch):
-    """C3: a sweep stores leaves and the list is shorter: the fit is not called with a window cap."""
+def test_a_recovery_attempt_that_shortens_the_list_runs_one_capped_fit(tmp_path, summaries, clock, monkeypatch):
+    """C3: a sweep stores leaves and the list is shorter: one fit for the call, with both caps."""
     engine, view = _rejected_state(tmp_path, monkeypatch, clock, spend=False)
     caps = _fit_spy(monkeypatch, engine)
     try:
-        result = engine.compress(view, current_tokens=engine._survival_measure(view) + 1_000, bypass_cooldown=True)
+        request = _request(engine, view)
+        result = engine.compress(view, current_tokens=request, bypass_cooldown=True)
         assert engine._last_compression_status == "compacted" and summaries
         assert _shorter_by_host_score(engine, result, view)
-        assert caps and all(cap is None for cap in caps)
+        assert caps == [(request, int(THRESHOLD * 0.95))]
     finally:
         engine.shutdown()
 
@@ -516,13 +536,14 @@ def test_a_recovery_attempt_that_shortens_the_list_runs_no_capped_fit(tmp_path, 
 @pytest.mark.parametrize("current_tokens", [None, 0])
 def test_without_a_request_size_the_cap_is_the_measure_of_the_list(tmp_path, summaries, clock, monkeypatch,
                                                                    current_tokens):
-    """C4: no positive current_tokens: the cap is the measure of the list."""
+    """C4: no positive current_tokens: the window cap is the measure of the list; one fit for the call."""
     engine, view = _rejected_state(tmp_path, monkeypatch, clock)
     caps = _fit_spy(monkeypatch, engine)
     try:
         result = engine.compress(view, current_tokens=current_tokens, bypass_cooldown=True)
-        assert caps == [None, engine._survival_measure(view)]
+        assert caps == [(engine._survival_measure(view), int(THRESHOLD * 0.95))]
         assert _shorter_by_host_score(engine, result, view)
+        assert engine._survival_measure(result) <= int(THRESHOLD * 0.95)
     finally:
         engine.shutdown()
 
@@ -549,18 +570,21 @@ def test_the_next_ingest_after_a_capped_fit_stores_only_the_new_turn(tmp_path, s
 
 
 def test_the_except_path_of_a_recovery_attempt_returns_the_capped_fit(tmp_path, clock, monkeypatch):
-    """C6: _compress_impl raises; recovery attempt; list below the ceiling: the fitted list, no raise."""
+    """C6: _compress_impl raises; recovery attempt; list below the ceiling: the fitted list under the
+    threshold share, one fit, no raise."""
     engine, view = _rejected_state(tmp_path, monkeypatch, clock, spend=False)
+    caps = _fit_spy(monkeypatch, engine)
 
     def boom(*args, **kwargs):
         raise RuntimeError("injected (ids only)")
 
     monkeypatch.setattr(engine, "_compress_impl", boom)
     try:
-        result = engine.compress(view, current_tokens=engine._survival_measure(view) + 1_000, bypass_cooldown=True)
+        result = engine.compress(view, current_tokens=_request(engine, view), bypass_cooldown=True)
         assert _shorter_by_host_score(engine, result, view)
-        assert engine._last_survival_fit["reason"] == "provider_overflow:exception:RuntimeError"
-        assert engine._last_compression_status == "error"
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(THRESHOLD * 0.95)
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:exception:RuntimeError"
+        assert engine._last_compression_status == "error" and len(caps) == 1 and _fit_records(engine) == 1
     finally:
         engine.shutdown()
 
@@ -584,5 +608,188 @@ def test_survival_budget_without_a_cap_is_unchanged(tmp_path, observed, expected
         assert lcm_engine.count_messages_tokens(view) == 1432
         assert engine._survival_fit_budget(view, observed, window_cap=None) == expected
         assert engine._survival_fit_budget(view, observed) == expected
+    finally:
+        engine.shutdown()
+
+
+# -- 10. every result of a recovery attempt fits under the threshold (Amendment 3b) ------------------------------
+
+def _host_shrank(result, messages) -> bool:
+    """compress_scored_by_tokens the host's way, with this process's estimate (no host on the path): fewer
+    messages, or the estimate under 95% of the estimate before. The real-host variant is in
+    test_real_host_bypass_cooldown_wire.py."""
+    return len(result) < len(messages) or 0 < lcm_engine.count_messages_tokens(result) < \
+        0.95 * lcm_engine.count_messages_tokens(messages)
+
+
+def _one_notice(result) -> bool:
+    return str(result[0]["content"]).count("[LCM survival fit: ") == 1
+
+
+def _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog, *, turns=8, threshold=THRESHOLD):
+    """A recovery attempt whose compaction stores no leaf. With the request at or over the threshold that is
+    the threshold sweep spending its budget; below it (or with no threshold) the sweep does not run, and the
+    compaction is a stand-in that returns the list unchanged with status noop."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock, turns=turns, threshold=threshold)
+    if not 0 < threshold <= _request(engine, view):
+        def no_leaf(messages, **kwargs):
+            engine._last_compression_status = "noop"
+            return messages
+
+        monkeypatch.setattr(engine, "_compress_impl", no_leaf)
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+        result = engine.compress(view, current_tokens=_request(engine, view), bypass_cooldown=True)
+    return engine, view, result
+
+
+def test_no_leaf_recovery_attempt_below_the_ceiling_fits_under_the_threshold(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """D1: threshold < request < ceiling, no leaf: result plus host tokens at most int(0.95 * threshold); the
+    dropped rows are stored; one counter record; reason recovery_attempt."""
+    engine, view, result = _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog)
+    try:
+        assert THRESHOLD < _request(engine, view) < int(6_000 * 0.85) and summaries == []
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(THRESHOLD * 0.95)
+        assert _dropped_rows_are_stored(engine, view, result)
+        assert _fit_records(engine) == 1 and _count(caplog, "survival fit applied") == 1
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:noop"
+    finally:
+        engine.shutdown()
+
+
+def test_no_leaf_recovery_attempt_over_the_ceiling_fits_under_the_threshold_in_one_fit(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """D2: a list over the survival ceiling, no leaf: the same bound, exactly one counter record and one
+    notice for the call (at 7e37bd96 the list came back at the ceiling)."""
+    engine, view, result = _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog, turns=40)
+    try:
+        assert engine._survival_measure(view) > int(6_000 * 0.85)
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(THRESHOLD * 0.95)
+        assert _dropped_rows_are_stored(engine, view, result)
+        assert _fit_records(engine) == 1 and _count(caplog, "survival fit applied") == 1 and _one_notice(result)
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:noop"
+    finally:
+        engine.shutdown()
+
+
+def test_recovery_attempt_whose_sweep_result_is_inside_the_budget_is_not_fitted(
+        tmp_path, summaries, clock, monkeypatch):
+    """D3: the sweep stores leaves and its result is inside the budget: returned as it is, no record."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock, spend=False)
+    try:
+        result = engine.compress(view, current_tokens=_request(engine, view), bypass_cooldown=True)
+        assert engine._last_compression_status == "compacted" and summaries
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(THRESHOLD * 0.95)
+        assert engine._last_survival_fit is None and _fit_records(engine) == 0
+    finally:
+        engine.shutdown()
+
+
+def test_recovery_attempt_whose_sweep_result_is_over_the_budget_is_fitted_and_keeps_the_leaves(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """D4: the sweep stores leaves and its result is still over the budget: fitted to the budget; the
+    published leaves stay; the hold is not started."""
+    threshold = 1_650  # budget int(0.95 * 1,650) - 1,000 = 567: under the sweep result, over the newest turn
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock, spend=False, threshold=threshold)
+    caps = _fit_spy(monkeypatch, engine)
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            result = engine.compress(view, current_tokens=_request(engine, view), bypass_cooldown=True)
+        nodes = engine._dag.get_session_nodes("S")
+        assert engine._last_compression_status == "compacted" and summaries and nodes
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:compacted" and len(caps) == 1
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(threshold * 0.95)
+        assert _count(caplog, "could not reach budget") == 0 and _fit_records(engine) == 1
+        assert [n.node_id for n in engine._dag.get_session_nodes("S")] == [n.node_id for n in nodes]
+        assert engine._sweep_budget_hold_until == 0.0
+    finally:
+        engine.shutdown()
+
+
+def test_without_a_threshold_the_recovery_budget_is_amendment_3s(tmp_path, summaries, clock, monkeypatch, caplog):
+    """D5: threshold_tokens 0: the threshold term is left out (window 6,000, reserve 0.15)."""
+    view = [{"role": "system", "content": "system prompt"}] + [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"[{i}]{PAD}"} for i in range(8)]
+    engine = _engine(tmp_path, context_length=6_000)
+    try:  # 1,432 counted tokens, 1,932 observed: window cap 1,932, overhead 500
+        assert engine._survival_fit_budget(view, 1932, window_cap=1932, request_cap=None) == 1142
+        assert engine._survival_fit_budget(view, 1932, window_cap=1932, request_cap=int(3000 * 0.95)) == 1142
+        assert engine._survival_fit_budget(view, 1932, window_cap=1932, request_cap=int(1500 * 0.95)) == 925
+    finally:
+        engine.shutdown()
+    engine, view, result = _no_leaf_recovery(tmp_path / "compress", monkeypatch, clock, caplog, threshold=0)
+    try:  # request 3,896: int(3,896 * 0.85) - 1,000
+        assert _count(caplog, "budget=2311)") == 1
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:noop"
+        assert engine._survival_measure(result) <= 2311
+    finally:
+        engine.shutdown()
+
+
+def test_recovery_attempt_below_the_threshold_keeps_amendment_3s_bound(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """D6: request below the threshold: result plus host tokens at most 85% of the request."""
+    engine, view, result = _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog, threshold=4_500)
+    try:
+        request = _request(engine, view)
+        assert request < 4_500
+        assert engine._survival_measure(result) + HOST_TOKENS <= int(request * 0.85)
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:noop" and _fit_records(engine) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_a_second_recovery_attempt_shrinks_again_and_stops_where_nothing_can_leave(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """D7: on the fitted list, with its smaller request: fewer rows again while stored rows can leave. With a
+    budget under the newest turn: the first attempt logs the budget WARNING once; the next returns the
+    identical list, no second WARNING, no second record."""
+    engine, view, first = _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog)
+    try:
+        second = engine.compress(first, current_tokens=_request(engine, first), bypass_cooldown=True)
+        assert len(second) < len(first) < len(view)
+        assert _dropped_rows_are_stored(engine, view, second)
+    finally:
+        engine.shutdown()
+    caplog.clear()
+    engine, view, first = _no_leaf_recovery(tmp_path / "floor", monkeypatch, clock, caplog, threshold=1_200)
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            again = engine.compress(first, current_tokens=_request(engine, first), bypass_cooldown=True)
+        assert len(first) < len(view) and again is first
+        assert _count(caplog, "could not reach budget") == 1 and _fit_records(engine) == 1
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(("turns", "threshold"), [(8, THRESHOLD), (40, THRESHOLD), (8, 4_500)],
+                         ids=["D1-below-ceiling", "D2-over-ceiling", "D6-below-threshold"])
+def test_recovery_results_pass_the_host_shrink_score(tmp_path, summaries, clock, monkeypatch, caplog, turns,
+                                                     threshold):
+    """D8 (in-process): the D1, D2 and D6 results pass the host's shrink score, computed the host's way."""
+    engine, view, result = _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog, turns=turns, threshold=threshold)
+    try:
+        assert _host_shrank(result, view)
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:noop"
+    finally:
+        engine.shutdown()
+
+
+def test_the_next_ingest_after_an_over_ceiling_recovery_fit_stores_only_the_new_turn(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """D9: after D2, the fitted list plus one new turn: the new turn is stored once, no old row again."""
+    engine, view, result = _no_leaf_recovery(tmp_path, monkeypatch, clock, caplog, turns=40)
+
+    def rows():
+        return sorted((r["role"], r["content"]) for r in engine._store.get_session_messages("S", limit=100_000))
+    try:
+        assert engine._last_survival_fit["reason"] == "recovery_attempt:noop"
+        before = rows()
+        new = _turn("N1", 9_999.0)
+        engine.ingest(result + new)
+        added = list(rows())
+        for row in before:
+            added.remove(row)
+        assert sorted(added) == sorted((m["role"], m["content"]) for m in new)
     finally:
         engine.shutdown()
