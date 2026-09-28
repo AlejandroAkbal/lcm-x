@@ -149,6 +149,54 @@ def test_budget_spent_in_the_store_complete_step_stops_before_the_identity_ancho
         engine.shutdown()
 
 
+@pytest.mark.parametrize(("method", "call", "step"), [
+    ("_get_store_id_map_for_messages", 1, "anchor_ids"),
+    ("_committed_replay_drops", 1, "replay_drops"),
+    ("_get_store_id_map_for_messages", 2, "store_id_map"),
+    ("_identity_anchor_summary_input", 1, "identity_anchor"),
+])
+def test_pass_leaves_right_after_the_step_that_spends_the_budget(
+        tmp_path, summaries, clock, monkeypatch, caplog, method, call, step):
+    engine = _engine(tmp_path)
+    view = _view()
+    _advance_on_call(monkeypatch, engine, method, clock, 121.0, call=call)
+    try:
+        engine.ingest(view)
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            result = engine.compress(view, current_tokens=engine.threshold_tokens + 1)
+        assert result is view and summaries == [] and engine._last_compression_status == "noop"
+        line = next(r.getMessage() for r in caplog.records if BUDGET_LINE in r.getMessage())
+        assert line.endswith(f"{step}=121.0s")  # the last timed step: nothing ran after it
+    finally:
+        engine.shutdown()
+
+
+def test_budget_spent_in_a_provider_timeout_names_the_summariser_step(tmp_path, clock, monkeypatch, caplog):
+    """The first summariser call times out after 110 s: the smaller-chunk retry finds 10 s left and the
+    sweep stops before the first leaf; the WARNING shows where the time went."""
+    engine = _engine(tmp_path, leaf_chunk_tokens=2000)
+    view = _view()
+    calls = []
+
+    def summarize(**kwargs):
+        calls.append(1)
+        clock.offset += 110.0
+        raise TimeoutError("provider timed out")
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize)
+    try:
+        engine.ingest(view)
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            result = engine.compress(view, current_tokens=engine.threshold_tokens + 1)
+        telemetry = engine.get_status()["threshold_full_sweep"]
+        assert calls == [1] and result is view and telemetry["stop_reason"] == "time_budget_exhausted"
+        assert _count(caplog, RETRY_LINE) == 1 and _count(caplog, BUDGET_LINE) == 1
+        line = next(r.getMessage() for r in caplog.records if BUDGET_LINE in r.getMessage())
+        assert "summariser=110.0s" in line
+    finally:
+        engine.shutdown()
+
+
 # -- 2. five seconds left at the pre-call check ------------------------------------------------------------
 
 def test_five_seconds_left_at_the_pre_call_check_makes_no_summariser_call(

@@ -1742,6 +1742,7 @@ class CompactionMixin:
                 ):
                     self._schedule_pre_compaction_assertions(summary_input_chunk)
 
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 try:
                     summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
                     if threshold_full_sweep_active:
@@ -1771,6 +1772,9 @@ class CompactionMixin:
                         )
                         break
                     raise
+                finally:
+                    if threshold_full_sweep_active:
+                        sweep_step_done("summariser", step_started)
             anchor_claimed_ids = sorted({  # #436 R4: only claims whose text the summarizer actually read
                 store_id for message in compacted_chunk for store_id in anchor_claims.get(id(message), ())
             })
