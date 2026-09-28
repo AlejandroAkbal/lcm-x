@@ -375,6 +375,15 @@ _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 
+# #608: a threshold sweep does not start a summariser call with less time than this left, and after a
+# sweep that spent its budget before the first leaf, the threshold answer is no for the hold time.
+_THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS = 15.0
+_SWEEP_BUDGET_HOLD_SECONDS = 600.0
+
+
+class SweepBudgetExhausted(TimeoutError):
+    """The threshold sweep's own time budget is spent: a stop condition, not a provider failure."""
+
 
 def _normalize_total_compactions(value: Any) -> int:
     """Return a persisted compaction total only when it is a valid counter."""
@@ -661,6 +670,9 @@ class LCMEngine(
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
+        # #608: wall clock until which the threshold answer is no, after a sweep
+        # spent its time budget before the first leaf. A stored leaf clears it.
+        self._sweep_budget_hold_until: float = 0.0
         # One-shot handoff from preflight: adopt an already-durable replay
         # cleanup during boundary cooldown without running summary work.
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
@@ -1540,6 +1552,34 @@ class LCMEngine(
         self._last_boundary_skip_time = 0
         return False
 
+    def _start_sweep_budget_hold(self) -> None:
+        self._sweep_budget_hold_until = time.time() + _SWEEP_BUDGET_HOLD_SECONDS
+
+    def _sweep_budget_hold_active(self) -> bool:
+        """#608: return true while a no-leaf sweep budget stop holds the threshold answer."""
+        if self._sweep_budget_hold_until <= 0:
+            return False
+        remaining = self._sweep_budget_hold_until - time.time()
+        if remaining > 0:
+            logger.debug("LCM threshold compression held: %.1f seconds left after a sweep budget stop", remaining)
+            return True
+        self._sweep_budget_hold_until = 0.0
+        return False
+
+    def _sweep_budget_hold_applies(self, tokens: Optional[int]) -> bool:
+        """#608: the hold never applies at or over the survival ceiling, whose fit only compress() runs."""
+        if not self._sweep_budget_hold_active():
+            return False
+        window = int(self.context_length or 0)
+        if window <= 0 or tokens is None:
+            return True
+        reserve = min(0.9, max(0.0, float(getattr(self._config, "survival_reserve", 0.15) or 0.0)))
+        ceiling = int(window * (1 - reserve))
+        if tokens >= ceiling:
+            logger.debug("LCM sweep budget hold not applied: %d tokens >= survival ceiling %d", tokens, ceiling)
+            return False
+        return True
+
     def _record_ingest_success(self) -> None:
         self._consecutive_ingest_failures = 0
 
@@ -1869,8 +1909,8 @@ class LCMEngine(
                 timeout_seconds = self._config.summary_timeout_ms / 1000
                 if deadline is not None:
                     remaining_seconds = deadline - time.monotonic()
-                    if remaining_seconds <= 0:
-                        raise TimeoutError("threshold full sweep time budget exhausted")
+                    if remaining_seconds < _THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS:
+                        raise SweepBudgetExhausted("threshold full sweep time budget exhausted")
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
@@ -1890,6 +1930,8 @@ class LCMEngine(
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
+                if isinstance(exc, SweepBudgetExhausted):
+                    raise  # a smaller chunk cannot get the time back
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
                     raise
                 smaller_chunk = self._next_leaf_rescue_chunk(attempt_chunk, source_tokens)
@@ -6689,8 +6731,8 @@ class LCMEngine(
         timeout_seconds = self._config.summary_timeout_ms / 1000
         if deadline is not None:
             remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                raise TimeoutError("threshold full sweep time budget exhausted")
+            if remaining_seconds < _THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS:
+                raise SweepBudgetExhausted("threshold full sweep time budget exhausted")
             timeout_seconds = min(timeout_seconds, remaining_seconds)
         summary_text, level = summarize_with_escalation(
             text=combined_text,
@@ -6791,6 +6833,8 @@ class LCMEngine(
                     focus_topic=focus_topic,
                     deadline=deadline,
                 )
+            except SweepBudgetExhausted:
+                return passes, "time_budget_exhausted"
             except Exception as exc:
                 if _is_sqlite_locked_error(exc):
                     setattr(exc, "lcm_completed_condensation_passes", passes)

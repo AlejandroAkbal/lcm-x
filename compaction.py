@@ -84,7 +84,7 @@ class CompactionMixin:
             return True
         if self.threshold_tokens <= 0:
             return False
-        return tokens >= self.threshold_tokens
+        return tokens >= self.threshold_tokens and not self._sweep_budget_hold_applies(tokens)
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
@@ -193,6 +193,12 @@ class CompactionMixin:
             if self._compression_boundary_cooldown_active():
                 return False
             if (
+                self.threshold_tokens > 0
+                and max(rough, replay_rough) >= self.threshold_tokens
+                and self._sweep_budget_hold_applies(max(rough, replay_rough, self.last_prompt_tokens or 0))
+            ):
+                return False
+            if (
                 self._config.native_recovery
                 and self.threshold_tokens > 0
                 and replay_rough >= self.threshold_tokens
@@ -262,6 +268,8 @@ class CompactionMixin:
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+            if self._sweep_budget_hold_applies(max(rough, self.last_prompt_tokens or 0)):
+                return False
             if self._config.native_recovery:
                 return self._mark_preflight_compression_requested(
                     depends_on_pressure_yield=self._pressure_yield_preflight_candidate,
@@ -535,8 +543,10 @@ class CompactionMixin:
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
-                 force: bool = False) -> List[Dict[str, Any]]:
-        """Run compaction and leave a terminal public status on every failure."""
+                 force: bool = False,
+                 bypass_cooldown: bool = False) -> List[Dict[str, Any]]:
+        """Run compaction and leave a terminal public status on every failure. ``bypass_cooldown`` is the
+        host's mark of a recovery attempt (#608): the returned list fits under the compaction threshold."""
         try:
             self._pending_emission_candidates = []
             self._compress_occurrences = None
@@ -561,8 +571,9 @@ class CompactionMixin:
                 )
             ):
                 result = messages
-            result = self._survival_fit(messages, result, current_tokens, reason=self._survival_fit_reason
-                                        or str(self._last_compression_status or "unknown"))
+            reason = self._survival_fit_reason or str(self._last_compression_status or "unknown")
+            result = self._survival_fit(messages, result, current_tokens,
+                                        **self._survival_fit_args(messages, current_tokens, reason, bypass_cooldown))
             self._record_compress_commit_proof(messages, result)
             logger.debug("LCM compaction emission descriptor count=%d",
                          len((self._compress_commit_proof or {}).get("emissions") or ()))
@@ -579,8 +590,10 @@ class CompactionMixin:
             if isinstance(exc, Exception):  # #582: an over-window list survives the failure, fitted
                 try:
                     self._store.rollback_pending_write()
-                    fitted = self._survival_fit(messages, messages, current_tokens,
-                                                reason=f"exception:{type(exc).__name__}", after_exception=True)
+                    reason = f"exception:{type(exc).__name__}"
+                    fitted = self._survival_fit(messages, messages, current_tokens, after_exception=True,
+                                                **self._survival_fit_args(messages, current_tokens, reason,
+                                                                          bypass_cooldown))
                 except Exception:
                     logger.debug("LCM survival fit after a compress exception failed", exc_info=True)
                     fitted = messages
@@ -1378,6 +1391,13 @@ class CompactionMixin:
         sweep_raw_drained = False
         dependent_reply_message_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
+        sweep_step_seconds: Dict[str, float] = {}
+
+        def sweep_step_done(step: str, started: float) -> float:
+            """#608: add the step's seconds to its total; return the clock after it."""
+            now = time.monotonic()
+            sweep_step_seconds[step] = sweep_step_seconds.get(step, 0.0) + now - started
+            return now
 
         while leaf_passes < max_leaf_passes:
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
@@ -1390,9 +1410,13 @@ class CompactionMixin:
             # turn; that must remain eligible for compaction instead of being
             # replayed forever as fresh-looking intent.
             leading_anchor_count = self._leading_anchor_count(working_messages)
+            step_started = time.monotonic() if threshold_full_sweep_active else 0.0
             publication_excluded_store_ids = self._get_store_ids_for_messages(
                 working_messages[:leading_anchor_count]
-            )
+            ) if leading_anchor_count else []  # #608: an empty slice maps to nothing
+            if threshold_full_sweep_active and sweep_step_done("anchor_ids", step_started) >= sweep_deadline:
+                sweep_stop_reason = "time_budget_exhausted"
+                break
             filter_exclusion_proofs: Dict[int, Any] = {}
             hidden_backlog = False
             if fresh_tail_start <= leading_anchor_count:
@@ -1406,7 +1430,11 @@ class CompactionMixin:
                     eligible_tokens=0,
                 ):
                     continue
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 hidden_backlog = self._store_complete_backlog(working_messages, leading_anchor_count)
+                if threshold_full_sweep_active and sweep_step_done("store_complete", step_started) >= sweep_deadline:
+                    sweep_stop_reason = "time_budget_exhausted"
+                    break
             if fresh_tail_start <= leading_anchor_count and not hidden_backlog:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 if threshold_full_sweep_active:
@@ -1426,9 +1454,13 @@ class CompactionMixin:
             # Reuse the map when the pass maps this same list.
             drops, premapped_store_ids, kept = set(range(leading_anchor_count, candidate_start)), None, 0
             if leaf_passes == 0 and not resumed_prefix and not hidden_backlog:
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 resumed, store_ids, summary_tokens, kept = self._committed_replay_drops(
                     working_messages, candidate_start
                 )
+                if threshold_full_sweep_active and sweep_step_done("replay_drops", step_started) >= sweep_deadline:
+                    sweep_stop_reason = "time_budget_exhausted"
+                    break
                 resumed_prefix = bool(resumed)
                 resumed_ahead = resumed[0] - candidate_start if resumed else 0  # kept rows before lineage
                 premapped_store_ids = None if drops or resumed else store_ids
@@ -1454,11 +1486,15 @@ class CompactionMixin:
                     break
 
             if candidate_start < fresh_tail_start:
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 self._current_compress_store_ids_by_message_id = (
                     premapped_store_ids
                     if premapped_store_ids is not None
                     else self._get_store_id_map_for_messages(working_messages[leading_anchor_count:])
                 )
+                if threshold_full_sweep_active and sweep_step_done("store_id_map", step_started) >= sweep_deadline:
+                    sweep_stop_reason = "time_budget_exhausted"
+                    break
                 compactable_pairs = list(
                     zip(
                         working_messages[candidate_start:fresh_tail_start],
@@ -1660,10 +1696,14 @@ class CompactionMixin:
             anchor_claims: dict[int, list[int]] = {}  # #436 R4: id(input row) -> the store ids its text covers
             selected_input = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
             self._store_complete_excluded, self._store_complete_cut = [], False
+            step_started = time.monotonic() if threshold_full_sweep_active else 0.0
             anchored_input = self._identity_anchor_summary_input(
                 selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk,
                 budget=max(1, int(self._config.leaf_chunk_tokens)), accounted_ids=publication_excluded_store_ids,
             )
+            if threshold_full_sweep_active and sweep_step_done("identity_anchor", step_started) >= sweep_deadline:
+                sweep_stop_reason = "time_budget_exhausted"
+                break
             if anchored_input == []:  # #581: the oldest owned row above the frontier is a retained occurrence
                 noop_reason = "leaf would end before an unresolved retained occurrence"
                 break
@@ -1707,6 +1747,7 @@ class CompactionMixin:
                 ):
                     self._schedule_pre_compaction_assertions(summary_input_chunk)
 
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 try:
                     summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
                     if threshold_full_sweep_active:
@@ -1722,6 +1763,11 @@ class CompactionMixin:
                         **summary_kwargs,
                     )
                 except Exception as exc:
+                    from .engine import SweepBudgetExhausted  # engine imports this module
+
+                    if threshold_full_sweep_active and isinstance(exc, SweepBudgetExhausted):
+                        sweep_stop_reason = "time_budget_exhausted"  # #608: a stop, with or without a leaf
+                        break
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
                         logger.warning(
@@ -1731,6 +1777,9 @@ class CompactionMixin:
                         )
                         break
                     raise
+                finally:
+                    if threshold_full_sweep_active:
+                        sweep_step_done("summariser", step_started)
             anchor_claimed_ids = sorted({  # #436 R4: only claims whose text the summarizer actually read
                 store_id for message in compacted_chunk for store_id in anchor_claims.get(id(message), ())
             })
@@ -1853,6 +1902,7 @@ class CompactionMixin:
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
             pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
             leaf_compacted_this_turn = True
+            self._sweep_budget_hold_until = 0.0  # #608: a stored leaf ends the hold
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
             if (
@@ -1925,6 +1975,15 @@ class CompactionMixin:
             sweep_stop_reason = "pass_budget_exhausted"
 
         if not leaf_compacted_this_turn:
+            if sweep_stop_reason == "time_budget_exhausted":
+                noop_reason = "threshold sweep time budget spent before the first leaf"
+                logger.warning(
+                    "LCM threshold sweep spent its time budget before the first leaf: %.1fs (budget %.0fs); steps: %s",
+                    time.monotonic() - (sweep_deadline - _THRESHOLD_FULL_SWEEP_MAX_SECONDS),
+                    _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
+                    ", ".join(f"{step}={seconds:.1f}s" for step, seconds in sweep_step_seconds.items()),
+                )
+                self._start_sweep_budget_hold()
             self._refresh_raw_backlog_debt(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,

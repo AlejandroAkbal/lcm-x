@@ -47,6 +47,7 @@ _PROJECTED_RE = re.compile(r"\[LCM survival fit: this ([a-z_]+) message \((\d+) 
                            r"(\d+); lcm_expand / lcm_grep reach the full text\. \(projection (\d+)/(\d+)\)\]")
 _PROJECTED_PREFIX = "[LCM survival fit: this "
 _HEAD, _TAIL = 1200, 600  # a projected text keeps its first _HEAD and last _TAIL characters
+_RECOVERY_THRESHOLD_SHARE = 0.95  # #608: a recovery attempt's request fits under this share of the threshold
 
 
 def _carries_survival_notice(raw: Any, text: str) -> bool:
@@ -57,6 +58,10 @@ def _carries_survival_notice(raw: Any, text: str) -> bool:
         return isinstance(last, dict) and last.get("type") == "text" and str(last.get("text") or "").startswith(
             "[LCM survival fit: ")
     return "\n\n[LCM survival fit: " in text
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _host_estimate(messages) -> Optional[int]:
@@ -79,16 +84,32 @@ class SurvivalFitMixin:
         counted = count_messages_tokens(messages)
         return counted if host is None else max(host, counted)
 
-    def _survival_fit_budget(self, messages, observed_tokens) -> Optional[int]:
+    def _survival_fit_budget(self, messages, observed_tokens, window_cap: Optional[int] = None,
+                             request_cap: Optional[int] = None) -> Optional[int]:
         window = int(getattr(self, "context_length", 0) or 0)
         if window <= 0 or not getattr(self._config, "survival_fit", True):
             return None
+        if _positive_int(window_cap):  # #608: the size of a request the provider rejected
+            window = min(window, window_cap)
         reserve = min(0.9, max(0.0, float(getattr(self._config, "survival_reserve", 0.15) or 0.0)))
         counted = _host_estimate(messages)
         counted = count_messages_tokens(messages) if counted is None else counted
         # system prompt + tools the host adds; more than half the window is a stale or synthetic observation
         overhead = min(window // 2, max(0, int(observed_tokens or 0) - counted))
-        return max(1, int(window * (1 - reserve)) - overhead)
+        ceiling = int(window * (1 - reserve))
+        if _positive_int(request_cap):  # #608: a recovery attempt's request under the compaction threshold
+            ceiling = min(ceiling, request_cap)
+        return max(1, ceiling - overhead)
+
+    def _survival_fit_args(self, messages, observed_tokens, reason: str, recovery: bool) -> Dict[str, Any]:
+        """#608: the fit's reason and caps. A recovery attempt (the host's ``bypass_cooldown``) fits under the
+        rejected request's size (``observed_tokens``, else the input's measure) and under the threshold."""
+        if not recovery:
+            return {"reason": reason}
+        threshold = int(getattr(self, "threshold_tokens", 0) or 0)
+        return {"reason": f"recovery_attempt:{reason}",
+                "window_cap": observed_tokens if _positive_int(observed_tokens) else self._survival_measure(messages),
+                "request_cap": int(threshold * _RECOVERY_THRESHOLD_SHARE) if threshold > 0 else None}
 
     def _survival_generated(self, message) -> bool:
         """LCM's own regenerated context (summaries, carriers): derived from stored rows, never a row."""
@@ -96,9 +117,10 @@ class SurvivalFitMixin:
                 or self._generated_context_carrier_remainder(message) is not None
                 or self._is_context_summary_content(message.get("content")))  # a host summary of stored rows
 
-    def _survival_fit(self, messages, result, observed_tokens, reason: str, *, after_exception: bool = False):
+    def _survival_fit(self, messages, result, observed_tokens, reason: str, *, after_exception: bool = False,
+                      window_cap: Optional[int] = None, request_cap: Optional[int] = None):
         """``result``, or the fitted list when ``result`` is over the survival budget."""
-        budget = self._survival_fit_budget(messages, observed_tokens)
+        budget = self._survival_fit_budget(messages, observed_tokens, window_cap, request_cap)
         if budget is None or not isinstance(result, list) or not result or not self._session_id or \
                 self._bypasses_lcm_context_management():
             return result

@@ -12246,15 +12246,15 @@ class TestEngineCompress:
             {"role": "user", "content": "fresh"},
             {"role": "assistant", "content": "answer"},
         ]
-        monotonic_calls = 0
+        leaf_called = False
 
         def fake_monotonic():
-            nonlocal monotonic_calls
-            monotonic_calls += 1
-            return 0.0 if monotonic_calls <= 2 else 121.0
+            return 121.0 if leaf_called else 0.0
 
         def fake_leaf(chunk, focus_topic=None, deadline=None):
+            nonlocal leaf_called
             del focus_topic, deadline
+            leaf_called = True
             return chunk, count_messages_tokens(chunk), "timed summary", 1, 0
 
         import hermes_lcm.compaction as compaction_module
