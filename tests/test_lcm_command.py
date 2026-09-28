@@ -564,11 +564,13 @@ def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engi
         assert "plugin-only rollback within the 0.24.x line is supported for this store" in observation
         assert "plugin-only rollback within the 0.24.x line is supported for this store" in line
         assert restore not in line and "lcm.db backup" not in observation
+        assert not any(phrase in observation for phrase in ("stop Hermes", "-wal and -shm", "keep it"))
     else:
         assert "stop Hermes, move the current lcm.db (with its -wal and -shm files) aside and keep it" in line
         assert restore in line and "stay in the file you moved aside" in line
-        assert "move the current lcm.db aside, then restore the lcm.db backup taken before the first v0.24.5 " \
-               "install with the plugin" in observation
+        for phrase in ("stop Hermes", "-wal and -shm", "keep it"):  # the observation alone is the whole procedure
+            assert phrase in observation, phrase
+        assert "restore the lcm.db backup taken before the first v0.24.5 install with the plugin" in observation
         assert "rows stored after that backup leave the LCM store" in line
 
 

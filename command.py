@@ -1708,8 +1708,9 @@ def _doctor_text(engine) -> str:
         projected = survival_fit.get("projected_count")  # absent on a record from before the key: unknown
         within = ("whole turns were dropped, nothing projected: a plugin-only rollback within the 0.24.x line is "
                   "supported for this store" if projected == 0 else
-                  "rollback within the 0.24.x line: move the current lcm.db aside, then restore the lcm.db backup "
-                  "taken before the first v0.24.5 install with the plugin")
+                  "rollback within the 0.24.x line: stop Hermes, move the current lcm.db (with its -wal and -shm "
+                  "files) aside and keep it, then restore the lcm.db backup taken before the first v0.24.5 install "
+                  "with the plugin")
         observations.append(f"survival_fit: applied {int(survival_fit['count'])} time(s); last reason "
                             f"{survival_fit.get('last_reason') or '(unknown)'}; projected_count "
                             f"{'unknown' if projected is None else projected}; {within}; a rollback to v0.23.3 "
