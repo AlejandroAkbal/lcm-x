@@ -31,6 +31,8 @@ jobs:
       OUT: ${{ github.workspace }}/reliability-out
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up Python (harness)
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -40,7 +42,7 @@ jobs:
       - name: Install uv
         run: pip install uv==0.11.26
 
-      - name: Prepare host ${{ matrix.host }} (pinned sha)
+      - name: Prepare the pinned Hermes tree for ${{ matrix.host }}
         run: python -m bench.instruments.reliability.ci prep --host "${{ matrix.host }}" --root "$RUNNER_TEMP/hosts" --out "$RUNNER_TEMP/hosts.json"
 
       - name: R1 in-process, all cells
