@@ -858,41 +858,57 @@ class IdentityAnchorMixin:
 def _match_occurrences(rows, keys_of, occurrences) -> dict:
     """``{store_id: occurrence}``: a maximum matching of stored ``rows`` (store order; a row listed twice, e.g.
     under an alternate stamp, is one row) to view ``occurrences`` ``[(occurrence, key)]`` (view order) by any key
-    of ``keys_of(row)``, each side once. A row takes its first free occurrence, else an augmenting path frees
-    one: a row with one admissible key gets what an in-order walk gave it. Deterministic."""
+    of ``keys_of(row)``, each side once. A row takes its first key with a free occurrence, else an augmenting
+    path frees one; each key's rows then take its occurrences in store order <-> view order, so rows with one
+    admissible key get what an in-order walk gave them. Deterministic; O(rows + occurrences + keys) memory."""
     slots: dict = defaultdict(list)
     for occurrence, key in occurrences:
         slots[key].append(occurrence)
     merged: dict = {}
     for row in rows:
         merged.setdefault(int(row["store_id"]), set()).update(keys_of(row))
-    ids = list(merged)
-    options = [[o for key in sorted(merged[store_id], key=repr) for o in slots.get(key, ())] for store_id in ids]
-    owner: dict = {}  # occurrence -> row index
-    held: dict = {}  # row index -> occurrence
-    for i in range(len(ids)):
-        parent: dict = {}
-        level, found = [i], None
-        while found is None and level:  # BFS over alternating paths; level 0 is row i's own options, in order
-            following = []
-            for r in level:
-                for o in options[r]:
-                    if o in parent:
-                        continue
-                    parent[o] = r
-                    if o not in owner:
-                        found = o
-                        break
-                    following.append(owner[o])
-                if found is not None:
-                    break
-            level = following
-        while found is not None:  # flip the path back to row i
-            r = parent[found]
-            previous = held.get(r)
-            owner[found], held[r] = r, found
+    keys = {sid: sorted((k for k in ks if k in slots), key=repr) for sid, ks in merged.items()}
+    load: Counter = Counter()
+    at: dict = {}  # store_id -> key
+    movable: dict = defaultdict(dict)  # key -> its assigned rows with >= 2 keys (ordered set); others never move
+    dead: set = set()  # Kuhn: a key a failed search reached never reaches a free slot after later augmentations
+    for sid, own in keys.items():
+        found = next((k for k in own if load[k] < len(slots[k])), None)
+        parent = {} if found is not None else {k: (sid, None) for k in own if k not in dead}
+        seen, queue = {sid}, list(parent)
+        for k in queue:  # BFS over keys; the queue grows while it is walked
+            if load[k] < len(slots[k]):
+                found = k
+                break
+            for r in movable[k]:
+                if r not in seen:
+                    seen.add(r)
+                    for nxt in keys[r]:
+                        if nxt not in dead and nxt not in parent:
+                            parent[nxt] = (r, k)
+                            queue.append(nxt)
+        if found is None:
+            dead.update(parent)
+            continue
+        load[found] += 1
+        r, previous = parent.get(found, (sid, None))
+        while True:  # re-point each row on the path to its next key
+            if previous is not None:
+                del movable[previous][r]
+            at[r] = found
+            if len(keys[r]) > 1:
+                movable[found][r] = None
+            if previous is None:
+                break
             found = previous
-    return {ids[r]: o for o, r in owner.items()}
+            r, previous = parent[found]
+    taken: Counter = Counter()
+    result = {}
+    for sid in keys:
+        if sid in at:
+            result[sid] = slots[at[sid]][taken[at[sid]]]
+            taken[at[sid]] += 1
+    return result
 
 
 def _composite_relation(group, stamp) -> list:
