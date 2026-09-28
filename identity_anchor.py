@@ -262,7 +262,7 @@ class IdentityAnchorMixin:
             return view_counts.get(identity, 0)
 
         def shown(idx: int) -> Counter:  # B-ID-1: the view's own occurrences no stored row has matched yet
-            return Counter((stamps[i], identity_at(i)) for i in stamps
+            return Counter((stamps.get(i), identity_at(i)) for i in range(n)  # unstamped: (None, form)
                            if i != idx and i not in matched and identity_at(i) is not None)
 
         consumed: set[int] = set()
@@ -387,11 +387,13 @@ class IdentityAnchorMixin:
         if "\n\n" not in content:
             return
         # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
-        view, pool, reserved = shown(idx), self._identity_anchor_pool(donors, consumed), set()
+        # A stamped row answers only its own stamp, a NULL-stamped (legacy) row only an unstamped occurrence.
+        pool, reserved = self._identity_anchor_pool(donors, consumed), set()
+        view = shown(idx) if pool else Counter()
         for row in pool:
             row_stamp = _normalize_observed_at(row.get("observed_at"))
             form = next((form for form in self._stored_row_forms(row) if view[(row_stamp, form)] > 0), None)
-            if row_stamp is not None and form is not None:
+            if form is not None:
                 view[(row_stamp, form)] -= 1
                 reserved.add(int(row["store_id"]))
         pool = [row for row in pool if int(row["store_id"]) not in reserved]
