@@ -6,13 +6,16 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
-## v0.24.4 - (unreleased; rc1) (#436: message identity anchored on the host timestamp)
+## v0.24.4 - (unreleased; rc2) (#436: message identity anchored on the host timestamp)
 
 - Fix: a message the host shows is matched to its stored copy by the host timestamp plus its full content, counted per
   occurrence, instead of by an ordered content prefix. Host re-issues (compaction generations, rotation handoff, ACP
   persist replace, restore) no longer re-store the tail, a merged row is absorbed only with an exact decomposition
   proof (new additive `message_relations` table; schema version unchanged), and a summary claims only sources in its
   input. `LCM_IDENTITY_ANCHOR=false` restores the v0.24.3 behaviour. (#436, #553, #561, #563, #572)
+- Fix (rc2): a repeated user message the host merges into a failed turn is stored as its own occurrence; a row the
+  host shows on its own is never a piece of a merged row (except a row stored before the host stamped it, #583), and a
+  storage rebind clears the identity caches. (#436, #580)
 
 ## v0.24.3 - 2026-09-28 (#559: a leaf chunk never splits a parallel tool-call group)
 
