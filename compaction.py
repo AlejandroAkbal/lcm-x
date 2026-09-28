@@ -1378,6 +1378,15 @@ class CompactionMixin:
         sweep_raw_drained = False
         dependent_reply_message_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
+        sweep_step_seconds: Dict[str, float] = {}
+
+        def sweep_step_done(step: str, started: float) -> float:
+            """#608: add the step's seconds to its total; return the clock after it. Only the
+            store-complete step checks the deadline here; the other timed steps lead to the leaf
+            pre-call check, which stops the sweep once the budget is spent."""
+            now = time.monotonic()
+            sweep_step_seconds[step] = sweep_step_seconds.get(step, 0.0) + now - started
+            return now
 
         while leaf_passes < max_leaf_passes:
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
@@ -1390,9 +1399,12 @@ class CompactionMixin:
             # turn; that must remain eligible for compaction instead of being
             # replayed forever as fresh-looking intent.
             leading_anchor_count = self._leading_anchor_count(working_messages)
+            step_started = time.monotonic() if threshold_full_sweep_active else 0.0
             publication_excluded_store_ids = self._get_store_ids_for_messages(
                 working_messages[:leading_anchor_count]
-            )
+            ) if leading_anchor_count else []  # #608: an empty slice maps to nothing
+            if threshold_full_sweep_active:
+                sweep_step_done("anchor_ids", step_started)
             filter_exclusion_proofs: Dict[int, Any] = {}
             hidden_backlog = False
             if fresh_tail_start <= leading_anchor_count:
@@ -1406,7 +1418,11 @@ class CompactionMixin:
                     eligible_tokens=0,
                 ):
                     continue
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 hidden_backlog = self._store_complete_backlog(working_messages, leading_anchor_count)
+                if threshold_full_sweep_active and sweep_step_done("store_complete", step_started) >= sweep_deadline:
+                    sweep_stop_reason = "time_budget_exhausted"
+                    break
             if fresh_tail_start <= leading_anchor_count and not hidden_backlog:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 if threshold_full_sweep_active:
@@ -1426,9 +1442,12 @@ class CompactionMixin:
             # Reuse the map when the pass maps this same list.
             drops, premapped_store_ids, kept = set(range(leading_anchor_count, candidate_start)), None, 0
             if leaf_passes == 0 and not resumed_prefix and not hidden_backlog:
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 resumed, store_ids, summary_tokens, kept = self._committed_replay_drops(
                     working_messages, candidate_start
                 )
+                if threshold_full_sweep_active:
+                    sweep_step_done("replay_drops", step_started)
                 resumed_prefix = bool(resumed)
                 resumed_ahead = resumed[0] - candidate_start if resumed else 0  # kept rows before lineage
                 premapped_store_ids = None if drops or resumed else store_ids
@@ -1454,11 +1473,14 @@ class CompactionMixin:
                     break
 
             if candidate_start < fresh_tail_start:
+                step_started = time.monotonic() if threshold_full_sweep_active else 0.0
                 self._current_compress_store_ids_by_message_id = (
                     premapped_store_ids
                     if premapped_store_ids is not None
                     else self._get_store_id_map_for_messages(working_messages[leading_anchor_count:])
                 )
+                if threshold_full_sweep_active:
+                    sweep_step_done("store_id_map", step_started)
                 compactable_pairs = list(
                     zip(
                         working_messages[candidate_start:fresh_tail_start],
@@ -1660,10 +1682,13 @@ class CompactionMixin:
             anchor_claims: dict[int, list[int]] = {}  # #436 R4: id(input row) -> the store ids its text covers
             selected_input = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
             self._store_complete_excluded, self._store_complete_cut = [], False
+            step_started = time.monotonic() if threshold_full_sweep_active else 0.0
             anchored_input = self._identity_anchor_summary_input(
                 selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk,
                 budget=max(1, int(self._config.leaf_chunk_tokens)), accounted_ids=publication_excluded_store_ids,
             )
+            if threshold_full_sweep_active:
+                sweep_step_done("identity_anchor", step_started)
             if anchored_input == []:  # #581: the oldest owned row above the frontier is a retained occurrence
                 noop_reason = "leaf would end before an unresolved retained occurrence"
                 break

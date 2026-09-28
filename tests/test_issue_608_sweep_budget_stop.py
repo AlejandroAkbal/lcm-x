@@ -100,6 +100,33 @@ def _spend_budget_before_first_leaf(engine, view, clock, monkeypatch, caplog):
         return engine.compress(view, current_tokens=engine.threshold_tokens + 1)
 
 
+# -- 1. the budget is spent before the first leaf ------------------------------------------------------
+
+def test_budget_spent_in_the_store_complete_step_stops_before_the_identity_anchor(
+        tmp_path, summaries, clock, monkeypatch, caplog):
+    """The view is all fresh tail and the owned backlog is hidden: the store-complete step is the one
+    that spends the budget, and the pass leaves before the identity-anchor step."""
+    engine = _engine(tmp_path)
+    old = [*_turn("H1", 100.0), *_turn("H2", 110.0)]
+    tail = _turn("T9", 900.0)
+    anchor_calls = []
+    original_anchor = engine._identity_anchor_summary_input
+    monkeypatch.setattr(engine, "_identity_anchor_summary_input",
+                        lambda *a, **k: anchor_calls.append(1) or original_anchor(*a, **k))
+    _advance_on_call(monkeypatch, engine, "_store_complete_backlog", clock, 121.0)
+    try:
+        engine.ingest([*old, *tail])
+        view = list(tail)
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            result = engine.compress(view, current_tokens=engine.threshold_tokens + 1)
+        telemetry = engine.get_status()["threshold_full_sweep"]
+        assert result is view and engine._last_compression_status == "noop"
+        assert telemetry["stop_reason"] == "time_budget_exhausted"
+        assert anchor_calls == [] and summaries == []
+    finally:
+        engine.shutdown()
+
+
 # -- 2. five seconds left at the pre-call check ------------------------------------------------------------
 
 def test_five_seconds_left_at_the_pre_call_check_makes_no_summariser_call(
@@ -196,5 +223,29 @@ def test_condensation_budget_end_is_a_stop_reason_without_a_warning(
                 target_tokens=100, pass_budget=5, deadline=clock() + 5.0)
         assert (passes, reason) == (0, "time_budget_exhausted")
         assert calls == [] and _count(caplog, CONDENSATION_LINE) == 0
+    finally:
+        engine.shutdown()
+
+
+# -- 7. the empty anchor slice is not mapped -----------------------------------------------------------------
+
+def test_empty_anchor_slice_is_not_mapped_and_the_pass_result_is_the_same(tmp_path, summaries, monkeypatch):
+    """No system prompt: the anchor slice is empty. Skipping its map uses the value the map returns for
+    an empty slice, so the pass publishes the same leaf and returns the same list as without the skip."""
+    engine = _engine(tmp_path)
+    view = _view()[1:]
+    mapped = []
+    original = engine._get_store_ids_for_messages
+    monkeypatch.setattr(engine, "_get_store_ids_for_messages",
+                        lambda messages, *a, **k: mapped.append(len(messages)) or original(messages, *a, **k))
+    try:
+        assert original([]) == []
+        engine.ingest(view)
+        result = engine.compress(view, current_tokens=engine.threshold_tokens + 1)
+        nodes = engine._dag.get_session_nodes("S")
+        assert engine._last_compression_status == "compacted"
+        assert [node.source_ids for node in nodes] == [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
+        assert result[-2:] == view[-2:] and len(result) == 3
+        assert 0 not in mapped
     finally:
         engine.shutdown()
