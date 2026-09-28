@@ -920,6 +920,9 @@ class LCMEngine(
         self._host_fallback_compressor = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        # B-ID-2: #436 caches name rows and ancestry of the previous profile's store.
+        self._identity_anchor_recent, self._identity_anchor_versions = [], []
+        self._identity_anchor_chain_cache = None
         self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
 

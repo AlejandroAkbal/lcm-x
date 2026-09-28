@@ -42,6 +42,7 @@ _POOL_WINDOW = 256  # store ids either side of a stamp donor searched for a comp
 _MAX_DECOMPOSITIONS = 3
 _DECOMPOSE_BUDGET = 2048  # T3: prefixes visited per decomposition (ingest thread)
 _DECOMPOSE_MAX_PARTS = 64
+_MATCH_WORK_PER_ITEM, _MATCH_WORK_FLOOR = 32, 4096  # matching search budget per row + occurrence + key (see below)
 
 
 def identity_anchor_enabled() -> bool:
@@ -261,20 +262,22 @@ class IdentityAnchorMixin:
                     view_counts[key] = view_counts.get(key, 0) + 1
             return view_counts.get(identity, 0)
 
+        def shown(idx: int) -> Counter:  # B-ID-1: the view's own occurrences no stored row has matched yet
+            return Counter((stamps.get(i), identity_at(i)) for i in range(n)  # unstamped: (None, form)
+                           if i != idx and i not in matched and identity_at(i) is not None)
+
         consumed: set[int] = set()
         matched: dict[int, list] = {}
         # R1: per key, the host view's occurrences consume the stored ones in order; the rest are new.
-        for idx in sorted(i for i, stamp in stamps.items() if stamp in wanted):
-            identity = identity_at(idx)
-            if identity is None:
-                continue
-            row = next((r for r, forms in by_stamp[stamps[idx]]
-                        if int(r["store_id"]) not in consumed and identity in forms), None)
-            if row is not None:
-                consumed.add(int(row["store_id"]))
-                matched[idx] = [row]
-                if idx >= start:
-                    plan["replayed"].add(idx)
+        forms_of = {id(r): forms for pairs in by_stamp.values() for r, forms in pairs}
+        occurrences = [(idx, (stamps[idx], identity_at(idx))) for idx in sorted(stamps)
+                       if stamps[idx] in wanted and identity_at(idx) is not None]
+        for store_id, idx in _match_occurrences(
+                rows, lambda r: {(float(r["observed_at"]), form) for form in forms_of[id(r)]}, occurrences).items():
+            consumed.add(store_id)
+            matched[idx] = [next(r for r, _forms in by_stamp[stamps[idx]] if int(r["store_id"]) == store_id)]
+            if idx >= start:
+                plan["replayed"].add(idx)
         for idx in range(start, n):
             identity = identity_at(idx) if idx in stamps and idx not in plan["replayed"] else None
             if identity is not None and identity[0] == "user":
@@ -283,7 +286,8 @@ class IdentityAnchorMixin:
                     plan.setdefault("ws", []).append((row, identity_messages[idx]))
                     self._identity_anchor_take(idx, [row], consumed, matched, plan)
                     continue
-                self._identity_anchor_user_row(idx, identity, stamps[idx], by_stamp, consumed, matched, plan, view_count)
+                self._identity_anchor_user_row(idx, identity, stamps[idx], by_stamp, consumed, matched, plan, view_count,
+                                               shown)
             elif idx not in stamps and idx not in plan["replayed"]:  # D-D plan (ii): H1 merged LCM's carrier
                 group = self._identity_anchor_carrier_group(identity_messages[idx], consumed)
                 if group is not None:
@@ -351,7 +355,7 @@ class IdentityAnchorMixin:
             logger.info("LCM identity-anchor: host changed its list before the cursor; %d unstored rows from %d: session=%s",
                         len(missed), min(missed), self._session_id)
 
-    def _identity_anchor_user_row(self, idx, identity, stamp, by_stamp, consumed, matched, plan, view_count) -> None:
+    def _identity_anchor_user_row(self, idx, identity, stamp, by_stamp, consumed, matched, plan, view_count, shown) -> None:
         """R2/R3/R5 for one unmatched user row: a recorded witness, an exact unique decomposition,
         the H1 unstable current-turn stamp, else a held head plus a new remainder. Else: new."""
         content = identity[1]
@@ -381,7 +385,15 @@ class IdentityAnchorMixin:
             return self._identity_anchor_constituent_copy(idx, identity, stamp, consumed, matched, plan)
         if "\n\n" not in content:
             return
-        pool = self._identity_anchor_pool(donors, consumed)
+        # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
+        # A stamped row answers only its own stamp, a NULL-stamped (legacy) row only an unstamped occurrence.
+        pool, reserved = self._identity_anchor_pool(donors, consumed), set()
+        if pool:
+            reserved = set(_match_occurrences(pool, lambda row: {(_normalize_observed_at(row.get("observed_at")), form)
+                                                                for form in self._stored_row_forms(row)},
+                                              list(enumerate(shown(idx).elements()))))
+        pool = [row for row in pool if int(row["store_id"]) not in reserved]
+        donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
         donor_texts = {self._identity_text(row) for row in donors}
         group, ambiguous = self._identity_anchor_compose(content, texts, pool, donors, consumed)
@@ -399,7 +411,9 @@ class IdentityAnchorMixin:
         if (len(recent) == 1 and recent[0][2] not in consumed and view_count(identity) == 1
                 and any(content.startswith(text + "\n\n") for text in donor_texts)):
             row = self._store.get_batch([recent[0][2]]).get(recent[0][2])
-            if row is not None:
+            # B-ID-2: the cached id names this occurrence only while the row still is it (same store, scope).
+            if (row is not None and row.get("role") == "user" and str(row.get("session_id") or "") in scope
+                    and recent[0][1] in self._stored_row_forms(row)):
                 plan["relations"].append(("alt_stamp", stamp, [row], None))
                 return self._identity_anchor_take(idx, [row], consumed, matched, plan)
         # R3: held constituents then a new remainder, stored once with its own stamp unknown.
@@ -504,7 +518,8 @@ class IdentityAnchorMixin:
 
     def _identity_anchor_pool(self, donors, consumed) -> list:
         """Candidate constituents: unconsumed user rows of the lineage near each stamp donor, plus the
-        bound session's recent rows (bounded)."""
+        bound session's recent rows (bounded). The caller drops rows the host view shows as their own
+        occurrences (B-ID-1) before it decomposes."""
         rows: dict[int, dict] = {}
         for donor in donors:
             store_id = int(donor["store_id"])
@@ -517,7 +532,8 @@ class IdentityAnchorMixin:
                 if row.get("role") == "user" and store_id not in consumed]
 
     def _identity_anchor_assign(self, parts, pool, donors, consumed) -> Optional[list]:
-        """Bind each part to one stored occurrence (a donor for a donor's text first), each used once."""
+        """Bind each part to one stored occurrence (a donor for a donor's text first), each used once;
+        ``pool`` holds no row the host view shows as its own occurrence (B-ID-1)."""
         taken: set[int] = set(consumed)
         donor_ids = {int(row["store_id"]) for row in donors}
         group = []
@@ -666,12 +682,6 @@ class IdentityAnchorMixin:
             shown = Counter(self._message_replay_identity(message, strip_carrier=False)  # a retained anchor, ...
                             for message in view if id(message) not in full_map)
 
-            def unshown(row) -> bool:
-                form = next((form for form in self._stored_row_forms(row) if shown[form] > 0), None)
-                if form is not None:
-                    shown[form] -= 1
-                return form is None
-
             rows = self._store.get_range(str(self._session_id), start_id=frontier + 1, end_id=last - 1, limit=100000)
             for source, start, end in carry:
                 if end > frontier and start < last:
@@ -680,8 +690,9 @@ class IdentityAnchorMixin:
                     if row.get("role") == "user" and owned(row)
                     and row.get("observed_at") is not None
                     and int(row["store_id"]) not in mapped | claimed
-                    and not self._matches_ignore_message_patterns(row, stored_row=True)
-                    and unshown(row)]
+                    and not self._matches_ignore_message_patterns(row, stored_row=True)]
+            shown_rows = _match_occurrences(gaps, self._stored_row_forms, list(enumerate(shown.elements())))
+            gaps = [row for row in gaps if int(row["store_id"]) not in shown_rows]
         if not gaps and not claims:
             return None
         out, pending = [], list(gaps)
@@ -843,6 +854,101 @@ class IdentityAnchorMixin:
             if identity is not None and identity[0] == "user":
                 recent.append((self._session_id, identity, int(store_id), _normalize_observed_at(message.get("timestamp"))))
         self._identity_anchor_recent = recent[-_RECENT_CAP:]
+
+
+def _match_occurrences(rows, keys_of, occurrences) -> dict:
+    """``{store_id: occurrence}``: a maximum matching of stored ``rows`` (store order; a row listed twice, e.g.
+    under an alternate stamp, is one row) to view ``occurrences`` ``[(occurrence, key)]`` (view order) by any key
+    of ``keys_of(row)``, each side once. A row takes its first key with a free occurrence, else an augmenting
+    path frees one; each key's rows then take its occurrences in store order <-> view order, so rows with one
+    admissible key get what an in-order walk gave them. Deterministic; O(rows + occurrences + keys) memory.
+    Rows with the same keys are one type and a search walks types, not rows. The searches of one call share a
+    work budget (key and type visits); once it is spent the remaining rows take only a free key of their own, the
+    result stays a valid deterministic matching that may fall short of maximum, and one WARNING (counts) is logged."""
+    slots: dict = defaultdict(list)
+    for occurrence, key in occurrences:
+        slots[key].append(occurrence)
+    merged: dict = {}
+    for row in rows:
+        merged.setdefault(int(row["store_id"]), set()).update(keys_of(row))
+    kinds = {sid: tuple(sorted((k for k in ks if k in slots), key=repr)) for sid, ks in merged.items()}
+    load: Counter = Counter()
+    units: dict = defaultdict(Counter)  # type -> key -> its rows on that key
+    matched: set = set()
+    movable: dict = defaultdict(dict)  # key -> multi-key types with a unit on it (ordered set); nothing else moves
+    dead: set = set()  # never an endpoint or a waypoint again (load never falls; Kuhn's lemma for failed searches)
+    budget, work, spent = _MATCH_WORK_PER_ITEM * (len(kinds) + len(occurrences) + len(slots)) + _MATCH_WORK_FLOOR, 0, False
+    for sid, own in kinds.items():
+        found = next((k for k in own if load[k] < len(slots[k])), None)
+        parent: dict = {}
+        if found is None and own and not spent:
+            queue = []
+            for k in own:
+                if k not in dead:
+                    parent[k] = (None, None)
+                    (queue.append if movable[k] else dead.add)(k)  # full with nothing that can leave: dead
+            seen: set = set()
+            for k in queue:  # BFS over keys; the queue grows while it is walked
+                gone = []
+                for kind in movable[k]:
+                    spent = work == budget
+                    if spent:
+                        break
+                    work += 1
+                    others = [other for other in kind if other != k and other not in dead]
+                    if not others:
+                        gone.append(kind)  # stuck on k for good
+                    elif kind not in seen:
+                        seen.add(kind)
+                        for other in others:
+                            if other in parent:
+                                continue
+                            spent = work == budget
+                            if spent:
+                                break
+                            work += 1
+                            parent[other] = (kind, k)
+                            if load[other] < len(slots[other]):
+                                found = other
+                                break
+                            (queue.append if movable[other] else dead.add)(other)
+                    if found is not None or spent:
+                        break
+                for kind in gone:
+                    del movable[k][kind]
+                if found is not None or spent:
+                    break
+            if found is None and not spent:
+                dead.update(parent)
+        if found is None:
+            continue
+        load[found] += 1
+        kind, previous = parent.get(found, (None, None))
+        while previous is not None:  # one unit of each type on the path moves one key along
+            units[kind][previous] -= 1
+            if not units[kind][previous]:
+                movable[previous].pop(kind, None)
+            units[kind][found] += 1
+            movable[found][kind] = None
+            found = previous
+            kind, previous = parent[found]
+        matched.add(sid)
+        units[own][found] += 1
+        if len(own) > 1:
+            movable[found][own] = None
+    given: dict = defaultdict(Counter)  # type -> key -> its rows given that key so far
+    taken: Counter = Counter()
+    result = {}
+    for sid, kind in kinds.items():  # store order: a type's rows fill its keys by units, keys in order
+        if sid in matched:
+            k = next(k for k in kind if given[kind][k] < units[kind][k])
+            given[kind][k] += 1
+            result[sid] = slots[k][taken[k]]
+            taken[k] += 1
+    if spent:
+        logger.warning("LCM identity-anchor matching spent its work budget %d: rows=%d occurrences=%d keys=%d matched=%d",
+                       budget, len(kinds), len(occurrences), len(slots), len(result))
+    return result
 
 
 def _composite_relation(group, stamp) -> list:
