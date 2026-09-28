@@ -8,8 +8,9 @@ composite: that is the host merge (agent/agent_runtime_helpers.py ``_merge_conse
 
 B1/B2 are scored per session lineage: the chat lineage is S0 and its compression children (state.db
 ``parent_session_id``), each cron fire is its own lineage. A row stored under the wrong lineage is a loss in
-one and a surplus in the other. A cell that cannot prove its scenario ran (tool dispatch, native attempts,
-tool groups) is UNSUPPORTED, never PASS.
+one and a surplus in the other. A user-row surplus the host's own state.db holds at the same multiplicity is
+licensed and reported (``host_parity_licensed``, scorers/host_parity.py). A cell that cannot prove its scenario
+ran (tool dispatch, native attempts, tool groups) is UNSUPPORTED, never PASS.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import sqlite3
 from collections import Counter
 from pathlib import Path
 
-from . import chronology, multiset, summary, tool_calls, tool_groups
+from . import chronology, host_parity, multiset, summary, tool_calls, tool_groups
 
 ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
 
@@ -132,6 +133,15 @@ def expected_items(atts: list[dict], notices=()) -> list[tuple[str, str]]:
     return items
 
 
+def source_ids(src) -> list:
+    """A summary node's ``source_ids`` JSON list; unparseable or non-list values are an empty source."""
+    try:
+        ids = json.loads(src) if src else []
+    except ValueError:
+        return []
+    return ids if isinstance(ids, list) else []
+
+
 def tag_counts(texts, pattern):
     counts = Counter()
     for text in texts:
@@ -155,6 +165,9 @@ def score(cell: dict, cell_dir: Path) -> dict:
     group = lineage(cell_dir, cell.get("chat_root", "S0"))
     groups = sorted({attempt_group(a, group) for a in atts} | {group(sid) for _s, sid, _r, _c in stored})
     notices = {x for p in phases for x in p.get("failed_turn_notices") or []}
+    plugin = cell.get("plugin") or (json.loads((cell_dir / "cell.json").read_text()).get("plugin")
+                                    if (cell_dir / "cell.json").exists() else None) or {}
+    host, host_why = host_parity.load(cell_dir / "db" / "state.db", group, plugin.get("tree"))
     per = {g: (expected_items([a for a in atts if attempt_group(a, group) == g], notices),
                [r for r in stored if group(r[1]) == g]) for g in groups}
     applicable = [b for b in cell.get("bars") or ALL_BARS
@@ -162,15 +175,23 @@ def score(cell: dict, cell_dir: Path) -> dict:
                   and (b != "B5" or cell.get("min_compactions", 5) > 0)]
     failed, numbers = {}, {}
 
-    user_pat, reply_pat = r"\[([A-Z]\d\d)\] user turn", r"reply to ([A-Z]\d\d)\b"
-    b1, b1_tags, b1_per, b2_parts = {}, [0, 0], {}, {}
+    user_pat, reply_pat = r"\[([A-Z]\d{2,3})\] user turn", r"reply to ([A-Z]\d{2,3})\b"
+    b1, b1_tags, b1_per, b2_parts, b1_lic = {}, [0, 0], {}, {}, []
     for g, (items, rows) in per.items():
         label = "" if g == "chat" else f"{g}:"
         want_u = tag_counts([t for r, t in items if r == "user"], user_pat)
         want_a = tag_counts([t for r, t in items if r == "assistant"], reply_pat)
         have_u = tag_counts([c for _s, _sid, r, c in rows if r == "user"], user_pat)
         have_a = tag_counts([c for _s, _sid, r, c in rows if r == "assistant"], reply_pat)
-        mism = {f"{label}{k}": {"expected": want_u[k], "stored": have_u[k]} for k in set(want_u) | set(have_u) if want_u[k] != have_u[k]}
+        hg = None if host is None else host.get(g, {})
+        mism = {}
+        for k in set(want_u) | set(have_u):
+            ids = [s for s, _sid, r, c in rows if r == "user" and k in re.findall(user_pat, c or "")] \
+                if have_u[k] > want_u[k] else []
+            lic = host_parity.b1_licence(k, want_u[k], have_u[k], hg, ids)
+            b1_lic += [dict(lic, session=g)] if lic else []
+            if want_u[k] + (lic or {}).get("licensed", 0) != have_u[k]:
+                mism[f"{label}{k}"] = {"expected": want_u[k], "stored": have_u[k]}
         mism.update({f"reply {label}{k}": {"expected": want_a[k], "stored": have_a[k]}
                      for k in set(want_a) | set(have_a) if want_a[k] != have_a[k]})
         want_c = continue_positions(items, reply_pat)
@@ -181,14 +202,17 @@ def score(cell: dict, cell_dir: Path) -> dict:
         b1_tags[0] += len(want_u)
         b1_tags[1] += len(want_a)
         b1_per[g] = len(mism)
-        b2_parts[g] = multiset.score(items, rows)
-    numbers["B1"] = {"user_tags": b1_tags[0], "reply_tags": b1_tags[1], "mismatched": len(b1), "per_session": b1_per}
+        b2_parts[g] = multiset.score(items, rows, None if host is None else host.get(g, {}).get("keys", {}))
+    numbers["B1"] = {"user_tags": b1_tags[0], "reply_tags": b1_tags[1], "mismatched": len(b1), "per_session": b1_per,
+                     "host_parity_licensed": host_parity.summary(b1_lic, host_why)}
     if b1:
         failed["B1"] = dict(sorted(b1.items())[:30])
     keys = ("expected_items", "missing_keys", "deficit_rows", "duplicated_keys", "surplus_rows",
             "stored_rows_not_expected", "split_keys")
     numbers["B2"] = {k: sum(m[k] for m in b2_parts.values()) for k in keys}
     numbers["B2"]["per_session"] = {g: m["verdict"] for g, m in b2_parts.items()}
+    numbers["B2"]["host_parity_licensed"] = host_parity.summary(
+        [dict(r, session=g) for g, m in b2_parts.items() for r in m["host_parity_licensed"]], host_why)
     bound = tool_calls.bind(atts, lambda a: attempt_group(a, group))
     tools = tool_calls.compare(bound["expected"], bound["loose"], tool_calls.stored_keys(full, group))
     numbers["B2"].update(tools)
@@ -216,11 +240,17 @@ def score(cell: dict, cell_dir: Path) -> dict:
                              f"{[c.get('turns_since_pass') for c in final.get('backlog_checks') or []]}"
     grow = summary.growth(events, sum(p.get("compactions_logged", 0) for p in phases), cell.get("min_compactions", 5))
     session_of = {r[0]: r[1] for r in full}
-    crossing = [nid for nid, sid, src in nodes  # a summary must only cover rows of its own session lineage
-                if any(group(session_of.get(i, f"missing:{i}")) != group(sid) for i in json.loads(src or "[]"))]
-    grow["cross_lineage_nodes"] = crossing[:10]
+    crossing, empty = [], []
+    for nid, sid, src in nodes:  # a summary must cover >= 1 stored row, and only rows of its own session lineage
+        ids = source_ids(src)
+        if not any(type(i) is int and i in session_of for i in ids):  # a JSON true is not store id 1
+            empty.append(nid)  # counted toward depth-0 growth, yet it summarises no stored message
+        if any(group(session_of.get(i, f"missing:{i}") if type(i) is int else f"invalid:{i}") != group(sid)
+               for i in ids):
+            crossing.append(nid)
+    grow["cross_lineage_nodes"], grow["empty_source_nodes"] = crossing[:10], empty[:10]
     numbers["B5"] = grow
-    if not grow["ok"] or crossing:
+    if not grow["ok"] or crossing or empty:
         failed["B5"] = {k: v for k, v in grow.items() if k != "depth0_sequence"} | {"depth0_tail": grow["depth0_sequence"][-8:]}
     tg = tool_groups.split_groups(db)
     hooked = all("orphan_hook" not in p for p in phases)

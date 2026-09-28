@@ -26,7 +26,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TAG = re.compile(r"\[([A-Z]\d\d)\] user")
+TAG = re.compile(r"\[([A-Z]\d{2,3})\] user")
 NONCE = re.compile(r'<lcm-summary nonce="([0-9a-f]+)">')
 
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-TAG = re.compile(r"\[([A-Z])(\d\d)\] user turn")
+TAG = re.compile(r"\[([A-Z])(\d{2,3})\] user turn")
 
 
 def report(stored_rows, group) -> dict:

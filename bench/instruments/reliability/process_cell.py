@@ -171,9 +171,14 @@ class Scenario:
         return {"content": text, "log": log, **extra}
 
 
+class PhaseDeadline(AD.DriverError):
+    """The overall phase deadline (run_matrix ``--timeout``) expired."""
+
+
 class ProcessCell:
-    def __init__(self, cell, d: Path, host: dict, transport: str, turn_timeout: float):
+    def __init__(self, cell, d: Path, host: dict, transport: str, turn_timeout: float, phase_timeout: float | None = None):
         self.cell, self.d, self.host, self.transport, self.turn_timeout = cell, d, host, transport, turn_timeout
+        self.phase_timeout, self.deadline = phase_timeout, None
         self.home, self.files, self.work = d / "hermes-home", d / "files", d / "home" / "work"
         self.transcript, self.proc, self.sid, self.text_tag = d / "transcript.jsonl", None, None, None
         self.phase, self.log_mark, self.fired, self.backlog_log, self.last_turn = "A", 0, set(), [], 0
@@ -216,6 +221,15 @@ class ProcessCell:
         self.event(turn=self.scenario.st["t"], event="cancel")
 
     # -- the host process ------------------------------------------------------------------------------------
+    def budget(self) -> float:
+        """One ACP request's timeout: the per-request timeout, capped by what is left of the phase deadline."""
+        if self.deadline is None:
+            return self.turn_timeout
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise PhaseDeadline(f"phase {self.phase} exceeded its {self.phase_timeout}s deadline")
+        return min(self.turn_timeout, left)
+
     def env(self) -> dict:
         env = {"HOME": str(self.d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(self.home),
                "TMPDIR": str(self.d / "home"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(self.d / "pycache"), "PYTHONUNBUFFERED": "1",
@@ -251,7 +265,7 @@ class ProcessCell:
         if killer:  # --kill-after-rotation: SIGKILL while the rotated child session has no lcm rows yet
             killer.start()
         try:
-            answer, stop = self.proc.prompt(self.sid, text, self.turn_timeout)
+            answer, stop = self.proc.prompt(self.sid, text, self.budget())
         finally:
             if killer:
                 killer.stop.set()
@@ -266,7 +280,7 @@ class ProcessCell:
             (self.d / "turn.json").write_text(json.dumps({"prefix": "T", "t": t, "kind": "final", "text": "/compress"}))
             self.scenario.begin(None, "final", self.phase, self.first)
             before, mark = len(self.notes("final_attempt")), len(self.host_log())
-            answer, _stop = self.proc.prompt(self.sid, "/compress", self.turn_timeout)
+            answer, _stop = self.proc.prompt(self.sid, "/compress", self.budget())
             got = self.notes("final_attempt")[before:]
             rec = {k: v for k, v in got[-1].items() if k not in ("phase", "kind", "ts")} if got else \
                 {"entry": None, "engine_calls": 0, "engine_status": None, "not_invoked": True}
@@ -285,13 +299,14 @@ class ProcessCell:
 
     def run_phase(self, first: int) -> dict:
         self.first = first
+        self.deadline = time.monotonic() + self.phase_timeout if self.phase_timeout else None
         self.proc = AD.AcpProcess(self.argv(), self.env(), self.work, self.d / f"host-{self.phase}.stderr")
         try:
-            self.proc.initialize(self.turn_timeout)
+            self.proc.initialize(self.budget())
             if self.phase == "A":
-                self.sid = self.proc.new_session(self.files, self.turn_timeout)
+                self.sid = self.proc.new_session(self.files, self.budget())
             else:  # ACP _restore: the stable ACP id, restored from state.db by the fresh process
-                self.proc.load_session(self.sid, self.files, self.turn_timeout)
+                self.proc.load_session(self.sid, self.files, self.budget())
             cancel = next((f for f in self.cell["faults"] if f["kind"] == "cancel_then_retry"), None)
             for t in P1.extend_turns(self.cell, first, self.low_backlog):
                 if cancel and t == cancel["turn"] and "cancel_then_retry" not in self.fired:
@@ -304,13 +319,19 @@ class ProcessCell:
                     self.turn(t)
             final = {**self.final_check(), "backlog_checks": self.backlog_log} \
                 if self.cell.get("final_compaction_check", True) else None
+            self.budget()  # work after the last request may have crossed the deadline: never a late "done"
             return {"exit": "done", "next_turn": None, **({"final_check": final} if final else {})}
         except AD.ProcessGone as exc:
             if self.proc.killed and any(k.startswith("crash") for k in self.fired):
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    return {"exit": "error", "reason": f"PhaseDeadline: phase {self.phase} exceeded its "
+                                                       f"{self.phase_timeout}s deadline before the crash was recorded"}
                 t = self.last_turn
                 return {"exit": "crash", "next_turn": t + 1, "turn": t}
             return {"exit": "error", "reason": f"host process ended: {exc}; stderr: {self.stderr_tail()}"}
         except (AD.DriverError, OSError, ValueError) as exc:
+            if self.deadline is not None and time.monotonic() >= self.deadline and not isinstance(exc, PhaseDeadline):
+                exc = PhaseDeadline(f"phase {self.phase} exceeded its {self.phase_timeout}s deadline ({exc})")
             return {"exit": "error", "reason": f"{type(exc).__name__}: {exc}; stderr: {self.stderr_tail()}"[:600]}
         finally:
             rc = self.proc.close()
@@ -413,7 +434,7 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
     (home / "models_dev_cache.json").write_text(json.dumps({"rel": {"id": "rel", "name": "reliability fake", "models": {}}}))
     (d / "files" / "small.txt").write_text("small deterministic file\n")
     (d / "files" / "big.txt").write_text("".join(f"line {i:05d}: " + P1.FILLER * 8 + "\n" for i in range(cell.get("big_lines", 400))))
-    run = ProcessCell(cell, d, host, transport, turn_timeout)
+    run = ProcessCell(cell, d, host, transport, turn_timeout, phase_timeout=timeout)
     run.provider.start()
     (home / "config.yaml").write_text(config_yaml(cell, plugin, run.provider.base_url))
     (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name, "host_src": host["src"],
@@ -452,7 +473,7 @@ def run_cell_process(cell: dict, host_name: str, host: dict, plugin: dict, out: 
         return done(verdict="ERROR", reason=f"provider request log does not account for the transcript: {acct}")
     rec.update(RM.verdict_fields({**cell, "chat_root": run.sid}, d, last, run.fired, rec["citations"], backup_errors))
     done()
-    if keep_dbs == "fail" and rec["verdict"] == "PASS":
+    if keep_dbs == "fail" and rec["verdict"] == "PASS" and not any(RM.report.licensed(rec)):
         shutil.rmtree(d / "db", ignore_errors=True)
     if not keep:
         shutil.rmtree(home, ignore_errors=True)
