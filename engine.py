@@ -494,10 +494,6 @@ class LCMEngine(
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
-        # (session, conversation) whose compaction-commit end finalized the lifecycle row
-        # and has had no start or reset since: a host that refuses the candidate after the
-        # end (would_grow) never sends the start that re-binds it.
-        self._commit_end_unbound: tuple[str, str] | None = None
 
         # Cursor: index in the current messages list up to which all
         # messages have been persisted.  After compress() shortens the
@@ -2962,19 +2958,23 @@ class LCMEngine(
         self._update_model_pending_session_start = False
 
     def _rebind_after_unadopted_compaction_commit(self) -> None:
-        """The host ran the compaction-commit end, then refused the candidate and sent no
-        compression start, so this process still serves a finalized (unbound) row.
+        """This engine is bound to (session, conversation), but the conversation's lifecycle row is
+        unbound and was last finalized by this session: an end ran with no start after it. The host
+        refused the candidate after the compaction-commit end (would_grow) and sent no start, or
+        ANOTHER engine on the same row ended the session (R5-3a: a gateway hygiene agent's deferred
+        cleanup, a background-review agent's turn end). The trigger is the row's state, so it
+        covers any engine or process that unbinds it.
 
         Re-bind it as that start would. bind_session restores the session's own finalized
-        frontier, or 0 when a reset came after the finalize (the reset dropped the leaves
-        claiming it). The frontier moves only through a proven publication (#5), never from
-        the in-process value.
+        frontier (#5: never another session's, never from the in-process value); a reset after the
+        finalize means the host is moving on, so nothing is re-bound then.
         """
-        marker, self._commit_end_unbound = self._commit_end_unbound, None
-        if marker != (self._session_id, self._conversation_id) or self._bypasses_lcm_context_management():
+        if not self._session_id or not self._conversation_id or self._bypasses_lcm_context_management():
             return
         state = self._lifecycle.get_by_conversation(self._conversation_id)
         if state is None or state.current_session_id is not None or state.last_finalized_session_id != self._session_id:
+            return
+        if state.last_reset_at is not None and (state.last_finalized_at or 0) < state.last_reset_at:
             return
         state = self._lifecycle.bind_session(self._session_id, conversation_id=state.conversation_id)
         frontier = int(state.current_frontier_store_id or 0)
@@ -2987,7 +2987,8 @@ class LCMEngine(
             )
         self._last_compacted_store_id = frontier
         logger.info(
-            "LCM re-bound %s after an unadopted compaction commit (frontier=%d)", self._session_id, frontier
+            "LCM re-bound %s after an unadopted compaction commit or another engine's end (frontier=%d)",
+            self._session_id, frontier,
         )
 
     def _continue_in_place_compression_boundary(
@@ -3426,7 +3427,6 @@ class LCMEngine(
         with self._exclusive_lifecycle("rebind"):
             if self._stable_use_closed:
                 raise RuntimeError("LCM engine is closed")
-            self._commit_end_unbound = None
             self._on_session_start_unlocked(session_id, **kwargs)
             binding = self._emission_binding()
             for name in ("_compress_commit_proof", "_last_emission_descriptors"):
@@ -4033,7 +4033,6 @@ class LCMEngine(
                         session_id,
                         frontier_store_id=self._last_compacted_store_id,
                     )
-                self._commit_end_unbound = (session_id, self._conversation_id)
             except (Exception, KeyboardInterrupt) as exc:
                 logger.warning("LCM compaction-commit session-end finalization skipped: %r", exc)
             logger.info(
@@ -4127,7 +4126,6 @@ class LCMEngine(
         with self._exclusive_lifecycle("reset"):
             if self._stable_use_closed:
                 return
-            self._commit_end_unbound = None
             self._on_session_reset_unlocked()
 
     def _on_session_reset_unlocked(self) -> None:
