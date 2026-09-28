@@ -1001,12 +1001,14 @@ def test_r6_5_store_complete_admits_a_tool_group_whole_or_not_at_all(tmp_path, s
         engine.shutdown()
 
 
-def _scan_cap_store(engine, call_pos, parallel=False):
+def _scan_cap_store(engine, call_pos, parallel=False, calls=None):
     """``call_pos - 1`` small hidden rows, an assistant tool-call row at owned position ``call_pos`` (two
-    calls when ``parallel``), its result rows, a reply, then the fresh tail (the only host view)."""
+    calls when ``parallel``, ``calls`` when given), its result rows, a reply, then the fresh tail (the only
+    host view)."""
     hidden = [{"role": "user", "content": f"h{i:05d} q", "timestamp": float(i)} if i % 2 else
               {"role": "assistant", "content": f"h{i:05d} a"} for i in range(1, call_pos)]
     ids = ["call_edge", "call_side"] if parallel else ["call_edge"]
+    ids = ids if calls is None else ["call_edge", *[f"call_{k}" for k in range(1, calls)]]
     calls = [{"id": cid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}} for cid in ids]
     group = [{"role": "assistant", "content": "", "tool_calls": calls},
              *[{"role": "tool", "tool_call_id": cid, "content": f"RESULT_OF_{cid}"} for cid in ids],
@@ -1023,7 +1025,8 @@ def _unmatched_calls(messages) -> list:
     return [call["id"] for m in messages for call in (m.get("tool_calls") or []) if call["id"] not in answered]
 
 
-def _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, cap, call_pos, parallel=False):
+def _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, cap, call_pos, parallel=False, calls=None,
+                         covered_before=False):
     """Two passes over the scan-cap store; returns (call id, covered after pass 1, log lines, serializer inputs)."""
     if cap is not None:
         monkeypatch.setattr(lcm_store_complete, "_SCAN_LIMIT", cap)
@@ -1032,7 +1035,10 @@ def _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, cap, call_pos, parallel=
     real = engine._serialize_messages
     monkeypatch.setattr(engine, "_serialize_messages", lambda messages: serialized.append(list(messages)) or real(messages))
     try:
-        tail, call_id = _scan_cap_store(engine, call_pos, parallel)
+        tail, call_id = _scan_cap_store(engine, call_pos, parallel, calls)
+        if covered_before:  # every row before the call is already covered by a summary (excluded, not in the leaf)
+            engine._dag.add_node(SummaryNode(session_id="OTHER", summary="s", token_count=1, source_token_count=1,
+                                             source_ids=list(range(1, call_id))))
         with caplog.at_level(logging.INFO, logger="hermes_lcm.store_complete"):
             view = engine.compress(list(tail))
             assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
@@ -1046,7 +1052,11 @@ def _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, cap, call_pos, parallel=
             engine._config.leaf_chunk_tokens = 200  # the next leaf: the rest of the backlog and host rows
             engine.compress(view)
             assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
-        _assert_contiguous(engine)
+        every = Counter(int(r[0]) for r in engine._store.connection.execute(
+            "SELECT source.value FROM summary_nodes AS node, json_each(node.source_ids) AS source "
+            "WHERE node.source_type = 'messages'").fetchall())  # any session's summaries
+        below = [int(r["store_id"]) for r in _rows(engine) if int(r["store_id"]) <= _frontier(engine)]
+        assert below and all(every[store_id] == 1 for store_id in below), (_frontier(engine), every)
         lines = [r.getMessage() for r in caplog.records if "store-complete leaf" in r.getMessage()]
         return call_id, first, set(_covered(engine)), lines, serialized
     finally:
@@ -1086,6 +1096,22 @@ def test_rc2_b_group_1_product_scan_limit(tmp_path, summaries, monkeypatch, capl
     call_id, first, covered, lines, _serialized = _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, None, cap)
     assert call_id == cap and max(first) == cap - 1 and "cut=True" in lines[0], (call_id, max(first), lines)
     assert {cap, cap + 1} <= covered
+
+
+@pytest.mark.parametrize("shape", ["covered-before", "first-owned-row"])
+def test_rc2_b_group_1_a_first_group_at_the_scan_cap_is_read_whole(tmp_path, summaries, monkeypatch, caplog, shape):
+    """A first tool group (no covered row before it in the leaf) open at the scan cap: one bounded larger
+    scan reads its results and the group is admitted whole, never a call without its result.
+    covered-before: 1,999 rows an existing summary covers, the call at 2000, its result at 2001.
+    first-owned-row: the call is the first owned row, twelve parallel calls, their results past cap 10."""
+    covered_before = shape == "covered-before"
+    call_id, first, covered, lines, serialized = _run_scan_cap_leaves(
+        tmp_path, monkeypatch, caplog, None if covered_before else 10, lcm_store_complete._SCAN_LIMIT
+        if covered_before else 1, calls=None if covered_before else 12, covered_before=covered_before)
+    results = 1 if covered_before else 12
+    assert set(range(call_id, call_id + results + 1)) <= first, (sorted(first)[-5:], call_id)
+    assert serialized and not any(_unmatched_calls(messages) for messages in serialized)
+    assert "[TOOL RESULT" not in summaries[1].split("\n\n")[0], summaries[1][:200]  # next leaf: no orphan result
 
 
 class _Heartbeat:
