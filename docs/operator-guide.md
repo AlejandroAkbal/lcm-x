@@ -121,7 +121,8 @@ restarts: `plugins.enabled` back to `hermes-lcm` and `context.engine: lcm`
 Hermes reports the engine as not found, runs the built-in compressor, and
 those turns never reach `lcm.db`. Within the 0.24.x line a plugin-only
 rollback is supported only while no survival-fit projection was persisted
-(#601); once `/lcm doctor` reports a `survival_fit` count above 0, an older
+(#601); once `/lcm doctor` reports a `survival_fit` `projected_count` above 0
+(or unknown, on a record from before that field), an older
 plugin re-stores rows it cannot compact, so restore the `lcm.db` backup taken
 before the upgrade together with the plugin, accepting that rows stored after
 that backup leave the LCM store (they remain in the host session).
