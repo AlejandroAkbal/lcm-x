@@ -386,8 +386,12 @@ class IdentityAnchorMixin:
         if "\n\n" not in content:
             return
         # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
-        pool = self._identity_anchor_pool(donors, consumed)
-        reserved = _reserve_shown(pool, self._stored_row_forms, list(enumerate(shown(idx).elements()))) if pool else set()
+        pool, aliases = self._identity_anchor_pool(donors, consumed), defaultdict(set)
+        for rel in self._store.get_message_relations([int(row["store_id"]) for row in pool], "alt_stamp"):
+            if _normalize_observed_at(rel["observed_at"]) is not None:  # B-ID-3: its recorded R5 alias stamps
+                aliases[int(rel["store_id"])].add(_normalize_observed_at(rel["observed_at"]))
+        reserved = _reserve_shown(pool, self._stored_row_forms, list(enumerate(shown(idx).elements())),
+                                  aliases) if pool else set()
         pool = [row for row in pool if int(row["store_id"]) not in reserved]
         donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
@@ -947,14 +951,16 @@ def _match_occurrences(rows, keys_of, occurrences) -> dict:
     return result
 
 
-def _reserve_shown(pool, forms_of, occurrences) -> set:
+def _reserve_shown(pool, forms_of, occurrences, aliases=None) -> set:
     """B-ID-1: store ids of ``pool`` rows (store order) the host view shows as their own occurrences
-    ``[(occurrence, (stamp, form))]``. A stamped row answers only its own stamp, a NULL-stamped (legacy) row an
-    unstamped occurrence. #583: then a NULL row LCM stored before the host stamped it answers a stamped
-    occurrence of its form still unmatched, keyed by form alone (a row's keys are its forms, never its
-    stamps: linear), in store order."""
-    reserved = _match_occurrences(pool, lambda row: {(_normalize_observed_at(row.get("observed_at")), form)
-                                                     for form in forms_of(row)}, occurrences)
+    ``[(occurrence, (stamp, form))]``. A stamped row answers only its own stamp and its recorded alias stamps
+    (``aliases``: store id -> stamps, B-ID-3), a NULL-stamped (legacy) row an unstamped occurrence. #583: then a
+    NULL row LCM stored before the host stamped it answers a stamped occurrence of its form still unmatched,
+    keyed by form alone (a row's keys are its forms, never its stamps: linear), in store order."""
+    aliases = aliases or {}
+    reserved = _match_occurrences(pool, lambda row: {
+        (stamp, form) for stamp in {_normalize_observed_at(row.get("observed_at")), *aliases.get(int(row["store_id"]), ())}
+        for form in forms_of(row)}, occurrences)
     null = [row for row in pool if _normalize_observed_at(row.get("observed_at")) is None
             and int(row["store_id"]) not in reserved]
     taken = set(reserved.values())

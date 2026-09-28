@@ -156,3 +156,14 @@ def test_scale_null_hub_of_many_forms(caplog):
     rows += [_null(2 * n + i, "a") for i in range(n // 2)]
     occurrences = [(j, (float(j), "a")) for j in range(n)] + [(n + i, (float(n + i), ("b", i))) for i in range(n)]
     assert len(_reserve(caplog, rows, occurrences)) == 2 * n
+
+
+def test_a_recorded_alias_stamp_reserves_only_its_own_row(caplog):
+    """B-ID-3: a stamped row answers its own stamp and its recorded alias stamps; another row of the same form
+    never answers that alias."""
+    pool = [{"store_id": 1, "observed_at": 20.0, "forms": {"u"}}, {"store_id": 2, "observed_at": 35.0, "forms": {"u"}}]
+    shown = [(0, (10.0, "u"))]
+    assert _reserve(caplog, pool, shown) == set()  # no alias recorded: nothing answers 10
+    assert _reserve_shown(pool, lambda row: row["forms"], shown, {1: {10.0}}) == {1}
+    assert _reserve_shown(pool, lambda row: row["forms"], shown, {2: {10.0}}) == {2}
+    assert _reserve_shown(pool, lambda row: row["forms"], [(0, (10.0, "u")), (1, (20.0, "u"))], {1: {10.0}}) == {1}

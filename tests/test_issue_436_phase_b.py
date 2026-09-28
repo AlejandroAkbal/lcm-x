@@ -285,3 +285,52 @@ def test_r3f_a_null_row_shown_only_inside_a_composite_is_no_reservation(tmp_path
         assert _stored(_rows(engine))[("user", "foo")] == 1
     finally:
         engine.shutdown()
+
+
+P_TEXT, Q_TEXT = "[P] first part" + PAD, "[Q] second part" + PAD
+
+
+@pytest.mark.parametrize("text", [("P", "Q"), (P_TEXT, Q_TEXT)], ids=["short", "long"])
+def test_bid3_a_row_the_host_shows_under_its_recorded_alias_stamp_is_reserved(tmp_path, text):
+    """B-ID-3 (fresh host dicts each ingest, U = "P\\n\\nQ"): [P@10, U@20]; then [U@10, A@21, R@30] (R5 records
+    alt_stamp 10 on U's row, observed_at 20); then a NEW U merged into the failed R: [U@10, A@21, "R\\n\\nU"@30,
+    A@40]. U@10 reserves U's row through its alias: the composite's U is new and stored, never absorbed
+    into the old row (loss)."""
+    engine = _engine(tmp_path)
+    try:
+        u_text, r = "\n\n".join(text), _u("[R] failed turn" + PAD, 30.0)
+        engine.ingest([_u(text[0], 10.0), _u(u_text, 20.0)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r)])
+        [u] = _ids(engine, u_text)
+        assert [rel for rel in _relations(engine) if rel[1] == "alt_stamp"] == [(u, "alt_stamp", None, None)]
+        before, composite = max(int(row["store_id"]) for row in _rows(engine)), r["content"] + "\n\n" + u_text
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), _u(composite, 30.0), _a("reply to R+U", 40.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert u not in members
+        if members:  # R3: stored constituents (P, not shown on its own, may head it) plus a remainder stored anew
+            content = {int(row["store_id"]): row["content"] for row in _rows(engine)}
+            assert "\n\n".join(content[m] for m in members) == composite and max(members) > before, members
+        else:
+            stored = _stored(_rows(engine))
+            assert stored[("user", u_text)] == 2 or stored[("user", composite)] == 1, stored
+    finally:
+        engine.shutdown()
+
+
+def test_bid3_an_alias_reserves_only_its_own_row(tmp_path):
+    """B-ID-3 precision: U's first row carries alias 10; a second stored U@35 (LCM stored it before the host
+    folded it into R) has no alias. U@10 reserves the first row only; the composite still absorbs U@35."""
+    engine = _engine(tmp_path)
+    try:
+        u_text, r = "\n\n".join((P_TEXT, Q_TEXT)), _u("[R] failed turn" + PAD, 30.0)
+        engine.ingest([_u(P_TEXT, 10.0), _u(u_text, 20.0)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r), _u(u_text, 35.0)])
+        first, second = _ids(engine, u_text)
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), _u(r["content"] + "\n\n" + u_text, 30.0),
+                       _a("reply to R+U", 40.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert first not in members and second in members, members
+        assert _stored(_rows(engine))[("user", u_text)] == 2
+    finally:
+        engine.shutdown()
