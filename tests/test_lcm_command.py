@@ -536,22 +536,35 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "triage_guidance:\n- none" in result
 
 
-def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engine):
+@pytest.mark.parametrize("projected", [2, None, 0], ids=["projected", "unknown", "none-projected"])
+def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engine, projected):
     """A persisted survival fit (#601, #603): within the 0.24.x line a rollback restores the pre-upgrade
-    lcm.db backup with the plugin; a rollback to v0.23.3 keeps lcm.db and needs native recovery on."""
+    lcm.db backup with the plugin while a projection may be persisted (projected_count > 0, or unknown on
+    an older record); with none projected a plugin-only rollback within 0.24.x is supported. A rollback to
+    v0.23.3 keeps lcm.db and needs native recovery on, in every case."""
     record = {"count": 2, "last_reason": "publication_invariant_conflict"}
+    if projected is not None:
+        record["projected_count"] = projected
     engine._store.write_metadata_json(["survival_fit:counter"], json.dumps(record, sort_keys=True))
 
     result = handle_lcm_command("doctor", engine)
 
     observation = next(line for line in result.splitlines() if "survival_fit: applied 2 time(s)" in line)
-    assert "within the 0.24.x line" in observation and "v0.23.3" in observation
     line = next(line for line in result.splitlines() if line.startswith("- survival_fit:") and " — " in line)
-    for phrase in ("within the 0.24.x line", "restore the lcm.db backup taken before the upgrade together with the plugin",
-                   "v0.23.3", "LCM_NATIVE_RECOVERY=true", "keep lcm.db", "never a backup restore"):
+    assert f"projected_count {projected if projected is not None else 'unknown'}" in observation
+    for text in (observation, line):
+        assert "within the 0.24.x line" in text and "v0.23.3" in text
+        assert "a rollback to an older plugin restores" not in text
+    for phrase in ("v0.23.3", "LCM_NATIVE_RECOVERY=true", "keep lcm.db", "never a backup restore"):
         assert phrase in line, phrase
-    assert "rows stored after that backup leave the LCM store" in line and "host session" in line
-    assert not any("a rollback to an older plugin restores" in text for text in (observation, line))
+    restore = "restore the lcm.db backup taken before the upgrade together with the plugin"
+    if projected == 0:
+        assert "plugin-only rollback within the 0.24.x line is supported for this store" in observation
+        assert "plugin-only rollback within the 0.24.x line is supported for this store" in line
+        assert restore not in line and "lcm.db backup" not in observation
+    else:
+        assert restore in line and "restores the pre-upgrade lcm.db backup" in observation
+        assert "rows stored after that backup leave the LCM store" in line and "host session" in line
 
 
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):

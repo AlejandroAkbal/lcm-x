@@ -1705,10 +1705,14 @@ def _doctor_text(engine) -> str:
         survival_fit = None
     survival_fit = survival_fit if isinstance(survival_fit, dict) else {}
     if int(survival_fit.get("count") or 0):
+        projected = survival_fit.get("projected_count")  # absent on a record from before the key: unknown
+        within = ("whole turns were dropped, nothing projected: a plugin-only rollback within the 0.24.x line is "
+                  "supported for this store" if projected == 0 else
+                  "rollback within the 0.24.x line restores the pre-upgrade lcm.db backup with the plugin")
         observations.append(f"survival_fit: applied {int(survival_fit['count'])} time(s); last reason "
-                            f"{survival_fit.get('last_reason') or '(unknown)'}; rollback within the 0.24.x line "
-                            "restores the pre-upgrade lcm.db backup with the plugin; a rollback to v0.23.3 keeps "
-                            "lcm.db and needs native recovery ON (see triage_guidance)")
+                            f"{survival_fit.get('last_reason') or '(unknown)'}; projected_count "
+                            f"{'unknown' if projected is None else projected}; {within}; a rollback to v0.23.3 "
+                            "keeps lcm.db and needs native recovery ON (see triage_guidance)")
         triage_checks.append({"check": "survival_fit", "status": "warn", "detail": survival_fit})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 

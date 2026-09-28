@@ -694,6 +694,26 @@ def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, ho
         cold.shutdown()
 
 
+@pytest.mark.parametrize("case", ["dropped-only", "projected", "old-record"])
+def test_rc2_survival_counter_records_projections(tmp_path, summaries, host_estimator, case):
+    """The doctor counter counts fits that projected a row (a persisted projection limits rollback, #601);
+    a record written before the key existed stays unknown (no key), never a false zero."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_user_view() if case == "projected" else _long_view()
+    try:
+        if case == "old-record":
+            engine._store.write_metadata_json(["survival_fit:counter"], json.dumps({"count": 1, "last_reason": "x"}))
+        engine.ingest(view)
+        _conflicted(engine)
+        engine.compress(view, current_tokens=host_estimator(view))
+        record = engine._store.read_metadata_json("survival_fit:counter")
+        expected = {"dropped-only": 0, "projected": 1, "old-record": None}[case]
+        assert record["count"] == (2 if case == "old-record" else 1)
+        assert record.get("projected_count") == expected and (expected is not None or "projected_count" not in record)
+    finally:
+        engine.shutdown()
+
+
 def _projection_of(engine, store_id) -> dict:
     """The view copy the survival fit makes of stored row ``store_id`` (its host stamp kept)."""
     row = engine._store.get(store_id)
