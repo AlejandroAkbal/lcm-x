@@ -230,7 +230,6 @@ def test_r3_r1_a_multi_form_row_leaves_the_single_form_row_its_occurrence(tmp_pa
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="#583: NULL-stamped row shown stamped below the cursor; fix in v0.24.5")
 @pytest.mark.parametrize("restart", [False, True], ids=["steady", "restart"])
 @pytest.mark.parametrize("text", ["foo", LONG], ids=["short", "long"])
 def test_r3f_a_null_stored_row_the_host_shows_stamped_is_reserved(tmp_path, text, restart):
@@ -247,5 +246,191 @@ def test_r3f_a_null_stored_row_the_host_shows_stamped_is_reserved(tmp_path, text
         expected = [("user", text)] * 2 + [("user", r["content"]), ("assistant", "reply to R+U")]
         assert _stored(_rows(engine)) == Counter(expected + [("user", text)] * restart)  # restart re-store: as above
         _assert_shown_row_is_no_constituent(engine, text)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("shown_alone", [1, 2], ids=["one-shown", "both-shown"])
+@pytest.mark.parametrize("text", ["foo", LONG], ids=["short", "long"])
+def test_r3f_two_null_rows_one_stamped_occurrence_reserves_the_first_in_store_order(tmp_path, text, shown_alone):
+    """#583 (a): stored U1@NULL, R@3, U2@NULL (same text); the host shows U alone ``shown_alone`` times, stamped,
+    and "R\\n\\nU"@3. One occurrence reserves U1 (store order) and the composite absorbs U2; a genuine second
+    occurrence reserves U2 too, so the composite's U is new and stored."""
+    engine = _engine(tmp_path)
+    try:
+        r = _u("[R] failed turn" + PAD, 3.0)
+        engine.ingest([_u(text, None), r, _u(text, None)])
+        u1, u2 = _ids(engine, text)
+        engine.ingest([_u(text, 1.0 + k) for k in range(shown_alone)]
+                      + [_u(r["content"] + "\n\n" + text, 3.0), _a("reply to R+U", 5.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert u1 not in members
+        assert (u2 in members) == (shown_alone == 1), members
+        assert _stored(_rows(engine))[("user", text)] == 2 + (shown_alone - 1)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("other", [False, True], ids=["alone", "other-stamped-row"])
+def test_r3f_a_null_row_shown_only_inside_a_composite_is_no_reservation(tmp_path, other):
+    """#583 (b): stored U@NULL, R@3; the host shows U only inside "R\\n\\nU"@3 (a stamped row of another text
+    left over does not reserve it): the composite still decomposes into R and U, nothing is stored again."""
+    engine = _engine(tmp_path)
+    try:
+        r, x = _u("[R] failed turn" + PAD, 3.0), _u("[X] other row" + PAD, 1.0)
+        engine.ingest([x, _u("foo", None), r] if other else [_u("foo", None), r])
+        [u] = _ids(engine, "foo")
+        engine.ingest([dict(x)] * other + [_u(r["content"] + "\n\n" + "foo", 3.0), _a("reply to R+U", 5.0)])
+        assert u in [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert _stored(_rows(engine))[("user", "foo")] == 1
+    finally:
+        engine.shutdown()
+
+
+P_TEXT, Q_TEXT = "[P] first part" + PAD, "[Q] second part" + PAD
+
+
+@pytest.mark.parametrize("text", [("P", "Q"), (P_TEXT, Q_TEXT)], ids=["short", "long"])
+def test_bid3_a_row_the_host_shows_under_its_recorded_alias_stamp_is_reserved(tmp_path, text):
+    """B-ID-3 (fresh host dicts each ingest, U = "P\\n\\nQ"): [P@10, U@20]; then [U@10, A@21, R@30] (R5 records
+    alt_stamp 10 on U's row, observed_at 20); then a NEW U merged into the failed R: [U@10, A@21, "R\\n\\nU"@30,
+    A@40]. U@10 reserves U's row through its alias: the composite's U is new and stored, never absorbed
+    into the old row (loss)."""
+    engine = _engine(tmp_path)
+    try:
+        u_text, r = "\n\n".join(text), _u("[R] failed turn" + PAD, 30.0)
+        engine.ingest([_u(text[0], 10.0), _u(u_text, 20.0)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r)])
+        [u] = _ids(engine, u_text)
+        assert [rel for rel in _relations(engine) if rel[1] == "alt_stamp"] == [(u, "alt_stamp", None, None)]
+        before, composite = max(int(row["store_id"]) for row in _rows(engine)), r["content"] + "\n\n" + u_text
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), _u(composite, 30.0), _a("reply to R+U", 40.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert u not in members
+        if members:  # R3: stored constituents (P, not shown on its own, may head it) plus a remainder stored anew
+            content = {int(row["store_id"]): row["content"] for row in _rows(engine)}
+            assert "\n\n".join(content[m] for m in members) == composite and max(members) > before, members
+        else:
+            stored = _stored(_rows(engine))
+            assert stored[("user", u_text)] == 2 or stored[("user", composite)] == 1, stored
+    finally:
+        engine.shutdown()
+
+
+def test_bid3_an_alias_reserves_only_its_own_row(tmp_path):
+    """B-ID-3 precision: U's first row carries alias 10; a second stored U@35 (LCM stored it before the host
+    folded it into R) has no alias. U@10 reserves the first row only; the composite still absorbs U@35."""
+    engine = _engine(tmp_path)
+    try:
+        u_text, r = "\n\n".join((P_TEXT, Q_TEXT)), _u("[R] failed turn" + PAD, 30.0)
+        engine.ingest([_u(P_TEXT, 10.0), _u(u_text, 20.0)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r), _u(u_text, 35.0)])
+        first, second = _ids(engine, u_text)
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), _u(r["content"] + "\n\n" + u_text, 30.0),
+                       _a("reply to R+U", 40.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert first not in members and second in members, members
+        assert _stored(_rows(engine))[("user", u_text)] == 2
+    finally:
+        engine.shutdown()
+
+
+
+def _r2_history(engine, variant):
+    """Stored U and R@30; the view then shows U alone at @10 (stored at 10, NULL, or -- U = "P\\n\\nQ" -- at 20
+    with the recorded R5 alias 10) and a NEW U merged into the failed R: ``(u_text, u_old, view, composite)``."""
+    r = _u("[R] failed turn" + PAD, 30.0)
+    if variant == "alias":
+        u_text = P_TEXT + "\n\n" + Q_TEXT
+        engine.ingest([_u(P_TEXT, 10.0), _u(u_text, 20.0)])
+        engine.ingest([_u(u_text, 10.0), _a("reply to U" + PAD, 21.0), dict(r)])
+        assert [rel for rel in _relations(engine) if rel[1] == "alt_stamp"]
+        head = [_u(u_text, 10.0), _a("reply to U" + PAD, 21.0)]
+    else:
+        u_text = "[U] please go on" + PAD
+        engine.ingest([_u(u_text, 10.0 if variant == "stamped" else None), dict(r)])
+        head = [_u(u_text, 10.0)]
+    [u_old] = _ids(engine, u_text)
+    composite = _u(r["content"] + "\n\n" + u_text, 30.0)
+    return u_text, u_old, [*head, composite, _a("reply to R+U", 40.0)], composite
+
+
+
+def _assert_new_occurrence_kept(engine, u_text, u_old, composite):
+    """U_new is stored: a second U (or the composite whole), or R3's held constituents -- never U_old -- plus a
+    remainder stored anew (the alias variant's U = "P\\n\\nQ" decomposes into R, P and a new Q)."""
+    stored = _stored(_rows(engine))
+    if stored[("user", u_text)] + stored[("user", composite)] >= 2:
+        return
+    content = {int(row["store_id"]): row["content"] for row in _rows(engine)}
+    groups: dict = {}
+    for head, kind, member, ordinal in _relations(engine):
+        if kind == "composite":
+            groups.setdefault(head, []).append((ordinal, member))
+    members = [[sid for _o, sid in sorted(group)] for group in groups.values()]
+    assert any("\n\n".join(content[m] for m in group) == composite and u_old not in group
+               and max(group) > u_old for group in members), (stored, members)
+
+@pytest.mark.parametrize("mapped", [True, False], ids=["mapped", "unmapped"])
+@pytest.mark.parametrize("variant", ["stamped", "null", "alias"])
+def test_r2_publication_never_composes_a_row_the_view_shows_on_its_own(tmp_path, variant, mapped):
+    """PR #590 r2 (codex sol-high item 6): the publication-side composition (form i) of the unmapped composite
+    "R\\n\\nU_new"@30 never takes U, the row the view shows on its own at @10 -- mapped by the live row, or
+    (unmapped) held by that occurrence under its stamp, NULL or alias key. Else the witness [R, U_old] makes the
+    next ingest replay the composite once R1 consumed U: U_new lost."""
+    engine = _engine(tmp_path)
+    try:
+        u_text, u_old, view, composite = _r2_history(engine, variant)
+        full_map = engine._get_store_id_map_for_messages(view)
+        if not mapped:
+            full_map = {key: sid for key, sid in full_map.items() if sid != u_old}
+        engine._identity_anchor_summary_input([composite], full_map, view=view)
+        assert u_old not in [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        engine.ingest([dict(m) for m in view])
+        _assert_new_occurrence_kept(engine, u_text, u_old, composite["content"])
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("variant", ["stamped", "null", "alias"])
+def test_r2_compress_before_ingest_keeps_the_new_occurrence(tmp_path, summaries, variant):  # noqa: F811
+    """The same history through compress() before any further ingest (its preflight ingest runs first, so the
+    ingest site's reservation records the witness [R, U_new]): the new occurrence is stored, claims stay in the
+    input."""
+    engine = _engine(tmp_path)
+    try:
+        u_text, u_old, view, composite = _r2_history(engine, variant)
+        live = [dict(m) for m in view] + _turns(10, 4, 600.0)
+        for _ in range(4):
+            live = engine.compress(live, force=True)
+            assert engine._last_compression_status != "error", engine._last_compression_noop_reason
+        assert u_old not in [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        engine.ingest([dict(m) for m in live] + [_u("[N] next" + PAD, 900.0)])
+        _assert_new_occurrence_kept(engine, u_text, u_old, composite["content"])
+        _assert_claims_are_in_the_input(engine, summaries)
+    finally:
+        engine.shutdown()
+
+
+def test_r2_a_null_row_is_reserved_when_a_multi_form_stamped_row_can_move(tmp_path):
+    """PR #590 thread PRRT_kwDOT3S3V86mov1Z, REAL forms (no monkeypatch): N "foo " stored NULL; S "foo "@5, which
+    the host rewrote in place to "foo" (edge whitespace: the override form), so S answers {"foo ", "foo"}. The
+    host shows "foo "@5, S "foo"@5 and a new "foo " merged into the failed R. S moves to "foo", N keeps "foo "@5:
+    the composite's "foo " is new and stored, never absorbed into N."""
+    engine = _engine(tmp_path)
+    try:
+        n, s, r = _u("foo ", None), _u("foo ", 5.0), _u("[R] failed turn" + PAD, 30.0)
+        engine.ingest([n])
+        engine.ingest([n, s])
+        s["content"] = "foo"  # the host rewrites S's own object in place
+        engine.ingest([n, s, r])
+        n_id, s_id = _ids(engine, "foo ")
+        assert {form[1] for form in engine._stored_row_forms(_rows(engine)[1])} == {"foo ", "foo"}
+        engine.ingest([_u("foo ", 5.0), dict(s), _u(r["content"] + "\n\nfoo ", 30.0), _a("reply to R+U", 40.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert n_id not in members and s_id not in members, members
+        stored = _stored(_rows(engine))
+        assert stored[("user", "foo ")] + stored[("user", r["content"] + "\n\nfoo ")] >= 3, stored
     finally:
         engine.shutdown()

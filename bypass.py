@@ -315,12 +315,14 @@ class BypassMixin:
                     continue
                 call_ids = _assistant_tool_call_ids([msg])
                 remove_indices = [idx]
-                remove_indices.extend(
-                    follow_idx
-                    for follow_idx in range(idx + 1, len(compacted))
-                    if compacted[follow_idx].get("role") == "tool"
-                    and str(compacted[follow_idx].get("tool_call_id") or "") in call_ids
-                )
+                follow_idx = idx + 1
+                while (
+                    follow_idx < len(compacted)
+                    and compacted[follow_idx].get("role") == "tool"
+                ):
+                    if str(compacted[follow_idx].get("tool_call_id") or "") in call_ids:
+                        remove_indices.append(follow_idx)
+                    follow_idx += 1
                 break
             if not remove_indices:
                 remove_index = 1
