@@ -25,7 +25,7 @@ uv run --no-project python bench/instruments/reliability/run_matrix.py \
   `plugins.enabled` entry and engine name are read from that tree (v0.23.x = `hermes-lcm`/`lcm`).
 - Per cell: `<out>/cells/<host>/<sha12>/<cell-slug>/` holds cell.json, transcript.jsonl, phase-*.json,
   probe logs, `db/` (sqlite backup-API copies) and verdict.json. `--keep-homes` keeps hermes-home.
-- `--keep-dbs fail` (default) drops the db/ copies of PASS cells (regenerable); `--lcm-env` overrides LCM_*
+- `--keep-dbs fail` (default) drops the db/ copies of PASS cells (regenerable), except a PASS that carries host-parity licences; `--lcm-env` overrides LCM_*
   on every cell and is recorded in run.json and MATRIX.md.
 - Output: `results.jsonl`, `MATRIX.md`, `ISSUE-MAP.md`. Re-render: `python report.py <out>`.
 - Standalone scoring: `python -m bench.instruments.reliability.scorers.cli --db <lcm.db> --gauntlet-run <dir>`

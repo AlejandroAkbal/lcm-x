@@ -165,7 +165,7 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     rec.update(phases=phases_run, wall_s=round(time.time() - started, 1), citations=citations)
     rec.update(verdict_fields(cell, d, last, fired, citations, backup_errors))
     (d / "verdict.json").write_text(json.dumps(rec, indent=1, default=str))
-    if keep_dbs == "fail" and rec["verdict"] == "PASS":  # a PASS cell's DBs are regenerable
+    if keep_dbs == "fail" and rec["verdict"] == "PASS" and not any(report.licensed(rec)):  # kept: licence evidence
         shutil.rmtree(d / "db", ignore_errors=True)
     if not keep:
         shutil.rmtree(home, ignore_errors=True)
