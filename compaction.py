@@ -84,7 +84,7 @@ class CompactionMixin:
             return True
         if self.threshold_tokens <= 0:
             return False
-        return tokens >= self.threshold_tokens and not self._sweep_budget_hold_active()
+        return tokens >= self.threshold_tokens and not self._sweep_budget_hold_applies(tokens)
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
@@ -195,7 +195,7 @@ class CompactionMixin:
             if (
                 self.threshold_tokens > 0
                 and max(rough, replay_rough) >= self.threshold_tokens
-                and self._sweep_budget_hold_active()
+                and self._sweep_budget_hold_applies(max(rough, replay_rough, self.last_prompt_tokens or 0))
             ):
                 return False
             if (
@@ -268,7 +268,7 @@ class CompactionMixin:
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
-            if self._sweep_budget_hold_active():
+            if self._sweep_budget_hold_applies(max(rough, self.last_prompt_tokens or 0)):
                 return False
             if self._config.native_recovery:
                 return self._mark_preflight_compression_requested(

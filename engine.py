@@ -1566,6 +1566,20 @@ class LCMEngine(
         self._sweep_budget_hold_until = 0.0
         return False
 
+    def _sweep_budget_hold_applies(self, tokens: Optional[int]) -> bool:
+        """#608: the hold never applies at or over the survival ceiling, whose fit only compress() runs."""
+        if not self._sweep_budget_hold_active():
+            return False
+        window = int(self.context_length or 0)
+        if window <= 0 or tokens is None:
+            return True
+        reserve = min(0.9, max(0.0, float(getattr(self._config, "survival_reserve", 0.15) or 0.0)))
+        ceiling = int(window * (1 - reserve))
+        if tokens >= ceiling:
+            logger.debug("LCM sweep budget hold not applied: %d tokens >= survival ceiling %d", tokens, ceiling)
+            return False
+        return True
+
     def _record_ingest_success(self) -> None:
         self._consecutive_ingest_failures = 0
 

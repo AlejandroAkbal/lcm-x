@@ -18,10 +18,10 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 - Fix: a compaction the host refused, or another agent's session end on the shared lifecycle row, no longer leaves the
   next compaction conflicting at frontier 0. (#594, #591)
 - Fix: a threshold sweep whose 120 s budget is spent stops instead of raising `TimeoutError` to the host (which some
-  Hermes versions treat as a stall and reset the session): the input list comes back unchanged with status `noop`
-  and stop reason `time_budget_exhausted`, and no summariser call starts with less than 15 s left. After a stop
-  before the first leaf, one WARNING names the step timings and the threshold answer is no for 10 minutes (overflow
-  recovery is not held). (#608)
+  Hermes versions treat as a stall and reset the session): the input list comes back unchanged with status `noop` and
+  stop reason `time_budget_exhausted`, and no summariser call starts with less than 15 s left. After a stop before the
+  first leaf, one WARNING names the step timings and the threshold answer is no for 10 minutes while the request is
+  below the survival ceiling (the window minus the survival reserve); overflow recovery is not held. (#608)
 
 ## v0.24.4 - 2026-09-28 (#436: message identity anchored on the host timestamp)
 

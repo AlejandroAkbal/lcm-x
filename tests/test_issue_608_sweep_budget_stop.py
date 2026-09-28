@@ -53,12 +53,12 @@ def summaries(monkeypatch):
     return calls
 
 
-def _engine(tmp_path, **config) -> LCMEngine:
+def _engine(tmp_path, context_length: int = 200_000, **config) -> LCMEngine:
     settings = {"fresh_tail_count": 2, "leaf_chunk_tokens": 400, "context_threshold": 0.001,
                 "threshold_full_sweep_enabled": True, "max_assembly_tokens": 100_000,
                 "database_path": str(tmp_path / "lcm.db"), **config}
     engine = LCMEngine(config=LCMConfig(**settings))
-    engine.on_session_start("S", platform="telegram", context_length=200_000, conversation_id="conv")
+    engine.on_session_start("S", platform="telegram", context_length=context_length, conversation_id="conv")
     return engine
 
 
@@ -72,8 +72,8 @@ def _view(turns: int = 6) -> list[dict]:
             *[row for i in range(turns) for row in _turn(f"T{i}", 10.0 * (i + 1))]]
 
 
-def _advance_on_call(monkeypatch, engine, name: str, clock: _Clock, seconds: float, *, call: int = 1):
-    """Wrap engine step ``name``: its ``call``-th invocation moves the sweep clock by ``seconds``."""
+def _advance_on_call(monkeypatch, engine, name: str, clock: _Clock, seconds: float, *, call: int | None = 1):
+    """Wrap engine step ``name``: its ``call``-th invocation (every one when None) moves the sweep clock."""
     original = getattr(engine, name)
     count = 0
 
@@ -81,7 +81,7 @@ def _advance_on_call(monkeypatch, engine, name: str, clock: _Clock, seconds: flo
         nonlocal count
         result = original(*args, **kwargs)
         count += 1
-        if count == call:
+        if call is None or count == call:
             clock.offset += seconds
         return result
 
@@ -345,5 +345,99 @@ def test_empty_anchor_slice_is_not_mapped_and_the_pass_result_is_the_same(tmp_pa
         assert [node.source_ids for node in nodes] == [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
         assert result[-2:] == view[-2:] and len(result) == 3
         assert 0 not in mapped
+    finally:
+        engine.shutdown()
+
+
+# -- 8. the hold never applies at or over the survival ceiling ------------------------------------------------
+
+def _hold(engine) -> None:
+    engine._sweep_budget_hold_until = time.time() + 600.0
+
+
+def test_hold_ends_at_the_survival_ceiling_in_should_compress(tmp_path):
+    """A1: window 100,000 and reserve 0.15 make the ceiling 85,000."""
+    engine = _engine(tmp_path, context_length=100_000, max_assembly_tokens=0)
+    try:
+        _hold(engine)
+        assert engine.should_compress(84_999) is False
+        assert engine.should_compress(85_000) is True
+    finally:
+        engine.shutdown()
+
+
+def test_hold_ends_at_the_ceiling_by_the_last_prompt_size_in_preflight_without_a_replay_diff(tmp_path):
+    """A2: the listed messages are far below the ceiling; the host's last prompt decides."""
+    engine = _engine(tmp_path, context_length=100_000, max_assembly_tokens=0)
+    view = _view()
+    try:
+        engine.ingest(view)
+        _hold(engine)
+        engine.last_prompt_tokens = 1_000
+        assert engine.should_compress_preflight(view) is False
+        engine.last_prompt_tokens = 85_000
+        assert engine.should_compress_preflight(view) is True
+    finally:
+        engine.shutdown()
+
+
+def test_hold_ends_at_the_ceiling_by_the_last_prompt_size_in_preflight_with_a_replay_diff(tmp_path, monkeypatch):
+    """A3: the replay differs from the host list (not a cleanup the host must adopt)."""
+    engine = _engine(tmp_path, context_length=100_000, max_assembly_tokens=0)
+    view = _view()
+    replay_diffs = []
+    original = engine._ingest_messages
+
+    def ingest_with_a_diff(messages):
+        replay = [dict(message) for message in original(messages)]
+        replay[1]["content"] += " (replayed)"
+        replay_diffs.append(1)
+        return replay
+
+    monkeypatch.setattr(engine, "_ingest_messages", ingest_with_a_diff)
+    try:
+        _hold(engine)
+        engine.last_prompt_tokens = 1_000
+        assert engine.should_compress_preflight(view) is False
+        engine.last_prompt_tokens = 85_000
+        assert engine.should_compress_preflight(view) is True
+        assert replay_diffs == [1, 1]
+    finally:
+        engine.shutdown()
+
+
+def test_hold_applies_at_any_size_when_no_window_is_known(tmp_path):
+    """A4: context_length 0 has no ceiling: today's hold."""
+    engine = _engine(tmp_path, context_length=0, max_assembly_tokens=0)
+    try:
+        engine.context_length = 0
+        engine.threshold_tokens = 200
+        _hold(engine)
+        assert engine.should_compress(10_000_000) is False
+    finally:
+        engine.shutdown()
+
+
+def test_a_list_over_the_survival_budget_is_fitted_during_a_hold(tmp_path, summaries, clock, monkeypatch, caplog):
+    """A5: every sweep spends its budget in its first map. After the first no-leaf stop, a list over the
+    survival budget is still asked for and fitted: status noop, no raise, the result at or under budget."""
+    engine = _engine(tmp_path, context_length=6_000)
+    _advance_on_call(monkeypatch, engine, "_get_store_id_map_for_messages", clock, 121.0, call=None)
+    small, large = _view(4), _view(40)
+    budget = int(6_000 * (1 - 0.15))
+    try:
+        engine.ingest(small)
+        engine.compress(small, current_tokens=engine.threshold_tokens + 1)
+        assert engine._sweep_budget_hold_active() and engine._last_compression_noop_reason.startswith(
+            "threshold sweep time budget spent")
+        engine.ingest(large)
+        tokens = engine._survival_measure(large)
+        assert tokens > budget
+        assert engine.should_compress(tokens) is True
+        result = engine.compress(large, current_tokens=tokens)
+        assert engine._last_compression_status == "noop"
+        assert engine.get_status()["threshold_full_sweep"]["stop_reason"] == "time_budget_exhausted"
+        assert result is not large and engine._survival_measure(result) <= budget
+        assert summaries == []
     finally:
         engine.shutdown()
