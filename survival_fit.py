@@ -59,6 +59,10 @@ def _carries_survival_notice(raw: Any, text: str) -> bool:
     return "\n\n[LCM survival fit: " in text
 
 
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _host_estimate(messages) -> Optional[int]:
     """The host's own request estimator (Hermes agent.model_metadata), when the host provides one."""
     try:
@@ -79,10 +83,12 @@ class SurvivalFitMixin:
         counted = count_messages_tokens(messages)
         return counted if host is None else max(host, counted)
 
-    def _survival_fit_budget(self, messages, observed_tokens) -> Optional[int]:
+    def _survival_fit_budget(self, messages, observed_tokens, window_cap: Optional[int] = None) -> Optional[int]:
         window = int(getattr(self, "context_length", 0) or 0)
         if window <= 0 or not getattr(self._config, "survival_fit", True):
             return None
+        if _positive_int(window_cap):  # #608: the size of a request the provider rejected
+            window = min(window, window_cap)
         reserve = min(0.9, max(0.0, float(getattr(self._config, "survival_reserve", 0.15) or 0.0)))
         counted = _host_estimate(messages)
         counted = count_messages_tokens(messages) if counted is None else counted
@@ -90,15 +96,29 @@ class SurvivalFitMixin:
         overhead = min(window // 2, max(0, int(observed_tokens or 0) - counted))
         return max(1, int(window * (1 - reserve)) - overhead)
 
+    def _survival_fit_rejected(self, messages, result, observed_tokens, reason: str, *,
+                               after_exception: bool = False):
+        """#608: a recovery attempt for a request the provider rejected comes back shorter by the host's
+        score (fewer messages, or under 95% of the input's measure): the fit runs again with the window
+        capped at the rejected request's size (``observed_tokens``, else the input's measure)."""
+        before = self._survival_measure(messages)
+        if not isinstance(result, list) or len(result) < len(messages) or \
+                self._survival_measure(result) < 0.95 * before:
+            return result
+        return self._survival_fit(messages, result, observed_tokens, reason=f"provider_overflow:{reason}",
+                                  after_exception=after_exception,
+                                  window_cap=observed_tokens if _positive_int(observed_tokens) else before)
+
     def _survival_generated(self, message) -> bool:
         """LCM's own regenerated context (summaries, carriers): derived from stored rows, never a row."""
         return (self._is_replayed_context_scaffold_message(message)
                 or self._generated_context_carrier_remainder(message) is not None
                 or self._is_context_summary_content(message.get("content")))  # a host summary of stored rows
 
-    def _survival_fit(self, messages, result, observed_tokens, reason: str, *, after_exception: bool = False):
+    def _survival_fit(self, messages, result, observed_tokens, reason: str, *, after_exception: bool = False,
+                      window_cap: Optional[int] = None):
         """``result``, or the fitted list when ``result`` is over the survival budget."""
-        budget = self._survival_fit_budget(messages, observed_tokens)
+        budget = self._survival_fit_budget(messages, observed_tokens, window_cap)
         if budget is None or not isinstance(result, list) or not result or not self._session_id or \
                 self._bypasses_lcm_context_management():
             return result

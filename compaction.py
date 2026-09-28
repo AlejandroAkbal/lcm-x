@@ -543,8 +543,10 @@ class CompactionMixin:
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
-                 force: bool = False) -> List[Dict[str, Any]]:
-        """Run compaction and leave a terminal public status on every failure."""
+                 force: bool = False,
+                 bypass_cooldown: bool = False) -> List[Dict[str, Any]]:
+        """Run compaction and leave a terminal public status on every failure. ``bypass_cooldown`` is the
+        host's mark of a recovery attempt for a request the provider rejected (#608)."""
         try:
             self._pending_emission_candidates = []
             self._compress_occurrences = None
@@ -569,8 +571,10 @@ class CompactionMixin:
                 )
             ):
                 result = messages
-            result = self._survival_fit(messages, result, current_tokens, reason=self._survival_fit_reason
-                                        or str(self._last_compression_status or "unknown"))
+            reason = self._survival_fit_reason or str(self._last_compression_status or "unknown")
+            result = self._survival_fit(messages, result, current_tokens, reason=reason)
+            if bypass_cooldown:
+                result = self._survival_fit_rejected(messages, result, current_tokens, reason)
             self._record_compress_commit_proof(messages, result)
             logger.debug("LCM compaction emission descriptor count=%d",
                          len((self._compress_commit_proof or {}).get("emissions") or ()))
@@ -587,8 +591,12 @@ class CompactionMixin:
             if isinstance(exc, Exception):  # #582: an over-window list survives the failure, fitted
                 try:
                     self._store.rollback_pending_write()
-                    fitted = self._survival_fit(messages, messages, current_tokens,
-                                                reason=f"exception:{type(exc).__name__}", after_exception=True)
+                    reason = f"exception:{type(exc).__name__}"
+                    fitted = self._survival_fit(messages, messages, current_tokens, reason=reason,
+                                                after_exception=True)
+                    if bypass_cooldown:
+                        fitted = self._survival_fit_rejected(messages, fitted, current_tokens, reason,
+                                                             after_exception=True)
                 except Exception:
                     logger.debug("LCM survival fit after a compress exception failed", exc_info=True)
                     fitted = messages

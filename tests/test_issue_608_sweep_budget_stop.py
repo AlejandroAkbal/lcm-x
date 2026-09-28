@@ -6,6 +6,7 @@ that a wrapped engine step advances."""
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 
@@ -439,5 +440,149 @@ def test_a_list_over_the_survival_budget_is_fitted_during_a_hold(tmp_path, summa
         assert engine.get_status()["threshold_full_sweep"]["stop_reason"] == "time_budget_exhausted"
         assert result is not large and engine._survival_measure(result) <= budget
         assert summaries == []
+    finally:
+        engine.shutdown()
+
+
+# -- 9. a request the provider rejected comes back shorter ----------------------------------------------------
+
+def _rejected_state(tmp_path, monkeypatch, clock, *, spend=True):
+    """Window 6,000 (ceiling 5,100); every sweep spends its budget in its first map when ``spend``."""
+    engine = _engine(tmp_path, context_length=6_000)
+    if spend:
+        _advance_on_call(monkeypatch, engine, "_get_store_id_map_for_messages", clock, 121.0, call=None)
+    view = _view(8)
+    engine.ingest(view)
+    return engine, view
+
+
+def _shorter_by_host_score(engine, result, messages) -> bool:
+    return len(result) < len(messages) or engine._survival_measure(result) < 0.95 * engine._survival_measure(messages)
+
+
+def _fit_spy(monkeypatch, engine) -> list:
+    caps = []
+    original = engine._survival_fit
+
+    def spy(*args, window_cap=None, **kwargs):
+        caps.append(window_cap)
+        return original(*args, window_cap=window_cap, **kwargs)
+
+    monkeypatch.setattr(engine, "_survival_fit", spy)
+    return caps
+
+
+def test_rejected_request_after_a_no_leaf_stop_comes_back_shorter(tmp_path, summaries, clock, monkeypatch):
+    """C1: below the ceiling, recovery attempt, the request estimate as current_tokens: a shorter list whose
+    dropped rows are all stored, the fit named provider_overflow, no error."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock)
+    request = engine._survival_measure(view) + 1_000  # the host adds its system prompt and tools
+    assert request < int(6_000 * 0.85)
+    try:
+        result = engine.compress(view, current_tokens=request, bypass_cooldown=True)
+        assert _shorter_by_host_score(engine, result, view) and summaries == []
+        stored = {(r["role"], r["content"]) for r in engine._store.get_session_messages("S", limit=100_000)}
+        kept = {(m["role"], m["content"]) for m in result}
+        assert all((m["role"], m["content"]) in stored for m in view[1:] if (m["role"], m["content"]) not in kept)
+        assert engine._last_survival_fit["reason"].startswith("provider_overflow:")
+        assert engine._last_compression_status == "noop"
+    finally:
+        engine.shutdown()
+
+
+def test_same_state_without_a_recovery_attempt_returns_the_identical_list(tmp_path, summaries, clock, monkeypatch):
+    """C2: bypass_cooldown False (turn start, threshold): the identical list, no fit."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock)
+    try:
+        result = engine.compress(view, current_tokens=engine._survival_measure(view) + 1_000, bypass_cooldown=False)
+        assert result is view and engine._last_survival_fit is None
+    finally:
+        engine.shutdown()
+
+
+def test_a_recovery_attempt_that_shortens_the_list_runs_no_capped_fit(tmp_path, summaries, clock, monkeypatch):
+    """C3: a sweep stores leaves and the list is shorter: the fit is not called with a window cap."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock, spend=False)
+    caps = _fit_spy(monkeypatch, engine)
+    try:
+        result = engine.compress(view, current_tokens=engine._survival_measure(view) + 1_000, bypass_cooldown=True)
+        assert engine._last_compression_status == "compacted" and summaries
+        assert _shorter_by_host_score(engine, result, view)
+        assert caps and all(cap is None for cap in caps)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("current_tokens", [None, 0])
+def test_without_a_request_size_the_cap_is_the_measure_of_the_list(tmp_path, summaries, clock, monkeypatch,
+                                                                   current_tokens):
+    """C4: no positive current_tokens: the cap is the measure of the list."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock)
+    caps = _fit_spy(monkeypatch, engine)
+    try:
+        result = engine.compress(view, current_tokens=current_tokens, bypass_cooldown=True)
+        assert caps == [None, engine._survival_measure(view)]
+        assert _shorter_by_host_score(engine, result, view)
+    finally:
+        engine.shutdown()
+
+
+def test_the_next_ingest_after_a_capped_fit_stores_only_the_new_turn(tmp_path, summaries, clock, monkeypatch):
+    """C5: the fitted list plus one new turn: the new turn is stored once, no old row again."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock)
+
+    def rows():
+        return sorted((r["role"], r["content"]) for r in engine._store.get_session_messages("S", limit=100_000))
+    try:
+        result = engine.compress(view, current_tokens=engine._survival_measure(view) + 1_000, bypass_cooldown=True)
+        assert len(result) < len(view)
+        before = rows()
+        new = _turn("N1", 999.0)
+        engine.ingest(result + new)
+        after = rows()
+        added = list(after)
+        for row in before:
+            added.remove(row)
+        assert sorted(added) == sorted((m["role"], m["content"]) for m in new)
+    finally:
+        engine.shutdown()
+
+
+def test_the_except_path_of_a_recovery_attempt_returns_the_capped_fit(tmp_path, clock, monkeypatch):
+    """C6: _compress_impl raises; recovery attempt; list below the ceiling: the fitted list, no raise."""
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock, spend=False)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected (ids only)")
+
+    monkeypatch.setattr(engine, "_compress_impl", boom)
+    try:
+        result = engine.compress(view, current_tokens=engine._survival_measure(view) + 1_000, bypass_cooldown=True)
+        assert _shorter_by_host_score(engine, result, view)
+        assert engine._last_survival_fit["reason"] == "provider_overflow:exception:RuntimeError"
+        assert engine._last_compression_status == "error"
+    finally:
+        engine.shutdown()
+
+
+def test_compress_accepts_the_host_recovery_keyword(tmp_path):
+    """C7 (in-process half): the host passes bypass_cooldown only when compress() names it."""
+    engine = _engine(tmp_path)
+    try:
+        assert "bypass_cooldown" in inspect.signature(engine.compress).parameters
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(("observed", "expected"), [(None, 5100), (1432 + 500, 4600), (100_000, 2100)])
+def test_survival_budget_without_a_cap_is_unchanged(tmp_path, observed, expected):
+    """C8: window_cap=None gives the numbers pinned at c1312f3c (window 6,000, reserve 0.15, 1,432 tokens)."""
+    engine = _engine(tmp_path, context_length=6_000)
+    view = [{"role": "system", "content": "system prompt"}] + [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"[{i}]{PAD}"} for i in range(8)]
+    try:
+        assert lcm_engine.count_messages_tokens(view) == 1432
+        assert engine._survival_fit_budget(view, observed, window_cap=None) == expected
+        assert engine._survival_fit_budget(view, observed) == expected
     finally:
         engine.shutdown()
