@@ -72,6 +72,7 @@ LOG_COUNTS = {
     "resident_engine_conflict": "resident_engine_conflict",
     "skipped_ingest_resident_conflict": "skipped ingest: stable engine use ended with resident_engine_conflict",
     "recorded_replaced": "LCM recorded host-replaced rows",
+    "survival_fit": "LCM survival fit applied",
 }
 FILLER = "alpha beta gamma delta "
 

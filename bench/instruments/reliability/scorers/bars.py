@@ -1,4 +1,4 @@
-"""Bars B1-B7 over one finished cell: its DB copy (db/lcm.db), transcript.jsonl and phase-*.json.
+"""Bars B1-B8 over one finished cell: its DB copy (db/lcm.db), transcript.jsonl and phase-*.json.
 
 The expected transcript is what the host HELD for each attempt (the probe records the user row the host
 kept after its persist override and consecutive-user merge), so the bars compare LCM's store with the
@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import chronology, host_parity, multiset, summary, tool_calls, tool_groups
 
-ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8")
 
 
 def load(cell_dir: Path):
@@ -227,6 +227,10 @@ def score(cell: dict, cell_dir: Path) -> dict:
     numbers["B3"] = {"publication_invariant_conflict": conflicts}
     if conflicts:
         failed["B3"] = numbers["B3"]
+    fits = sum(p.get("log_counts", {}).get("survival_fit", 0) for p in phases)  # #582: a fit is a compaction miss
+    numbers["B8"] = {"survival_fit": fits}
+    if fits:
+        failed["B8"] = numbers["B8"]
     failed_turns = [t for p in phases for t in p.get("counters", {}).get("failed", [])]
     final = next((p["final_check"] for p in reversed(phases) if "final_check" in p), None)
     numbers["B4"] = {"failed_turns": failed_turns, "final_check": final}

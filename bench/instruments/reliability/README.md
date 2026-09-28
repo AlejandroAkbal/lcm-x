@@ -74,6 +74,9 @@ the host reported `interrupted`. Any other assistant row is surplus.
   under `numbers.B1`/`numbers.B2` (count + up to 10 records: LCM store ids, host row ids, content sha256, tags), the
   MATRIX `host-dup` column and "PASS with host-parity licences" section, and the ISSUE-MAP licence list.
 - **B3** zero `publication_invariant_conflict` log lines across phases.
+- **B8** zero `LCM survival fit applied` log lines across phases (#582): a survival fit keeps an over-window
+  session alive, so on a normal cell it marks a compaction that did not bring the list under the window.
+  Like B3, it does not apply to the injected publication-failure cells.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
   (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
   re-invoked once after a cleanup-only `sanitized`) does not end in error, conflict or exception; an

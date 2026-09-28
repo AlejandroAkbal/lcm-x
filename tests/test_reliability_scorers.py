@@ -102,7 +102,7 @@ def clean_events(n=3):
 def test_clean_cell_passes_every_bar(tmp_path):
     out = make(tmp_path, rows=clean_rows(), events=clean_events())
     assert out["verdict"] == "PASS", out["failed_bars"]
-    assert out["applicable_bars"] == ["B1", "B2", "B3", "B4", "B5"]
+    assert out["applicable_bars"] == ["B1", "B2", "B3", "B4", "B5", "B8"]
 
 
 def test_b1_b2_duplicate_user_row_fails(tmp_path):
@@ -142,6 +142,19 @@ def test_b3_b4(tmp_path):
     cleanup_only = {"outcome": "inconclusive", "engine_status": "sanitized", "attempts": [{}, {}], "entry": "x"}
     unsure = make(tmp_path / "i", rows=clean_rows(), events=clean_events(), phase={"final_check": cleanup_only})
     assert unsure["verdict"] == "INCONCLUSIVE" and unsure["failed_bars"] == {} and set(unsure["inconclusive_bars"]) == {"B4"}
+
+
+def test_b8_survival_fit_is_a_normal_cell_failure_and_not_scored_on_injected_failure_cells(tmp_path):
+    """#582: B8 counts `LCM survival fit applied` like B3; a cell that lists its own bars (the
+    publication-failure cells) does not score it."""
+    fit = {"log_counts": {"survival_fit": 1}}
+    out = make(tmp_path, rows=clean_rows(), events=clean_events(), phase=fit)
+    assert out["verdict"] == "FAIL" and out["failed_bars"] == {"B8": {"survival_fit": 1}}
+    assert report.signature(out) == "B8 survival_fits=1"
+    injected = make(tmp_path / "i", rows=clean_rows(), events=clean_events(), phase=fit, bars=["B1", "B2", "B4"])
+    assert injected["verdict"] == "PASS" and "B8" not in injected["applicable_bars"]
+    clean = make(tmp_path / "c", rows=clean_rows(), events=clean_events())
+    assert clean["verdict"] == "PASS" and clean["numbers"]["B8"] == {"survival_fit": 0}
 
 
 def test_compact_transcript_fields_mean_held_equals_persist(tmp_path):

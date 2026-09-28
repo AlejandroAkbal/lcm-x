@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 
-BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8")
 TRANSPORTS = ("acp", "gateway")
 FAULTS = {"crash_after_compaction_before_reply", "clean_exit_before_turn", "crash_mid_tool_call",
           "crash_after_rotation_before_child_row", "crash_between_session_end_and_start", "cancel_then_retry",
