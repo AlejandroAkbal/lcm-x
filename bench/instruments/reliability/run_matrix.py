@@ -97,18 +97,27 @@ def unfired_reason(cell: dict, fired: set, citations: dict) -> str | None:
     return f"fault trigger(s) {missing} never fired at this host sha"
 
 
-def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
-             keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None) -> dict:
+def with_lcm_env(cell: dict, plugin: dict, lcm_env: dict | None) -> dict:
     if lcm_env:  # a global override wins over the cell's tuning and is part of the cell record
         cell = {**cell, "lcm_env": {**cell["lcm_env"], **lcm_env}, "global_lcm_env": lcm_env}
         if "LCM_NATIVE_RECOVERY" in lcm_env:  # decided by the plugin's own parser at this ref, not "== true"
             cell["native_recovery"], cell["native_recovery_parser"] = plugin_tree.parse_bool(
                 Path(plugin["tree"]), "LCM_NATIVE_RECOVERY", lcm_env["LCM_NATIVE_RECOVERY"])
-    d = out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"])
+    return cell
+
+
+def checked_cell_dir(out: Path, d: Path) -> Path:
     if (out / "cells").is_symlink():
         raise ValueError(f"{out / 'cells'} is a symlink; refused")
     if (out / "cells").resolve() not in d.resolve().parents or out.resolve() not in d.resolve().parents:
         raise ValueError(f"cell dir {d} is not under {out / 'cells'}")
+    return d
+
+
+def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, timeout: int, keep: bool,
+             keep_dbs: str = "fail", lcm_env: dict | None = None, identity: dict | None = None) -> dict:
+    cell = with_lcm_env(cell, plugin, lcm_env)
+    d = checked_cell_dir(out, out / "cells" / host_name / plugin["sha"][:12] / slug(cell["id"]))
     if d.exists():
         shutil.rmtree(d)
     home = d / "hermes-home"
@@ -119,7 +128,7 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     (home / "config.yaml").write_text(config_yaml(cell, plugin))
     (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name, "host_src": host["src"],
                                              "host_python": host["python"]}, indent=1))
-    env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
+    env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(d / "pycache"),
            "OPENROUTER_API_KEY": "test-key", "TMPDIR": str(d / "home"),
            **cell["lcm_env"], "LCM_NATIVE_RECOVERY": "true" if cell["native_recovery"] else "false"}
     rec = {"cell": cell["id"], "host": host_name, "host_sha": host["sha"], "plugin_ref": plugin["ref"],
@@ -192,6 +201,9 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-dbs", choices=("fail", "all"), default="fail", help="keep db/ copies of non-PASS cells, or all")
     ap.add_argument("--lcm-env", action="append", default=[], metavar="KEY=VAL",
                     help="LCM_* override applied to every cell (repeatable)")
+    ap.add_argument("--transport", choices=("acp-process", "gateway-process", "api-server"),
+                    help="R2: run the cells through a real host process (process_cell.py); default: R1 in-process")
+    ap.add_argument("--turn-timeout", type=float, default=300.0, help="R2: per ACP request timeout, seconds")
     a = ap.parse_args(argv)
     if a.control:
         ctl = CT.CONTROLS[a.control]
@@ -214,17 +226,24 @@ def main(argv=None) -> int:
             identities[name] = H.verify(name, host)
         except (ValueError, OSError) as exc:
             identities[name] = {"error": str(exc)}
-    selected = C.select(a.cells)
-    plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins") for ref in a.plugin_ref.split(",")]
+    if a.transport:  # R2 (process_cell.py); without --transport the R1 in-process path is unchanged
+        from bench.instruments.reliability import process_cell
+    selected = C.select(a.cells, extra=process_cell.R2_CELLS if a.transport else ())
+    plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins", out) for ref in a.plugin_ref.split(",")]
     if len({p["sha"] for p in plugins}) < len(plugins):
         ap.error(f"--plugin-ref values resolve to the same commit: {[(p['ref'], p['sha'][:12]) for p in plugins]}")
     out.mkdir(parents=True, exist_ok=True)
     (out / "run.json").write_text(json.dumps({"argv": sys.argv, "hosts": hosts, "plugins": plugins, "lcm_env": lcm_env,
-                                              "host_identity": identities, "cells": [c["id"] for c in selected]}, indent=1))
+                                              "host_identity": identities, "cells": [c["id"] for c in selected],
+                                              **({"transport": a.transport} if a.transport else {})}, indent=1))
     jobs = [(c, h, hosts[h], p) for p in plugins for h in hosts for c in selected]
+    runner = run_cell
+    if a.transport:
+        from functools import partial
+        runner = partial(process_cell.run_cell_process, transport=a.transport, turn_timeout=a.turn_timeout)
     started, results = time.time(), []
     with ThreadPoolExecutor(max_workers=a.jobs) as pool, open(out / "results.jsonl", "w") as sink:
-        futures = {pool.submit(run_cell, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env,
+        futures = {pool.submit(runner, c, h, hd, p, out, a.timeout, a.keep_homes, a.keep_dbs, lcm_env,
                                identities[h]): (c, h, p) for c, h, hd, p in jobs}
         for fut in as_completed(futures):
             try:
@@ -233,6 +252,7 @@ def main(argv=None) -> int:
                 c, h, p = futures[fut]
                 rec = {"cell": c["id"], "host": h, "host_sha": hosts[h]["sha"], "plugin_ref": p["ref"],
                        "plugin_sha": p["sha"], "targets": c["targets"], "verdict": "ERROR",
+                       **({"transport": a.transport} if a.transport else {}),
                        "reason": f"harness job failed: {exc!r}"[:500]}
             results.append(rec)
             sink.write(json.dumps(rec, default=str) + "\n")

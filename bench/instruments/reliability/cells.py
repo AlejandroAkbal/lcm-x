@@ -147,8 +147,8 @@ def validate(c: dict) -> None:
         assert g["turns"] == "restart" or all(1 <= t <= c["turns"] for t in g["turns"]), c["id"]
 
 
-def select(patterns: str) -> list[dict]:
-    cells = registry()
+def select(patterns: str, extra=()) -> list[dict]:
+    cells = registry() + list(extra)  # extra: transport-only cells (R2 process_cell.R2_CELLS)
     for c in cells:
         validate(c)
     if patterns.strip() == "all":

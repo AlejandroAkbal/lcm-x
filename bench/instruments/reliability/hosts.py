@@ -76,9 +76,24 @@ def write_manifest(src: Path, sha: str, git_repo: Path) -> dict:
     return record
 
 
+def sourceless_pyc(src: Path) -> list[str]:
+    """Byte-code that could run instead of the verified source: a ``.pyc`` outside ``__pycache__``, or one whose
+    ``.py`` is missing. (Host processes run with PYTHONPYCACHEPREFIX, so in-tree ``__pycache__`` is never read.)"""
+    bad = []
+    for dirpath, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+        for f in files:
+            here = Path(dirpath)
+            if f.endswith(".pyc") and not (here.name == "__pycache__" and (here.parent / (f.split(".")[0] + ".py")).exists()):
+                bad.append(str((here / f).relative_to(src)))
+    return bad
+
+
 def verify(name: str, host: dict) -> dict:
     """Prove the tree at ``src`` IS the configured sha; raise otherwise."""
     src, sha = Path(host["src"]), host["sha"]
+    if bad := sourceless_pyc(src):
+        raise ValueError(f"host {name}: sourceless byte-code under {src}: {bad[:5]}")
     if (src / ".git").exists():
         def git(*args):  # every git command must succeed, or the tree is not verified
             done = subprocess.run(["git", "-C", str(src), *args], capture_output=True, text=True)

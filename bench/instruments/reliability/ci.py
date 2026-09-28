@@ -1,0 +1,79 @@
+"""Nightly CI helpers for .github/workflows/reliability-nightly.yml: host prep from hosts.ci.json, and the gate.
+
+    python -m bench.instruments.reliability.ci prep --host eva-0.21.5 --root "$RUNNER_TEMP/hosts" --out hosts.json
+    python -m bench.instruments.reliability.ci gate r1/results.jsonl r2/results.jsonl --open-issues open-issues.txt
+
+The gate fails on any ERROR, and on a FAIL in the G-REL-1 cell set unless the cell targets an open issue.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+CI_HOSTS = Path(__file__).with_name("hosts.ci.json")
+# G-REL-1 item 3 cell families; "crash-" covers every crash cell, gateway-second-restart the restart cells.
+G_REL_1 = ("baseline", "acp-trailing", "preflight-continue", "repeat-identical-replies", "long-80", "window-1m",
+           "pressure-disagreement", "lcm-tool-mid-turn", "parallel-tool-group", "crash-", "gateway-second-restart",
+           "cancel-retry", "publication-failure")
+
+
+def in_gate_set(cell_id: str) -> bool:
+    family = cell_id.split("/")[0]
+    return any(family == g or (g.endswith("-") and family.startswith(g)) for g in G_REL_1)
+
+
+def gate(results: list[dict], open_issues: set[int]) -> list[str]:
+    problems = []
+    for r in results:
+        where = f"{r['verdict']} {r['host']} {r['cell']} ({r.get('transport', 'in-process')})"
+        if r["verdict"] == "ERROR":
+            problems.append(f"{where}: {str(r.get('reason', ''))[:200]}")
+        elif r["verdict"] == "FAIL" and in_gate_set(r["cell"]) and not set(r.get("targets") or []) & open_issues:
+            problems.append(f"{where}: G-REL-1 cell fails and targets no open issue (targets {r.get('targets')})")
+    return problems
+
+
+def prep(name: str, root: Path, out: Path) -> dict:
+    """Clone the pinned sha (the harness verifies git HEAD and cites the source) and install it editable."""
+    spec = json.loads(CI_HOSTS.read_text())["hosts"][name]
+    src, venv = root / name / "src", root / name / "venv"  # the venv stays outside the verified tree
+    for cmd in (["git", "init", "-q", str(src)],
+                ["git", "-C", str(src), "fetch", "-q", "--depth", "1", f"https://github.com/{spec['repo']}.git", spec["sha"]],
+                ["git", "-C", str(src), "checkout", "-q", "--detach", "FETCH_HEAD"],
+                ["uv", "venv", "-q", "--python", spec["python_version"], str(venv)],
+                ["uv", "pip", "install", "-q", "-p", str(venv / "bin" / "python"), "-e", f"{src}[{spec['extras']}]", *spec["pins"]]):
+        subprocess.run(cmd, check=True)
+    hosts = {"hosts": {name: {"python": str(venv / "bin" / "python"), "src": str(src), "sha": spec["sha"],
+                              "hermes_version": spec["hermes_version"]}}}
+    out.write_text(json.dumps(hosts, indent=1) + "\n")
+    return hosts
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prep")
+    p.add_argument("--host", required=True)
+    p.add_argument("--root", required=True)
+    p.add_argument("--out", required=True)
+    g = sub.add_parser("gate")
+    g.add_argument("results", nargs="+")
+    g.add_argument("--open-issues", required=True, help="file with one open issue number per line")
+    a = ap.parse_args(argv)
+    if a.cmd == "prep":
+        prep(a.host, Path(a.root).resolve(), Path(a.out))
+        return 0
+    results = [json.loads(line) for f in a.results for line in Path(f).read_text().splitlines() if line.strip()]
+    open_issues = {int(n) for n in Path(a.open_issues).read_text().split()}
+    problems = gate(results, open_issues)
+    for line in problems:
+        print(f"GATE: {line}")
+    print(f"GATE {'FAILS' if problems else 'PASSES'}: {len(results)} cells, {len(problems)} gating")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

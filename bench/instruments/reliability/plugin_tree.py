@@ -39,7 +39,12 @@ def identity(tree: Path) -> dict:
     return {"dir": name, "enabled": name, "engine": engine, "module": "hermes_plugins." + name.replace("-", "_")}
 
 
-def export(repo: Path, ref: str, plugins_root: Path) -> dict:
+def export(repo: Path, ref: str, plugins_root: Path, out: Path | None = None) -> dict:
+    """``out`` (the run's output dir): the plugins root must be a plain dir resolving under it, checked before any
+    cache deletion or marker write; default: the plugins root's own parent."""
+    out = Path(out) if out is not None else plugins_root.parent
+    if plugins_root.is_symlink() or out.resolve() not in plugins_root.resolve().parents:
+        raise ValueError(f"plugins root {plugins_root} is a symlink or does not resolve under {out}; refused")
     sha = resolve(repo, ref)
     dest, marker = plugins_root / sha[:12], plugins_root / f"{sha[:12]}.export.json"
     try:  # reuse a cached export only if it is the same sha AND its tree still hashes as it did at export time
