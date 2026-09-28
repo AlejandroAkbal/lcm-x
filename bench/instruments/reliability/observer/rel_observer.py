@@ -37,7 +37,7 @@ _tap = None
 
 def _append(path, rec):
     data = (json.dumps(rec, default=str) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         while data:  # one write per record: O_APPEND keeps records from the runner and the host whole
             data = data[os.write(fd, data):]

@@ -56,7 +56,7 @@ def gateway_unsupported(src: str) -> str:
 def append(path: Path, rec: dict) -> None:
     """One O_APPEND write per record, so runner and host records in one file never interleave mid-line."""
     data = (json.dumps(rec, default=str) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         while data:
             data = data[os.write(fd, data):]
