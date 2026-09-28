@@ -6,42 +6,44 @@ deadline, a no-op, a lock after commit, an exception), the list is fitted on the
 - the FINAL list is measured with the host's own request estimator (and LCM's count, whichever is larger)
   and the oldest whole user turns are dropped until it fits; a cut falls only on a user row, so no
   tool result is orphaned;
-- when the newest user turn alone is over budget, its largest rows are projected: tool outputs through
-  the existing large-output externalization, other rows as head/tail with their store id. The raw rows
-  stay in the store;
+- when the newest user turn alone is over budget, its largest stored rows are projected (tool outputs
+  first): head/tail of the stored text around a mark naming the store id and the projection parameters,
+  tool-call arguments over the head size replaced by the mark. A projection is a pure function of the
+  stored row and its mark, so a re-ingest (same process or cold resume) recomputes it from that row and
+  recognises the copy only on an exact match: it is never stored again, and no new message can take an
+  old row's identity unless byte-identical to its projection. The raw rows stay in the store;
 - a row that is not durably stored is never omitted (a row the ingest cursor cannot prove stored counts
   as durable only when it is DAG-verified LCM scaffold), and the list is never empty (#91).
-It writes no message, node or lifecycle row: only metadata (the counter /lcm doctor reads, and a bounded
-witness keying each projected view copy to its source store id, so a re-ingest of the fitted list, in
-process or after a cold resume, recognises the copy as that stored row and never stores it). The global
+It writes no message, node or lifecycle row: only the metadata counter /lcm doctor reads. The global
 assembly cap is never set (that would force overflow and trim every good compaction). The notice goes in
 the system-prefix slot when the list has one, never as a conversation row; the one-shot user warning goes
 through the host's automatic-compaction status hook. LCM_SURVIVAL_FIT=false turns it off.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
-from .externalize import maybe_externalize_tool_output
 from .message_content import normalize_content_value
 from .tokens import count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
 SURVIVAL_FIT_COUNTER_KEY = "survival_fit:counter"
-_WITNESS_KEY = "survival_fit:projections:{owner}"  # projected view copy -> its source store id
-_WITNESS_CAP = 64
 _NOTICE = ("[LCM survival fit: {n} earlier messages (store ids {first}..{last}) are stored verbatim but not in "
            "live context; lcm_grep / lcm_load_session reach them.]")
 _WARNING = ("LCM could not summarise part of this conversation in time. To keep the session alive, {n} older "
             "messages left live context; they stay stored verbatim and searchable (lcm_grep, lcm_load_session). "
             "/lcm doctor reports it.")
 _PROJECTED = ("[LCM survival fit: this {role} message ({tokens} tokens) is stored verbatim as store id {store_id}; "
-              "lcm_expand / lcm_grep reach the full text.]")
+              "lcm_expand / lcm_grep reach the full text. (projection {head}/{tail})]")
+_PROJECTED_RE = re.compile(r"\[LCM survival fit: this ([a-z_]+) message \((\d+) tokens\) is stored verbatim as store id "
+                           r"(\d+); lcm_expand / lcm_grep reach the full text\. \(projection (\d+)/(\d+)\)\]")
+_PROJECTED_PREFIX = "[LCM survival fit: this "
+_HEAD, _TAIL = 1200, 600  # a projected text keeps its first _HEAD and last _TAIL characters
 
 
 def _carries_survival_notice(raw: Any, text: str) -> bool:
@@ -52,13 +54,6 @@ def _carries_survival_notice(raw: Any, text: str) -> bool:
         return isinstance(last, dict) and last.get("type") == "text" and str(last.get("text") or "").startswith(
             "[LCM survival fit: ")
     return "\n\n[LCM survival fit: " in text
-
-
-def _witness_digest(message: Dict[str, Any], content: str) -> str:
-    """A projected view copy's exact bytes (role, normalized content, tool linkage and calls)."""
-    blob = json.dumps([str(message.get("role") or ""), content, str(message.get("tool_call_id") or ""),
-                       message.get("tool_calls") or None], sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def _host_estimate(messages) -> Optional[int]:
@@ -150,9 +145,6 @@ class SurvivalFitMixin:
             self._ingest_cursor, self._ingest_cursor_needs_reconcile = 0, True
         else:
             self._ingest_cursor = len(fitted)
-        if projected:
-            self._survival_witness([(message, store_ids[id(source)]) for message, source in zip(kept, body[cut:])
-                                    if message is not source])
         self._survival_record(reason, count, ids, before, after, budget, projected, notice)
         return fitted
 
@@ -163,9 +155,10 @@ class SurvivalFitMixin:
         return f"{normalize_content_value(content) or ''}\n\n{notice}"
 
     def _survival_projection(self, turn: List[Dict[str, Any]], store_ids, limit: int) -> List[Dict[str, Any]]:
-        """The newest turn, its largest stored rows stubbed until it fits (tool outputs first, then others);
-        never a row that is not stored, never an empty list. Only a row mapped to its store id is
-        projected: the witness keys the view copy to that row, so a re-ingest never stores the copy."""
+        """The newest turn, its largest stored rows projected until it fits (tool outputs first, then
+        others); never a row that is not stored, never an empty list. A projection is a pure function of
+        the stored row and the parameters its mark carries (store id, token count, head/tail), so a
+        re-ingest recognises it by recomputing it from that row (``_survival_projection_source``)."""
         out = list(turn)
         order = sorted(range(len(out)), key=lambda i: (out[i].get("role") != "tool", -count_message_tokens(out[i])))
         for index in order:
@@ -175,84 +168,80 @@ class SurvivalFitMixin:
             tokens = count_message_tokens(message)
             if id(source) not in store_ids or tokens < 256:
                 continue
-            text = normalize_content_value(message.get("content")) or ""
-            stub = None
-            if message.get("role") == "tool" and text:
-                externalized = maybe_externalize_tool_output(
-                    text, tool_call_id=str(message.get("tool_call_id") or ""), session_id=self._session_id,
-                    config=self._config, hermes_home=self._hermes_home, force=True,
-                )
-                if externalized:
-                    stub = self._active_tool_stub_content(message.get("content"), externalized["placeholder"])
-            marker = _PROJECTED.format(role=message.get("role"), tokens=tokens, store_id=store_ids[id(source)])
-            if stub is None and text:
-                stub = f"{text[:1200]}\n...\n{marker}\n...\n{text[-600:]}" if len(text) > 2400 else marker
-            out[index] = {**message, "content": message.get("content") if stub is None else stub}
-            if message.get("tool_calls"):  # R3 F1: arguments count too; ids, names and pairing stay
-                out[index]["tool_calls"] = [self._survival_bounded_call(call, marker) for call in message["tool_calls"]]
+            row = self._store.get(store_ids[id(source)])
+            if not row or str(row.get("role") or "") != str(message.get("role") or ""):
+                continue
+            fields = self._survival_projected_fields(row, tokens, _HEAD, _TAIL)
+            out[index] = {key: value for key, value in {**message, **fields}.items()
+                          if key != "tool_calls" or value}
         return out
 
     @staticmethod
-    def _survival_bounded_call(call: Any, marker: str) -> Any:
-        """A view copy of a tool call whose arguments are over 1,200 characters: valid JSON carrying the
+    def _survival_projected_fields(row: Dict[str, Any], tokens: int, head: int, tail: int) -> Dict[str, Any]:
+        """The projection of a stored row: its content as head/tail around the mark (the mark alone when
+        short), its tool calls with arguments over ``head`` characters replaced by the mark, and its
+        stored tool linkage. Deterministic in (row bytes, tokens, head, tail)."""
+        store_id = int(row["store_id"])
+        marker = _PROJECTED.format(role=row.get("role"), tokens=tokens, store_id=store_id, head=head, tail=tail)
+        text = normalize_content_value(row.get("content")) or ""
+        if text:
+            text = f"{text[:head]}\n...\n{marker}\n...\n{text[-tail:]}" if len(text) > 2 * head else marker
+        calls = row.get("tool_calls")
+        if isinstance(calls, str):
+            try:
+                calls = json.loads(calls)
+            except ValueError:
+                calls = None
+        fields: Dict[str, Any] = {"content": text,
+                                  "tool_calls": [SurvivalFitMixin._survival_bounded_call(call, marker, head)
+                                                 for call in calls] if isinstance(calls, list) and calls else None}
+        if row.get("tool_call_id"):
+            fields["tool_call_id"] = row["tool_call_id"]
+        return fields
+
+    @staticmethod
+    def _survival_bounded_call(call: Any, marker: str, head: int = _HEAD) -> Any:
+        """A view copy of a tool call whose arguments are over ``head`` characters: valid JSON carrying the
         provenance notice. The stored row keeps the verbatim arguments; the call stays data."""
         function = call.get("function") if isinstance(call, dict) else None
         arguments = function.get("arguments") if isinstance(function, dict) else None
-        if not isinstance(arguments, str) or len(arguments) <= 1200:
+        if not isinstance(arguments, str) or len(arguments) <= head:
             return call
         notice = f"{marker} Its tool-call arguments ({len(arguments)} characters) are not in live context."
         return {**call, "function": {**function, "arguments": json.dumps({"lcm_survival_fit": notice})}}
 
-    def _survival_witnesses(self) -> Dict[tuple, Dict[str, int]]:
-        """{(role, content length): {digest: store id}} of this conversation's projected view copies."""
-        owner = str(getattr(self, "_conversation_id", None) or getattr(self, "_session_id", None) or "")
-        store = getattr(self, "_store", None)
-        cache = getattr(self, "_survival_witness_cache", None)
-        if cache is None or cache[0] != owner or cache[1] is not store:
-            items = []
-            if owner and store is not None:
-                try:
-                    stored = store.read_metadata_json(_WITNESS_KEY.format(owner=owner))
-                    items = [tuple(item) for item in stored if isinstance(item, list) and len(item) == 4] \
-                        if isinstance(stored, list) else []
-                except Exception:
-                    logger.debug("LCM survival-fit witness read failed", exc_info=True)
-            index: Dict[tuple, Dict[str, int]] = {}
-            for role, length, digest, store_id in items:
-                index.setdefault((str(role), int(length)), {})[str(digest)] = int(store_id)
-            cache = (owner, store, index, items)
-            self._survival_witness_cache = cache
-        return cache[2]
-
-    def _survival_witness(self, projected) -> None:
-        """Record each projected view copy against its source row (bounded, per conversation)."""
-        if not projected:
-            return
-        self._survival_witnesses()
-        owner, _store, index, items = self._survival_witness_cache
-        for message, store_id in projected:
-            content = normalize_content_value(message.get("content")) or ""
-            item = (str(message.get("role") or ""), len(content), _witness_digest(message, content), int(store_id))
-            items = [old for old in items if old[2] != item[2]] + [item]
-        items = items[-_WITNESS_CAP:]
-        index.clear()
-        for role, length, digest, store_id in items:
-            index.setdefault((role, length), {})[digest] = store_id
-        self._survival_witness_cache = (owner, self._store, index, items)
-        try:
-            self._store.write_metadata_json([_WITNESS_KEY.format(owner=owner)], json.dumps([list(i) for i in items]))
-        except Exception:
-            logger.warning("LCM survival-fit witness write failed; a cold resume may store a projected copy")
-
     def _survival_projection_source(self, message: Dict[str, Any], role: str, content: str) -> Optional[Dict[str, Any]]:
-        """The stored row a host message is a projected view copy of (the witness), else None."""
-        index = self._survival_witnesses() if getattr(self, "_session_id", None) else None
-        bucket = index.get((role, len(content))) if index else None
-        store_id = bucket.get(_witness_digest(message, content)) if bucket else None
-        if store_id is None:
+        """The stored row ``message`` is a projection of, else None. Self-verifying: each mark names a store
+        id and the projection parameters; the row is loaded and its projection recomputed from its stored
+        bytes, and only an exact match of role, content, tool linkage, tool name and every tool call counts.
+        A genuinely new message can match only by being byte-identical to a projection of a stored row."""
+        calls = message.get("tool_calls")
+        haystack = content if _PROJECTED_PREFIX in content else ""
+        if isinstance(calls, list):
+            haystack += "".join(str((call.get("function") or {}).get("arguments") or "") for call in calls
+                                if isinstance(call, dict) and isinstance(call.get("function"), dict)
+                                and "lcm_survival_fit" in str(call["function"].get("arguments") or ""))
+        store = getattr(self, "_store", None)
+        if _PROJECTED_PREFIX not in haystack or store is None:
             return None
-        row = self._store.get(store_id)
-        return row if row is not None and str(row.get("role") or "") == role else None
+        for match in list(_PROJECTED_RE.finditer(haystack))[:4]:
+            mark_role, tokens, store_id, head, tail = match.groups()
+            if mark_role != role:
+                continue
+            try:
+                row = store.get(int(store_id))
+            except Exception:
+                row = None
+            if not row or str(row.get("role") or "") != role:
+                continue
+            fields = self._survival_projected_fields(row, int(tokens), int(head), int(tail))
+            if (content == fields["content"]
+                    and str(message.get("tool_call_id") or "") == str(row.get("tool_call_id") or "")
+                    and (calls or None) == fields["tool_calls"]
+                    and (role != "tool" or str(message.get("tool_name") or message.get("name") or "")
+                         == str(row.get("tool_name") or ""))):
+                return row
+        return None
 
     def _survival_record(self, reason, count, ids, before, after, budget, projected, notice) -> None:
         """Loud: a WARNING line, the doctor counter (metadata only) and one user warning per conversation."""

@@ -642,6 +642,90 @@ def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, ho
         cold.shutdown()
 
 
+def _projected_tool_fit(tmp_path, host_estimator, **patches):
+    """The big-tool view fitted after an injected conflict: (fitted list, its projected tool message)."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_tool_view()
+    engine.ingest(view)
+    _conflicted(engine)
+    for name, value in patches.items():
+        setattr(engine._store, name, value)
+    fitted = engine.compress(view, current_tokens=host_estimator(view))
+    projected = next(m for m in fitted if m.get("role") == "tool")
+    assert NOTICE in projected["content"] and projected["content"] != view[-1]["content"]
+    return engine, fitted, projected
+
+
+@pytest.mark.parametrize("change", ["tool_name", "one_byte"])
+def test_r4_b_a_new_message_never_takes_a_projected_rows_identity(tmp_path, summaries, host_estimator, change):
+    """R4-2: the host's list holds, where the projection was, a genuinely new message -- the projection
+    with another tool name (same content and tool_call_id), or with one byte changed. A cold resume
+    stores it as a new row: it never takes the projected row's identity."""
+    engine, fitted, projected = _projected_tool_fit(tmp_path, host_estimator)
+    if change == "tool_name":
+        new = {**projected, "tool_name": "another_tool"}
+    else:
+        text = projected["content"]
+        new = {**projected, "content": text[:5] + ("X" if text[5] != "X" else "Y") + text[6:]}
+    before = len(_rows(engine))
+    engine.on_session_end("S", fitted)
+    engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        cold.ingest([new if m is projected else m for m in fitted])
+        added = _rows(cold)[before:]
+        assert [(r["content"], r["tool_name"]) for r in added if r["role"] == "tool"] == [
+            (new["content"], new.get("tool_name"))], [(r["role"], r["tool_name"]) for r in added]
+        # (a changed tool result re-stores its call group on a cold resume: reconcile's #259 policy, as at base)
+    finally:
+        cold.shutdown()
+
+
+def test_r4_b_a_failed_metadata_write_never_stores_a_projection(tmp_path, summaries, host_estimator):
+    """R4-3: the projection needs no metadata: with every metadata write failing, a cold resume of the
+    fitted list stores only the new turn."""
+    def refuse(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    engine, fitted, _projected = _projected_tool_fit(tmp_path, host_estimator, write_metadata_json=refuse)
+    before = len(_rows(engine))
+    engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        new = _turn("NEW", 500.0)
+        cold.ingest([*fitted, *new])
+        assert [r["content"] for r in _rows(cold)[before:]] == [m["content"] for m in new]
+    finally:
+        cold.shutdown()
+
+
+def test_r4_b_seventy_projections_then_a_cold_resume_store_no_stub(tmp_path, summaries, host_estimator):
+    """R4-3: 70 fits, each projecting its newest over-budget user turn (no table to evict), then a cold
+    process resumes the list of all 70 projected turns: only the new turn is stored."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    system = {"role": "system", "content": "system prompt"}
+    turns = [[{"role": "user", "content": f"[B{i}] big " + "word " * 6000, "timestamp": 10.0 + i},
+              {"role": "assistant", "content": f"ok {i}"}] for i in range(70)]
+    try:
+        engine.ingest([system, *[m for turn in turns for m in turn]])
+        projected = []
+        for turn in turns:
+            fitted = engine._survival_fit([system, *turn], [system, *turn], 0, "test")
+            assert fitted[1]["content"] != turn[0]["content"] and NOTICE in fitted[1]["content"]
+            projected += fitted[1:]
+        before = len(_rows(engine))
+    finally:
+        engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        new = _turn("NEW", 900.0)
+        cold.ingest([system, *projected, *new])
+        added = _rows(cold)[before:]
+        assert [r["content"] for r in added] == [m["content"] for m in new], len(added)
+    finally:
+        cold.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"
