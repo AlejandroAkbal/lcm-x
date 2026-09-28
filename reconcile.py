@@ -803,6 +803,7 @@ class ReconcileMixin:
             if live == identity:
                 continue
             if _proof_user_identity(live) != _proof_user_identity(identity):
+                self._note_identity_anchor_version(store_id, message)  # #436 R6: a before/after observation
                 del watch[store_id]
                 continue
             try:  # best-effort: a failure keeps the watch for the next ingest, never blocks this one
@@ -2122,13 +2123,15 @@ class ReconcileMixin:
         return payload
 
     def _load_compression_carry_ranges(
-        self, session_id: str | None = None
+        self, session_id: str | None = None, with_anchor: bool = True,
     ) -> list[tuple[str, int, int]]:
-        """Load proof-backed parent ranges still visible in this segment."""
+        """Load proof-backed parent ranges still visible in this segment, plus (#436 R7) the verified
+        ancestors' rows this segment's ingest recognised as replays."""
         try:
             payload = self._durable_commit_proof_payload(session_id) or {}
+            anchored = self._identity_anchor_carry_ranges() if with_anchor and session_id in (None, self._session_id) else []
             return self._coalesce_compression_carry_ranges(
-                payload.get("carry_ranges") or []
+                list(payload.get("carry_ranges") or []) + anchored
             )
         except Exception:
             logger.debug("LCM compression carry-range load failed", exc_info=True)
@@ -2489,7 +2492,7 @@ class ReconcileMixin:
             if proof_cursor is not None:
                 for source, start, end in replaced:  # #519 R1: the vanished parent row leaves the carry
                     self._rewrite_own_carry_ranges(
-                        [(s, a, b - 1 if (s, a, b) == (source, start, end) else b) for s, a, b in self._load_compression_carry_ranges()],
+                        [(s, a, b - 1 if (s, a, b) == (source, start, end) else b) for s, a, b in self._load_compression_carry_ranges(with_anchor=False)],
                         "host replaced the last carried user row", [end],
                     )
                 self._record_ingest_reconciliation(
@@ -2549,7 +2552,7 @@ class ReconcileMixin:
                         effective_incoming=cursor,
                     )
                     return cursor
-            stale = self._load_compression_carry_ranges()
+            stale = self._load_compression_carry_ranges(with_anchor=False)
             if stale:  # #519 R2: the re-stored copies are the child's only rows; publication owns them alone
                 self._rewrite_own_carry_ranges([], "empty child re-stores its list", [(a + 1, b) for _s, a, b in stale])
             return 0

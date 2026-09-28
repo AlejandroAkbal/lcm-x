@@ -136,6 +136,7 @@ from .reconcile import _COMPACTION_COMMIT_PROOF_METADATA_PREFIX, ReconcileMixin,
 from .reconcile import _emission_identity
 from .reconcile import _has_lossy_redacted_identity, _merge_append_cut, _proof_user_identity
 from .compaction import CompactionMixin
+from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -395,6 +396,7 @@ class LCMEngine(
     CompactionMixin,
     ResetStateMixin,
     ReconcileMixin,
+    IdentityAnchorMixin,
     AuxiliarySessionMixin,
     PlaceholderLedgerMixin,
     BypassMixin,
@@ -5412,8 +5414,42 @@ class LCMEngine(
                 cursor,
                 n,
             )
+        # #436: recognise host replays per occurrence (host stamp + full payload identity) in front of
+        # the ordered-prefix result above. Fail-open: an error keeps today's path.
+        cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+        current_prefix_identities = (
+            [self._message_replay_identity(message, strip_carrier=False) for message in messages[:cursor]]
+            if cursor > 0 and cached_source_identities is not None and len(cached_source_identities) >= cursor
+            else None
+        )
+        anchor_plan = None
+        if identity_anchor_enabled():
+            # A steady-state cursor proves the prefix only while the host keeps that prefix; where it
+            # changed, the pre-match audits it (a row the host moved before the cursor was never stored).
+            audit_from = None
+            if not reconciled_existing_session and current_prefix_identities is not None:
+                audit_from = next((idx for idx, identity in enumerate(current_prefix_identities)
+                                   if identity != cached_source_identities[idx]), None)
+            try:
+                if reconciled_existing_session and cursor > 0:
+                    for store_id, stamp in self._identity_anchor_backfill_prefix(messages, reconcile_messages, cursor):
+                        self._store.backfill_observed_at(store_id, stamp)
+                anchor_plan = self._identity_anchor_prematch(messages, reconcile_messages, cursor, audit_from)
+                anchor_plan["replayed"] -= replayed_tool_segment_indexes
+                self._identity_anchor_version_rewind(messages, anchor_plan)
+                self._identity_anchor_commit(anchor_plan)
+            except Exception as exc:
+                logger.warning("LCM identity-anchor pre-match failed (%s); ordered-prefix path only", type(exc).__name__)
+                anchor_plan = None
+            if anchor_plan and anchor_plan["cursor"] < cursor:
+                cursor = anchor_plan["cursor"]
+                self._ingest_cursor = cursor
+            if anchor_plan and anchor_plan["replayed"]:
+                logger.info("LCM identity-anchor recognised %d replayed rows: session=%s cursor=%d incoming=%d",
+                            len(anchor_plan["replayed"]), self._session_id, cursor, n)
+        anchored_replay_indexes = anchor_plan["replayed"] if anchor_plan else set()
+        anchor_remainders: dict[int, Any] = {}
         if cursor > 0:
-            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
             if (
                 cached_source_identities is not None
@@ -5421,9 +5457,10 @@ class LCMEngine(
                 and len(cached_source_identities) >= cursor
                 and len(cached_active_replay_messages) >= cursor
             ):
-                current_prefix_identities = [
-                    self._message_replay_identity(message, strip_carrier=False) for message in messages[:cursor]
-                ]
+                if current_prefix_identities is None or len(current_prefix_identities) != cursor:
+                    current_prefix_identities = [
+                        self._message_replay_identity(message, strip_carrier=False) for message in messages[:cursor]
+                    ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
                         self._copy_active_replay_messages_preserving_generated_ids(
@@ -5661,7 +5698,14 @@ class LCMEngine(
                             excerpt,
                         )
                     continue
+                if absolute_idx in anchored_replay_indexes:
+                    continue  # #436 R1/R2: a replay of a stored occurrence
                 store_msg = replay_msg
+                remainder = (anchor_plan or {}).get("remainders", {}).get(absolute_idx)
+                raw_remainder = _raw_remainder(replay_msg, remainder) if remainder is not None else None
+                if raw_remainder is not None:  # #436 R3: only the new row of a partially-held survivor
+                    store_msg = {**replay_msg, "content": raw_remainder, "timestamp": None}
+                    anchor_remainders[absolute_idx] = None
                 if (
                     str(original_msg.get("role") or "") == "tool"
                     and _is_hermes_persisted_output_marker(
@@ -5745,6 +5789,19 @@ class LCMEngine(
         )
         originals = [messages[idx] for idx, _msg in messages_to_store_with_index]
         self._watch_stored_user_rows(zip(originals, protected_messages, store_ids))
+        if anchor_plan is not None:
+            try:
+                stored_at = {idx: store_id for (idx, _msg), store_id in zip(messages_to_store_with_index, store_ids)}
+                self._identity_anchor_commit(anchor_plan, {idx: stored_at[idx] for idx in anchor_remainders if idx in stored_at})
+                self._identity_anchor_remember([
+                    (self._message_replay_identity(reconcile_messages[idx], strip_carrier=False), store_id, messages[idx])
+                    for idx, store_id in stored_at.items() if idx not in anchor_remainders
+                ])
+                self._identity_anchor_record_versions(
+                    [(messages[idx], store_id) for idx, store_id in stored_at.items() if idx not in anchor_remainders]
+                )
+            except Exception as exc:
+                logger.warning("LCM identity-anchor relation write failed (%s)", type(exc).__name__)
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists

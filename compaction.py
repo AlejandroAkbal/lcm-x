@@ -1627,18 +1627,24 @@ class CompactionMixin:
             if not to_compact:
                 noop_reason = "no eligible leaf chunk selected"
                 break
+            to_compact = self._identity_anchor_extend_chunk(to_compact, candidate_raw)  # #563
 
             selected_raw_chunk = to_compact
             sources = {}
             summary_input_chunk = []
-            for message in selected_raw_chunk:
-                if id(message) in dependent_reply_message_ids:
-                    continue
+            anchor_claims: dict[int, list[int]] = {}  # #436 R4: id(input row) -> the store ids its text covers
+            selected_input = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
+            anchored_input = self._identity_anchor_summary_input(
+                selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk
+            )
+            for message, claims in anchored_input or [(message, []) for message in selected_input]:
                 remainder = self._generated_context_carrier_remainder(message)
                 if remainder is not None:
                     original = message
                     message = {**message, "content": remainder}
                     sources[id(message)] = original
+                if claims:
+                    anchor_claims[id(message)] = claims
                 summary_input_chunk.append(message)
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
@@ -1684,6 +1690,11 @@ class CompactionMixin:
                         summary_input_chunk,
                         **summary_kwargs,
                     )
+                    selected_ids = {id(message) for message in selected_raw_chunk}
+                    if anchored_input and not any(id(sources.get(id(m), m)) in selected_ids for m in compacted_chunk):
+                        # #436 T6: a rescue prefix of rehydrated rows alone read no raw row; never let the
+                        # boundary fallback below consume raw rows the summarizer did not read.
+                        raise RuntimeError("adaptive leaf rescue kept only rehydrated rows")
                 except Exception as exc:
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
@@ -1694,6 +1705,9 @@ class CompactionMixin:
                         )
                         break
                     raise
+            anchor_claimed_ids = sorted({  # #436 R4: only claims whose text the summarizer actually read
+                store_id for message in compacted_chunk for store_id in anchor_claims.get(id(message), ())
+            })
             compacted_chunk = [sources.get(id(message), message) for message in compacted_chunk]
             compacted_summary_ids = {id(message) for message in compacted_chunk}
             compacted_positions = [
@@ -1716,9 +1730,9 @@ class CompactionMixin:
             ]
             full_map = self._current_compress_store_ids_by_message_id  # #535: the pass maps the whole list
             source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk, full_map)
-            source_store_ids = sorted(dict.fromkeys(source_store_ids))
+            source_store_ids = sorted(dict.fromkeys(source_store_ids + anchor_claimed_ids))
             consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk, full_map)
-            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
+            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids + anchor_claimed_ids))
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
