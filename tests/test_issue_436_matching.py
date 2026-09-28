@@ -167,3 +167,24 @@ def test_a_recorded_alias_stamp_reserves_only_its_own_row(caplog):
     assert _reserve_shown(pool, lambda row: row["forms"], shown, {1: {10.0}}) == {1}
     assert _reserve_shown(pool, lambda row: row["forms"], shown, {2: {10.0}}) == {2}
     assert _reserve_shown(pool, lambda row: row["forms"], [(0, (10.0, "u")), (1, (20.0, "u"))], {1: {10.0}}) == {1}
+
+
+def test_a_null_row_takes_an_occurrence_a_stamped_row_can_move_off(caplog):
+    """PR #590 bot P1: S answers {a, b} at t, N (NULL) only a; the view shows a@t and b@t. Pass one gives S a@t;
+    S moves to b@t (another of its OWN keys) so N takes a@t. A stamped row that cannot move is never unmatched."""
+    s, n = {"store_id": 1, "observed_at": 1.0, "forms": {"a", "b"}}, _null(2, "a")
+    assert _reserve(caplog, [s, n], [(0, (1.0, "a")), (1, (1.0, "b"))]) == {1, 2}
+    assert _reserve(caplog, [s, n], [(0, (1.0, "a"))]) == {1}  # S cannot move: S keeps it
+    s2 = {"store_id": 3, "observed_at": 1.0, "forms": {"b"}}  # b@t is S2's: S has nowhere to go
+    assert _reserve(caplog, [s, s2, n], [(0, (1.0, "a")), (1, (1.0, "b"))]) == {1, 3}
+
+
+def test_scale_null_rows_rerouting_stamped_rows(caplog):
+    """50k stamped rows {a, b} at their own stamps hold a (pass one), 50k NULL rows {a}: each moves one stamped
+    row to its b; then 50k stuck stamped rows {a} and 50k NULL rows {a} (every holder dead after one look)."""
+    n = 50_000
+    rows = [{"store_id": i, "observed_at": float(i), "forms": {"a", "b"}} for i in range(n)] + [_null(n + i, "a") for i in range(n)]
+    occurrences = [(i, (float(i), "a")) for i in range(n)] + [(n + i, (float(i), "b")) for i in range(n)]
+    assert len(_reserve(caplog, rows, occurrences)) == 2 * n
+    rows = [{"store_id": i, "observed_at": float(i), "forms": {"a"}} for i in range(n)] + [_null(n + i, "a") for i in range(n)]
+    assert len(_reserve(caplog, rows, [(i, (float(i), "a")) for i in range(n)])) == n

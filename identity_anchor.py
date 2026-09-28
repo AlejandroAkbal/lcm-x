@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from typing import Any, Dict, Optional
 
 from .fresh_tail import tool_group_safe_end
@@ -386,12 +386,8 @@ class IdentityAnchorMixin:
         if "\n\n" not in content:
             return
         # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
-        pool, aliases = self._identity_anchor_pool(donors, consumed), defaultdict(set)
-        for rel in self._store.get_message_relations([int(row["store_id"]) for row in pool], "alt_stamp"):
-            if _normalize_observed_at(rel["observed_at"]) is not None:  # B-ID-3: its recorded R5 alias stamps
-                aliases[int(rel["store_id"])].add(_normalize_observed_at(rel["observed_at"]))
-        reserved = _reserve_shown(pool, self._stored_row_forms, list(enumerate(shown(idx).elements())),
-                                  aliases) if pool else set()
+        pool = self._identity_anchor_pool(donors, consumed)
+        reserved = self._identity_anchor_reserved(pool, shown(idx))
         pool = [row for row in pool if int(row["store_id"]) not in reserved]
         donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
@@ -531,6 +527,15 @@ class IdentityAnchorMixin:
         return [row for store_id, row in sorted(rows.items())
                 if row.get("role") == "user" and store_id not in consumed]
 
+    def _identity_anchor_reserved(self, pool, shown: Counter) -> set:
+        """B-ID-1: store ids of ``pool`` rows the view's ``shown`` occurrences ``{(stamp, form): n}`` hold as their
+        own (``_reserve_shown``), a stamped row also under its recorded R5 alias stamps (B-ID-3)."""
+        aliases: dict = defaultdict(set)
+        for rel in self._store.get_message_relations([int(row["store_id"]) for row in pool], "alt_stamp"):
+            if _normalize_observed_at(rel["observed_at"]) is not None:
+                aliases[int(rel["store_id"])].add(_normalize_observed_at(rel["observed_at"]))
+        return _reserve_shown(pool, self._stored_row_forms, list(enumerate(shown.elements())), aliases) if pool else set()
+
     def _identity_anchor_assign(self, parts, pool, donors, consumed) -> Optional[list]:
         """Bind each part to one stored occurrence (a donor for a donor's text first), each used once;
         ``pool`` holds no row the host view shows as its own occurrence (B-ID-1)."""
@@ -627,6 +632,7 @@ class IdentityAnchorMixin:
 
         claimed: set[int] = set()
         claims: dict[int, list] = {}
+        shown: Optional[Counter] = None  # the view's unmapped occurrences, built once on first need
         self._identity_anchor_text_memo = {}
         scope = [str(self._session_id), *self._identity_anchor_chain()]
         for message in chunk:
@@ -656,10 +662,20 @@ class IdentityAnchorMixin:
             groups = [group for group in self._identity_anchor_witnesses(donors, stamp)
                       if "\n\n".join(self._identity_text(row) for row in group) == content] if donors else []
             if not groups and donors and "\n\n" in content:  # LCM observes the exact composite here (form i)
-                pool = self._identity_anchor_pool(donors, set())
+                # B-ID-1 (PR #590 r2): a row a live view row maps, or that the view's unmapped occurrences hold
+                # as their own (the ingest site's reservation), is never a constituent. Over-reservation only
+                # leaves the composite uncomposed: its text claims nothing (duplication, never a claim).
+                if shown is None:
+                    shown = Counter(self._identity_anchor_view_key(m) for m in view if id(m) not in full_map)
+                    shown.pop(None, None)
+                pool = self._identity_anchor_pool(donors, mapped)
+                own = self._identity_anchor_view_key(message)
+                reserved = self._identity_anchor_reserved(pool, shown - Counter([own] if own else []))
+                pool = [row for row in pool if int(row["store_id"]) not in reserved]
+                donors = [row for row in donors if int(row["store_id"]) not in mapped | reserved]
                 group, _ambiguous = self._identity_anchor_compose(
                     content, {self._identity_text(row) for row in pool}, pool, donors, set()
-                )
+                ) if donors else (None, False)
                 if group is not None:
                     self._store.add_message_relations([_composite_relation(group, stamp)])
                     groups = [group]
@@ -703,6 +719,14 @@ class IdentityAnchorMixin:
                 out.append(({"role": "user", "content": row.get("content") or ""}, [int(row["store_id"])]))
             out.append((message, claims.get(id(message), [])))
         return out
+
+    def _identity_anchor_view_key(self, message) -> Optional[tuple]:
+        """A view row's occurrence key ``(stamp, form)`` as the ingest site keys it; None for LCM's own scaffold
+        or a lossy identity."""
+        if self._identity_is_lcm_scaffold(message):
+            return None
+        identity = self._message_replay_identity(message, strip_carrier=False)
+        return None if identity is None or _lossy(identity) else (_normalize_observed_at(message.get("timestamp")), identity)
 
     def _identity_anchor_owned(self, row, carry) -> bool:
         store_id, owner = int(row["store_id"]), str(row.get("session_id") or "")
@@ -958,16 +982,58 @@ def _reserve_shown(pool, forms_of, occurrences, aliases=None) -> set:
     NULL row LCM stored before the host stamped it answers a stamped occurrence of its form still unmatched,
     keyed by form alone (a row's keys are its forms, never its stamps: linear), in store order."""
     aliases = aliases or {}
-    reserved = _match_occurrences(pool, lambda row: {
-        (stamp, form) for stamp in {_normalize_observed_at(row.get("observed_at")), *aliases.get(int(row["store_id"]), ())}
-        for form in forms_of(row)}, occurrences)
-    null = [row for row in pool if _normalize_observed_at(row.get("observed_at")) is None
-            and int(row["store_id"]) not in reserved]
-    taken = set(reserved.values())
+
+    def keys_of(row) -> set:
+        stamps = {_normalize_observed_at(row.get("observed_at")), *aliases.get(int(row["store_id"]), ())}
+        return {(stamp, form) for stamp in stamps for form in forms_of(row)}
+
+    first = _match_occurrences(pool, keys_of, occurrences)
+    null = [row for row in pool if _normalize_observed_at(row.get("observed_at")) is None and int(row["store_id"]) not in first]
+    taken = set(first.values())
     left = [(occurrence, ("null", key[1])) for occurrence, key in occurrences if key[0] is not None and occurrence not in taken]
+    reserved = set(first)
     if null and left:  # over-reservation only stores a composite whole: duplication, never loss
-        reserved.update(_match_occurrences(null, lambda row: {("null", form) for form in forms_of(row)}, left))
-    return set(reserved)
+        second = _match_occurrences(null, lambda row: {("null", form) for form in forms_of(row)}, left)
+        reserved.update(second)
+        rest = [row for row in null if int(row["store_id"]) not in second]
+        if rest:
+            reserved |= _reroute_for_null(pool, rest, first, taken | set(second.values()), dict(occurrences), keys_of, forms_of)
+    return reserved
+
+
+def _reroute_for_null(pool, rest, first, taken, key_of, keys_of, forms_of) -> set:
+    """PR #590: augmentation from pass one for the NULL rows ``rest`` still unreserved. One takes an occurrence of
+    its form a stamped row holds only when that row can move to a free occurrence of another of its OWN keys, so a
+    stamped row is never unmatched. Free occurrences only fall here: a holder that cannot move never can, and
+    leaves the index after one look. Bounded like ``_match_occurrences``; a spent budget keeps what was found."""
+    free = Counter(key for occurrence, key in key_of.items() if key[0] is not None and occurrence not in taken)
+    current = {int(row["store_id"]): key_of[first[int(row["store_id"])]] for row in pool
+               if int(row["store_id"]) in first and key_of[first[int(row["store_id"])]][0] is not None}
+    holders: dict = defaultdict(deque)  # form -> stamped rows holding an occurrence of it, store order
+    rows = {int(row["store_id"]): row for row in pool}
+    for sid, key in current.items():
+        holders[key[1]].append(sid)
+    out: set = set()
+    budget, work = _MATCH_WORK_PER_ITEM * (len(pool) + len(key_of)) + _MATCH_WORK_FLOOR, 0
+    for row in rest:
+        for form in sorted(forms_of(row), key=repr):
+            queue = holders.get(form)
+            while queue and int(row["store_id"]) not in out and work < budget:
+                sid = queue.popleft()
+                work += 1
+                target = next((k for k in sorted(keys_of(rows[sid]), key=repr) if k != current[sid] and free[k] > 0), None)
+                if target is not None:  # the holder moves; this NULL row takes the occurrence it left
+                    free[target] -= 1
+                    current[sid] = target
+                    holders[target[1]].append(sid)
+                    out.add(int(row["store_id"]))
+            if int(row["store_id"]) in out:
+                break
+        if work >= budget:
+            logger.warning("LCM identity-anchor NULL re-route spent its work budget %d: rows=%d occurrences=%d reserved=%d",
+                           budget, len(pool), len(key_of), len(out))
+            break
+    return out
 
 
 def _composite_relation(group, stamp) -> list:
