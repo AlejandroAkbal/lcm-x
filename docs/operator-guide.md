@@ -114,7 +114,12 @@ never with native recovery off: v0.23.3 does not recognise the summary carrier
 that v0.24.x puts in the host list, so with native recovery off its
 compactions conflict on every attempt (with it on, v0.23.3 does not attempt a
 publication), and restoring the pre-upgrade backup does not avoid that and
-also drops rows stored since the backup. Within the 0.24.x line a plugin-only
+also drops rows stored since the backup. Rolling back to v0.23.3
+(`hermes-lcm`) also reverts the v0.24.0 config migration before Hermes
+restarts: `plugins.enabled` back to `hermes-lcm` and `context.engine: lcm`
+(restore the `config.yaml` backup taken before the migration); otherwise
+Hermes reports the engine as not found, runs the built-in compressor, and
+those turns never reach `lcm.db`. Within the 0.24.x line a plugin-only
 rollback is supported only while no survival-fit projection was persisted
 (#601); once `/lcm doctor` reports a `survival_fit` count above 0, an older
 plugin re-stores rows it cannot compact, so restore the `lcm.db` backup taken

@@ -167,7 +167,8 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
                    "turns stay stored verbatim (lcm_grep / lcm_load_session); nothing needs deleting. Rollback "
                    f"(#601, #603): {within}. To v0.23.3: reinstall it with LCM_NATIVE_RECOVERY=true and keep lcm.db "
                    "as it is — never with native recovery off, and never a backup restore (it drops rows and does "
-                   "not avoid the conflict).")
+                   "not avoid the conflict) — and revert the v0.24.0 config migration (plugins.enabled back to "
+                   "hermes-lcm, context.engine: lcm; restore the pre-migration config.yaml) before restarting Hermes.")
         warning_only = True
         rationale = "a survival fit kept an over-window session alive; it points at a compaction that could not publish"
     elif name == "cleanup_candidates":

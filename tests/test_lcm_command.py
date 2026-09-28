@@ -555,7 +555,8 @@ def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engi
     for text in (observation, line):
         assert "within the 0.24.x line" in text and "v0.23.3" in text
         assert "a rollback to an older plugin restores" not in text
-    for phrase in ("v0.23.3", "LCM_NATIVE_RECOVERY=true", "keep lcm.db", "never a backup restore"):
+    for phrase in ("v0.23.3", "LCM_NATIVE_RECOVERY=true", "keep lcm.db", "never a backup restore",
+                   "plugins.enabled", "hermes-lcm", "context.engine: lcm", "config.yaml"):
         assert phrase in line, phrase
     restore = "restore the lcm.db backup taken before the upgrade together with the plugin"
     if projected == 0:
