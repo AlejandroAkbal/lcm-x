@@ -6,13 +6,26 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
-## v0.24.4 - (unreleased; rc3) (#436: message identity anchored on the host timestamp)
+## v0.24.5 - (unreleased; rc1) (#581, #582, #594: summaries sourced from the store, and a survival fit)
+
+- Fix: a leaf summary can cover stored rows the host no longer shows (rows the host compacted in place while native
+  recovery was ON, older duplicate copies); the leaf input is a bounded, contiguous run of the conversation's stored
+  rows. Sessions that ended every pass in `publication_invariant_conflict` publish again. (#581, #591)
+- Fix: when a compaction cannot shrink the context under the model window, the oldest whole user turns are dropped from
+  that turn's context until it fits or until nothing stored can leave. A fit that shortens the list but stays over
+  budget logs a WARNING; when nothing stored can leave, the list reaches the host unchanged (a warning for that case:
+  #599) (`LCM_SURVIVAL_FIT`, default on; nothing is deleted). (#582, #591)
+- Fix: a compaction the host refused, or another agent's session end on the shared lifecycle row, no longer leaves the
+  next compaction conflicting at frontier 0. (#594, #591)
+
+## v0.24.4 - 2026-09-28 (#436: message identity anchored on the host timestamp)
 
 - Fix: a message the host shows is matched to its stored copy by the host timestamp plus its full content, counted per
   occurrence, instead of by an ordered content prefix. Host re-issues (compaction generations, rotation handoff, ACP
   persist replace, restore) no longer re-store the tail, a merged row is absorbed only with an exact decomposition
   proof (new additive `message_relations` table; schema version unchanged), and a summary claims only sources in its
-  input. `LCM_IDENTITY_ANCHOR=false` restores the v0.24.3 behaviour. (#436, #553, #561, #563, #572)
+  input. `LCM_IDENTITY_ANCHOR=false` restores the v0.24.3 identity path; the #589 tool-call-id fixes
+  stay active either way. (#436, #553, #561, #563, #572)
 - Fix (rc2): a repeated user message the host merges into a failed turn is stored as its own occurrence; a row the
   host shows on its own is never a piece of a merged row, and a storage rebind clears the identity caches. (#436, #580)
 - Fix (rc3): the reservation also covers a row the host shows under a key other than the one stored: a row saved before
