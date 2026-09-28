@@ -1706,7 +1706,8 @@ def _doctor_text(engine) -> str:
     survival_fit = survival_fit if isinstance(survival_fit, dict) else {}
     if int(survival_fit.get("count") or 0):
         observations.append(f"survival_fit: applied {int(survival_fit['count'])} time(s); last reason "
-                            f"{survival_fit.get('last_reason') or '(unknown)'}")
+                            f"{survival_fit.get('last_reason') or '(unknown)'}; a rollback to an older plugin "
+                            "restores the pre-upgrade lcm.db backup with it (see triage_guidance)")
         triage_checks.append({"check": "survival_fit", "status": "warn", "detail": survival_fit})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 
