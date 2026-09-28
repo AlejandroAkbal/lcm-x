@@ -89,9 +89,12 @@ class SurvivalFitMixin:
             lead += 1
         head, body = list(result[:lead]), list(result[lead:])
         store_ids = self._get_store_id_map_for_messages(body)
+        # The ingest cursor indexes this list with nothing to reconcile: every row of it is persisted,
+        # including rows the identity mapper cannot pin to one stored copy (duplicates, stubbed tools).
+        persisted = not self._ingest_cursor_needs_reconcile and self._ingest_cursor == len(result)
 
         def durable(message) -> bool:
-            return id(message) in store_ids or self._survival_generated(message)
+            return persisted or id(message) in store_ids or self._survival_generated(message)
 
         users = [i for i, message in enumerate(body) if isinstance(message, dict) and message.get("role") == "user"]
         cut, projected = None, False
@@ -106,7 +109,7 @@ class SurvivalFitMixin:
             if not all(durable(message) for message in body[:cut]):
                 logger.warning("LCM survival fit skipped: an over-budget list holds rows not yet stored (reason=%s)", reason)
                 return result
-            kept = self._survival_projection(body[cut:], store_ids, budget - self._survival_measure(head))
+            kept = self._survival_projection(body[cut:], store_ids, budget - self._survival_measure(head), persisted)
             projected = True
         else:
             kept = body[cut:]
@@ -120,9 +123,7 @@ class SurvivalFitMixin:
         after = self._survival_measure(fitted)
         if after >= before:  # nothing stored could leave: the list is already as small as it gets
             return result
-        if after_exception or self._ingest_cursor_needs_reconcile or self._ingest_cursor != len(result):
-            self._ingest_cursor, self._ingest_cursor_needs_reconcile = 0, True
-        elif any(id(message) not in store_ids and not self._survival_generated(message) for message in kept):
+        if after_exception or not persisted:
             self._ingest_cursor, self._ingest_cursor_needs_reconcile = 0, True
         else:
             self._ingest_cursor = len(fitted)
@@ -135,7 +136,8 @@ class SurvivalFitMixin:
             return list(content) + [{"type": "text", "text": notice}]
         return f"{normalize_content_value(content) or ''}\n\n{notice}"
 
-    def _survival_projection(self, turn: List[Dict[str, Any]], store_ids, limit: int) -> List[Dict[str, Any]]:
+    def _survival_projection(self, turn: List[Dict[str, Any]], store_ids, limit: int,
+                             persisted: bool = False) -> List[Dict[str, Any]]:
         """The newest turn, its largest stored rows stubbed until it fits (tool outputs first, then others);
         never a row that is not stored, never an empty list."""
         out = [dict(message) for message in turn]
@@ -145,7 +147,7 @@ class SurvivalFitMixin:
                 break
             message, source = out[index], turn[index]
             tokens = count_message_tokens(message)
-            if id(source) not in store_ids or tokens < 256:
+            if (id(source) not in store_ids and not persisted) or tokens < 256:
                 continue
             text = normalize_content_value(message.get("content")) or ""
             stub = None
@@ -157,7 +159,7 @@ class SurvivalFitMixin:
                 if externalized:
                     stub = self._active_tool_stub_content(message.get("content"), externalized["placeholder"])
             if stub is None:
-                marker = _PROJECTED.format(role=message.get("role"), tokens=tokens, store_id=store_ids[id(source)])
+                marker = _PROJECTED.format(role=message.get("role"), tokens=tokens, store_id=store_ids.get(id(source), "(unmapped)"))
                 stub = f"{text[:1200]}\n...\n{marker}\n...\n{text[-600:]}" if len(text) > 2400 else marker
             out[index] = {**message, "content": stub}
         return out

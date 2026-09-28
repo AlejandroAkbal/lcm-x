@@ -99,10 +99,11 @@ def registry() -> list[dict]:
         ]
         for ref in ("v0.23.3", "v0.24.3"):  # #581/#582: a native-ON store handed to the candidate with native OFF
             cells.append(cell(f"native-on-off/{ref}/{m}", [581, 582], in_place=ip, native=True, from_ref=ref,
-                              faults=[{"kind": "plugin_switch", "turn": 31}],
+                              faults=[{"kind": "plugin_switch", "turn": 31}], bars=["B3", "B4", "B8"],
                               doc=f"Turns 1-30 run lcm-x {ref} with native recovery ON; the candidate then takes over the "
                                   "same HERMES_HOME and store with native OFF. B3/B8 count from the candidate's first "
-                                  "publication; B4 asks it to publish."))
+                                  "publication; B4 asks it to publish. B1/B2/B5-B7 are reported, not scored: the older "
+                                  "ref's own phase decides them."))
         for tr in ("acp-history", "gateway-reload"):
             cells.append(cell(f"crash-after-compaction/{m}/{tr}", [553, 561], in_place=ip,
                               transport="acp" if tr == "acp-history" else "gateway", faults=[crash],

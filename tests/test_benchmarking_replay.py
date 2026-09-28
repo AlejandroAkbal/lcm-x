@@ -99,7 +99,8 @@ def test_replay_above_threshold_compresses_and_reports_canary_recall(tmp_path):
         canary_count=2,
         filler_words=80,
     )
-    policy = _small_policy()
+    # #582: a window the compacted list fits (at 400 its ~550 tokens overflow and the survival fit trims it)
+    policy = _small_policy(context_length=700)
 
     metrics = run_replay(fixture, policy, output_dir=tmp_path)
 
