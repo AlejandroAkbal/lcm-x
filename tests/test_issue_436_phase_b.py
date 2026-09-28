@@ -155,3 +155,61 @@ def test_bid2_profile_rebind_never_aliases_another_databases_row(tmp_path, engin
         assert not [rel for rel in _relations(engine) if rel[1] == "alt_stamp"]
     finally:
         engine.shutdown()
+
+
+# -- round 3: a row answers any of its forms (exact, host-rewrite): the reservation, R1 and gap-fill match as a
+# whole (maximum matching), never greedily per row. The adversarial form order is forced, not hash-seed luck.
+
+def _forms_first(engine, monkeypatch, first: dict) -> None:
+    """``_stored_row_forms`` of a row whose content is a key of ``first`` lists those texts, in that order."""
+    original = engine._stored_row_forms
+
+    def forms(row):
+        exact = next(iter(original(row)))
+        texts = first.get(str(row.get("content")))
+        return original(row) if texts is None else [(exact[0], text, *exact[2:]) for text in texts]
+
+    monkeypatch.setattr(engine, "_stored_row_forms", forms)
+
+
+def _ids(engine, text):
+    return [int(row["store_id"]) for row in _rows(engine) if row["content"] == text]
+
+
+@pytest.mark.parametrize("stamp, a_text, b_text, restart", [
+    (1.0, "alpha", "beta", False),  # one stamp: A answers {alpha, beta}, B only beta; the view shows both
+    (None, "foo ", "foo", True),  # NULL stamps after a restart: A "foo " (override "foo"), B "foo"
+], ids=["stamped-steady", "null-restart"])
+def test_r3_a_multi_form_row_never_frees_a_shown_row_into_a_composite(tmp_path, monkeypatch, stamp, a_text, b_text, restart):
+    engine = _engine(tmp_path)
+    try:
+        a, b, r = _u(a_text, stamp), _u(b_text, stamp), _u("[R] failed turn" + PAD, 3.0)
+        head = [a, b, _a("reply" + PAD, 2.0)]
+        engine.ingest([*head, r])
+        if restart:
+            engine.shutdown()
+            engine = _engine(tmp_path)
+        _forms_first(engine, monkeypatch, {a_text: [b_text, a_text]})
+        shown = set(_ids(engine, a_text) + _ids(engine, b_text))
+        r["content"] += "\n\n" + b_text  # the new U repeats B's text, merged into the dangling R
+        engine.ingest([*head, r, _a("reply to R+U", 5.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert not shown & set(members), (shown, members)
+        assert set(_ids(engine, b_text)) & set(members)  # the new U: stored, its own occurrence
+    finally:
+        engine.shutdown()
+
+
+def test_r3_gap_fill_never_rehydrates_a_row_the_view_shows(tmp_path, monkeypatch):
+    """R4 gap-fill: A answers {alpha, beta}, B only beta, the view shows alpha and beta: both rows are shown,
+    none is rehydrated into the summarizer input."""
+    engine = _engine(tmp_path)
+    try:
+        x = _u("[X] later user row" + PAD, 2.0)
+        engine.ingest([_u("alpha", 1.0), _u("beta", 1.0), x])
+        _forms_first(engine, monkeypatch, {"alpha": ["beta", "alpha"]})
+        [b_id], [x_id] = _ids(engine, "beta"), _ids(engine, x["content"])
+        out = engine._identity_anchor_summary_input([x], {id(x): x_id}, view=[_u("alpha", 1.0), _u("beta", 1.0), x])
+        assert not [ids for _row, ids in out or () if b_id in ids], out
+    finally:
+        engine.shutdown()
