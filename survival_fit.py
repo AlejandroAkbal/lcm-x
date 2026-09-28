@@ -265,6 +265,27 @@ class SurvivalFitMixin:
                 return row
         return None
 
+    def _survival_projection_followers(self, messages, idx: int, row: Dict[str, Any], stamps) -> list:
+        """B-ROLL-1 (rc2): ``[(index, stored_row), ...]`` for the unstamped non-user rows the view carries
+        right after ``messages[idx]``, a replayed projection of ``row``, that are exactly the rows stored
+        right after ``row``, in order; the first row that differs, is stamped or is a user/system row ends
+        it. A projected newest user row has no positional replay proof, so without this its replies are
+        stored again on a cold resume."""
+        role = str(messages[idx].get("role") or "")
+        if self._survival_projection_source(messages[idx], role, normalize_content_value(
+                messages[idx].get("content")) or "") is None:
+            return []
+        stored = self._store.get_range(str(row["session_id"]), start_id=int(row["store_id"]) + 1,
+                                       limit=max(len(messages) - idx - 1, 1))
+        out = []
+        for k, stored_row in zip(range(idx + 1, len(messages)), stored):
+            if (k in stamps or str(messages[k].get("role") or "") in ("user", "system")
+                    or self._message_replay_identity(messages[k], strip_carrier=False)
+                    != self._message_replay_identity(stored_row, stored_row=True)):
+                break
+            out.append((k, stored_row))
+        return out
+
     def _survival_stamp_matches(self, message: Dict[str, Any], row: Dict[str, Any]) -> bool:
         """No host stamp; or the source row's own: its observed_at or a recorded alias stamp (normalized as
         the identity anchor normalizes them); or any stamp when the source was stored unstamped (R6-1: a

@@ -665,10 +665,12 @@ def test_r3b_a_projected_row_re_ingests_as_its_source_row(tmp_path, summaries, h
         engine.shutdown()
 
 
-@pytest.mark.parametrize("view_of", [_big_tool_view, _list_system_view], ids=["projected-tool", "list-system"])
+@pytest.mark.parametrize("view_of", [_big_user_view, _big_tool_view, _list_system_view],
+                         ids=["projected-user", "projected-tool", "list-system"])
 def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, host_estimator, view_of):
-    """R3-B (Q3, Q2): the host adopts the fitted list (a projected tool row; a list-content system slot
-    carrying the notice) and a cold process resumes it: only the new turn is stored, never the notice."""
+    """R3-B (Q3, Q2): the host adopts the fitted list (a projected newest user row and the reply after it;
+    a projected tool row; a list-content system slot carrying the notice) and a cold process resumes it:
+    only the new turn is stored, never the notice, never the earlier reply again."""
     engine = _engine(tmp_path, context_length=WINDOW)
     view = view_of()
     try:
@@ -687,6 +689,28 @@ def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, ho
         added = _rows(cold)[before:]
         assert [r["content"] for r in added] == [m["content"] for m in new]
         assert not any(NOTICE in str(r["content"]) for r in _rows(cold))
+    finally:
+        cold.shutdown()
+
+
+def test_rc2_a_new_reply_after_a_projected_user_row_is_stored(tmp_path, summaries, host_estimator):
+    """B-ROLL-1 (rc2) control: only the rows stored right after the projection's source are its replies; a
+    different reply in that place is new and is stored."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_user_view()
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        fitted = engine.compress(view, current_tokens=host_estimator(view))
+        before = len(_rows(engine))
+        engine.on_session_end("S", fitted)
+    finally:
+        engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        changed = [*fitted[:-1], {"role": "assistant", "content": "a different reply"}]
+        cold.ingest(changed)
+        assert [r["content"] for r in _rows(cold)[before:]] == ["a different reply"]
     finally:
         cold.shutdown()
 
