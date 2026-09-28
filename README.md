@@ -116,7 +116,7 @@ copy-paste setups per agent type.
 ## Project status
 
 The latest stable release is
-`v0.24.2@3122e0f905b9ff58d38b3fb9e334d5034ac3d0f2` (plugin `hermes-lcm-x`, engine
+`v0.24.3@bafd8824134cfa9d77ef8c0315c8dbf40fae0766` (plugin `hermes-lcm-x`, engine
 `lcm-x`; the rename shipped in v0.24.0, #471). It carries
 the v0.23.2 lossless
 default (durable sensitive-pattern redaction is opt-in; cloud-embedding privacy
@@ -130,10 +130,9 @@ Stable release identity and the continuing `main` development line are
 separate proof planes; do not describe an arbitrary `main` checkout as the
 installed stable product.
 
-The `main` line now identifies itself as
-`hermes-lcm-x v0.24.3 (15 tools)` — a leaf chunk never splits a parallel tool-call group (#559) — on top of the
-`v0.24.2` release tag, which identifies itself as `hermes-lcm-x v0.24.2 (15 tools)`.
-This is the forward bump for the next patch release, never a restamp
+`main` and the `v0.24.3` tag identify themselves as
+`hermes-lcm-x v0.24.3 (15 tools)` — a leaf chunk never splits a parallel tool-call group (#559) — released as `v0.24.3`.
+The next identity bump is the forward bump for the next release, never a restamp
 of any past commit's own recorded identity (#385 fixed the earlier drift).
 
 Eva has accepted exact stable v0.23.1 with hosted `voyage-4-large`,
@@ -1097,7 +1096,7 @@ See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for project conduct expectations
 and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 See the [releases page](https://github.com/electricsheephq/lcm-x/releases),
 [tags page](https://github.com/electricsheephq/lcm-x/tags), and
-[CHANGELOG](CHANGELOG.md) for version history. `v0.24.2` is the latest stable
+[CHANGELOG](CHANGELOG.md) for version history. `v0.24.3` is the latest stable
 GitHub Release; verify its exact SHA before installation.
 
 ## License

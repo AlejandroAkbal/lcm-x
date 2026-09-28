@@ -6,7 +6,7 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
-## v0.24.3 - (unreleased; rc1) (#559: a leaf chunk never splits a parallel tool-call group)
+## v0.24.3 - 2026-09-28 (#559: a leaf chunk never splits a parallel tool-call group)
 
 - Fix: a leaf chunk ends only at a tool-group boundary, so a compaction never summarizes an assistant row with parallel
   tool calls apart from one of its results; before, the host dropped the orphaned result and every later publication
