@@ -172,6 +172,27 @@ def test_native_on_off_counts_b3_b8_from_the_candidate_first_publication():
                for c in cells.select("native-on-off/*"))
 
 
+def test_r3_probe_phase_json_carries_post_publication_counts_so_b3_b8_fail(tmp_path):
+    """R3 F4: the probe computes the post-publication counts BEFORE it writes the phase JSON, so a
+    candidate phase with 3 conflicts and 5 fits after its first publication scores B3/B8 FAIL
+    (it used to write them after, and bars saw no publication: B3 = B8 = 0, a false green)."""
+    import inspect
+    log = ("LCM compaction #1: ...\n" + "reason=publication_invariant_conflict\n" * 3
+           + "LCM survival fit applied (reason=x)\n" * 5)
+    fields = probe.phase_log_fields(log)
+    assert fields["log_counts_after_commit"] == {"publication_invariant_conflict": 3, "survival_fit": 5}
+    source = inspect.getsource(probe.main)
+    assert source.index("phase_log_fields(") < source.index('phase-{phase}.json')
+    cell = {"from_ref": "v0.24.3", "bars": ["B3", "B4", "B8"]}
+    make(tmp_path, rows=clean_rows(), events=clean_events(), phase={"exit": "plugin_switch"}, **cell)
+    (tmp_path / "cell" / "phase-B.json").write_text(json.dumps(
+        {"phase": "B", "exit": "done", "counters": {"failed": []}, "final_check": {"published": True}, **fields}))
+    out = bars.score({"id": "t", "tool_plan": [], "native_recovery": False, "min_compactions": 2,
+                      "final_compaction_check": True, **cell}, tmp_path / "cell")
+    assert out["verdict"] == "FAIL" and out["failed_bars"] == {
+        "B3": {"publication_invariant_conflict": 3}, "B8": {"survival_fit": 5}}, out["failed_bars"]
+
+
 def test_compact_transcript_fields_mean_held_equals_persist(tmp_path):
     events = clean_events()
     for e in events:

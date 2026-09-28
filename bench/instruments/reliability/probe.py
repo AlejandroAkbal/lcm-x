@@ -77,6 +77,16 @@ LOG_COUNTS = {
 FILLER = "alpha beta gamma delta "
 
 
+def phase_log_fields(log: str) -> dict:
+    """The log-derived phase fields, computed before the phase JSON is written: the counts, and (for
+    native-on-off, B3/B8 from the first publication) the counts after this phase's first publication."""
+    first_commit = log.find("LCM compaction #")
+    return {"compactions_logged": len(re.findall(r"LCM compaction #\d+", log)),
+            "log_counts": {k: log.count(v) for k, v in LOG_COUNTS.items()},
+            "log_counts_after_commit": None if first_commit < 0 else {
+                k: log[first_commit:].count(LOG_COUNTS[k]) for k in ("publication_invariant_conflict", "survival_fit")}}
+
+
 def provenance(cell, extra=()):
     """Where every loaded host module (and each cited, not yet loaded one) was executed from; a file outside the
     verified host tree, or the plugin outside its exported tree, is a violation."""
@@ -200,17 +210,13 @@ def main():
             if out["provenance"]["violations"] and exit_kind not in ("unsupported", "refused"):
                 exit_kind, extra = "error", {"reason": "import provenance: " + "; ".join(out["provenance"]["violations"][:3])}
         log = buf.getvalue()
-        out.update(exit=exit_kind, **extra, counters=counters, compactions_logged=len(re.findall(r"LCM compaction #\d+", log)),
-                   log_counts={k: log.count(v) for k, v in LOG_COUNTS.items()}, session_count=session_count())
+        out.update(exit=exit_kind, **extra, counters=counters, **phase_log_fields(log), session_count=session_count())
         (cell_dir / f"phase-{phase}.json").write_text(json.dumps(out, indent=1, default=str))
         (cell_dir / f"probe-{phase}.hermes.log").write_text("\n".join(
             line for line in log.splitlines() if "LCM" in line or "WARNING" in line or "ERROR" in line
             or "compress" in line.lower() or "orphan" in line)[-2_000_000:])
         print(json.dumps({"exit": exit_kind, **extra}), flush=True)
         tfile.close()
-        first_commit = log.find("LCM compaction #")  # native-on-off: B3/B8 count from the first publication
-        out["log_counts_after_commit"] = None if first_commit < 0 else {
-            k: log[first_commit:].count(LOG_COUNTS[k]) for k in ("publication_invariant_conflict", "survival_fit")}
         if exit_kind in ("crash", "clean_exit", "tip_switch", "plugin_switch"):  # between turns, as _CRASH_PROBE
             os._exit(0)  # the host process dies here: no atexit, no flush, no engine shutdown
 
