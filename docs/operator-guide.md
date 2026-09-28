@@ -127,12 +127,15 @@ those turns never reach `lcm.db`. Within the 0.24.x line a plugin-only
 rollback is supported only while no survival-fit projection was persisted
 (#601); once `/lcm doctor` reports a `survival_fit` `projected_count` above 0
 (or unknown, on a record from before that field), an older plugin re-stores
-rows it cannot compact, so restore the `lcm.db` backup taken before the
-upgrade together with the plugin, accepting that rows stored after that backup
-leave the LCM store (they remain in the host session). Before restoring the
-backup, move the current `lcm.db` (with its `-wal` and `-shm` files) aside and
-keep it: nothing is deleted, and its rows are readable again once a version
-that can read them is installed (#601).
+rows it cannot compact. Stop Hermes (every process that uses the profile)
+before you move or restore database files. Move the current `lcm.db` (with its
+`-wal` and `-shm` files) aside and keep it: nothing is deleted, and its rows
+are readable again once a version that can read them is installed (#601). Then
+restore the `lcm.db` backup taken before the first v0.24.5 install (no earlier
+version writes a projection, so that backup holds none) together with the
+plugin, accepting that rows stored after that backup leave the LCM store: they
+stay in the `lcm.db` you moved aside, and the host session keeps only the
+turns it still shows.
 
 ## Migrate from hermes-lcm (v0.23.x and earlier)
 
