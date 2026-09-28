@@ -26,6 +26,7 @@ import logging
 from typing import Optional
 
 from .ingest_protection import quarantine_suspicious_assistant_messages
+from .message_analysis import _tool_call_id
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -145,11 +146,25 @@ class StoreCompleteMixin:
             return max(ids_of(message, claims.get(id(message), ())), default=0)
 
         out, used, excluded, dependent, index = [], 0, [], False, 0
+        group: list = []  # the open tool group: [call ids, its index in out, used before it]
 
-        def take(message, ids) -> bool:  # the budget cuts only at a group boundary: a result joins its call
-            nonlocal used    # and never before the first row that carries a store id (the leaf's coverage)
+        def take(message, ids) -> bool:  # the budget cuts only at a group boundary, never before the first
+            nonlocal used, group          # row that carries a store id (the leaf's coverage)
             tokens = count_message_tokens(message)
-            if message.get("role") != "tool" and used + tokens > budget and any(ids_of(m, i) for m, i in out):
+            answers = message.get("role") == "tool" and group and \
+                str(message.get("tool_call_id") or "").strip() in group[0]
+            if message.get("role") != "tool":
+                group = []
+                if used + tokens > budget and any(ids_of(m, i) for m, i in out):
+                    return False
+                if message.get("tool_calls"):
+                    group = [{_tool_call_id(call) for call in message["tool_calls"]}, len(out), used]
+            elif answers and used + tokens > budget and any(ids_of(m, i) for m, i in out[:group[1]]):
+                # R6-5: a group is admitted whole or not at all, as _select_oldest_leaf_chunk and
+                # tool_group_safe_end admit it: its results cross the budget and the leaf already
+                # covers a stored row, so the leaf ends before the call (a first group is admitted whole).
+                del out[group[1]:]
+                used, group = group[2], []
                 return False
             out.append((message, ids))
             used += tokens

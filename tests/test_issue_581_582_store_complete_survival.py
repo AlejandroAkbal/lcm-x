@@ -946,6 +946,36 @@ def test_r6_4_a_pending_fit_warning_never_crosses_to_another_conversation(tmp_pa
         engine.shutdown()
 
 
+def _group(tag, result_words):
+    call = {"id": f"call_{tag}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    return [{"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": f"call_{tag}", "content": f"result of {tag} " + "row " * result_words}]
+
+
+@pytest.mark.parametrize("first", [False, True], ids=["second-group-crosses", "first-group-oversized"])
+def test_r6_5_store_complete_admits_a_tool_group_whole_or_not_at_all(tmp_path, summaries, first):
+    """R6-5: a hidden tool group whose results cross the leaf budget ends the leaf before its call once
+    the leaf covers a stored row; a first oversized group is admitted whole. Never a call/result split."""
+    engine = _engine(tmp_path, leaf_chunk_tokens=1200)
+    big = _group("BIG", 2500)
+    old = ([*big, {"role": "assistant", "content": "after big" + PAD}] if first else
+           [*_turn("H1", 100.0, tool=True), {"role": "user", "content": "[H2] turn" + PAD, "timestamp": 110.0},
+            *big, {"role": "assistant", "content": "after big" + PAD}])
+    tail = _turn("T9", 900.0)
+    try:
+        engine.ingest([*old, *tail])
+        rows = _rows(engine)
+        call_id = next(int(r["store_id"]) for r in rows if r["role"] == "assistant" and r.get("tool_calls")
+                       and "call_BIG" in json.dumps(r["tool_calls"]))
+        engine.compress(list(tail))
+        covered = set(_covered(engine))
+        assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
+        assert (call_id in covered) == (call_id + 1 in covered)  # no call/result split
+        assert (call_id in covered) == first
+    finally:
+        engine.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"
