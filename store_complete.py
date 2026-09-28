@@ -34,7 +34,8 @@ class StoreCompleteMixin:
     """Mixed into LCMEngine; reads ``self._store``, ``self._lifecycle`` and the identity helpers."""
 
     def _store_complete_frontier(self) -> int:
-        """The publication frontier (the lifecycle row), never below the in-process marker."""
+        """The publication frontier (the lifecycle row), never below the in-process marker. A frontier
+        moved by `/lcm rotate apply` (the backup-first operator command) is honoured by design."""
         state = self._lifecycle.get_by_conversation(self._conversation_id) if self._conversation_id else None
         return max(int(self._last_compacted_store_id or 0), int(getattr(state, "current_frontier_store_id", 0) or 0))
 
