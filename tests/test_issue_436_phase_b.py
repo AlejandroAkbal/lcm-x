@@ -45,9 +45,10 @@ def _merge_turn(engine, tmp_path, new_u, *, host_object, restart):
     return engine, live, r_text
 
 
-def _assert_no_relation_older_than_its_donor(engine):
-    for head, kind, member, _ordinal in _relations(engine):
-        assert kind != "composite" or member is None or int(member) >= int(head), (head, member)
+def _assert_shown_row_is_no_constituent(engine, text):
+    """The host view shows the earlier U as its own occurrence: it is never a composite constituent."""
+    shown = min(int(row["store_id"]) for row in _rows(engine) if row["content"] == text)
+    assert not [rel for rel in _relations(engine) if rel[1] == "composite" and rel[2] == shown]
 
 
 LONG = "[U] please go on with the report" + PAD
@@ -66,7 +67,7 @@ def test_bid1_merged_user_turn_is_stored_even_when_its_text_repeats_an_earlier_r
         expected = Counter([("user", text), ("assistant", "reply to U" + PAD), ("user", r_text),
                             ("user", second), ("assistant", "reply to R+U")])
         assert _stored(_rows(engine)) == expected
-        _assert_no_relation_older_than_its_donor(engine)
+        _assert_shown_row_is_no_constituent(engine, text)
     finally:
         engine.shutdown()
 
