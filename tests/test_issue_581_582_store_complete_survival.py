@@ -17,6 +17,7 @@ import pytest
 import hermes_lcm.compaction as lcm_compaction
 import hermes_lcm.engine as lcm_engine
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.lifecycle_state import LifecyclePublicationConflictError
 
@@ -195,25 +196,84 @@ def test_b_native_on_off_host_summary_chunk_leaves_cover_the_stored_rows(tmp_pat
         engine.shutdown()
 
 
-def test_c_leaf_stops_at_another_conversations_row_under_the_session(tmp_path, summaries):
-    """Eva thread 1: the bound session also holds rows stamped with ANOTHER conversation id. The proof
-    cannot cover them, so the leaf stops before them: a named no-op, never a conflict."""
+def test_c_bound_leaf_passes_rows_of_another_conversation_under_the_session(tmp_path, summaries):
+    """Eva thread 1: the bound session also holds rows of ANOTHER conversation, interleaved in store
+    order. The bound conversation's obligation is its own rows (and blank ones) only: its leaves pass
+    the other conversation's rows without covering them, and publication never conflicts."""
     engine = _engine(tmp_path, fresh_tail_count=2, leaf_chunk_tokens=300)
-    own = [row for i in range(1, 4) for row in _turn(f"T{i}", 10.0 * i)]
+    first = [row for i in range(1, 4) for row in _turn(f"T{i}", 10.0 * i)]
+    second = [row for i in range(4, 7) for row in _turn(f"T{i}", 10.0 * i)]
     tail = [row for i in range(8, 10) for row in _turn(f"T{i}", 10.0 * i)]
     try:
-        engine.ingest(own)
+        engine.ingest(first)
         foreign = [engine._store.append("S", {"role": "assistant", "content": f"[X{i}] other conversation" + PAD},
                                         conversation_id="other") for i in range(3)]
-        view = [*own, *tail]
+        view = [*first, *second, *tail]
         engine.ingest(view)
         statuses = []
-        for _ in range(3):
+        for _ in range(6):
             view = engine.compress(view)
             statuses.append(engine._last_compression_status)
-        assert "error" not in statuses and statuses[0] == "compacted", (statuses, engine._last_compression_noop_reason)
-        assert engine._last_compression_noop_reason == "leaf would reach a row of another conversation under this session"
-        assert 0 < _frontier(engine) < min(foreign) and set(foreign).isdisjoint(_covered(engine))
+        assert "error" not in statuses, (statuses, engine._last_compression_noop_reason)
+        assert _frontier(engine) > max(foreign), (_frontier(engine), foreign, statuses)
+        assert set(foreign).isdisjoint(_covered(engine))
+        assert all("other conversation" not in text for text in summaries)
+        _assert_contiguous_for_conversation(engine)
+    finally:
+        engine.shutdown()
+
+
+def _assert_contiguous_for_conversation(engine) -> None:
+    """#5 per conversation: every row of the bound (or blank) conversation at or below the frontier
+    is covered exactly once; rows of other conversations are neither required nor covered."""
+    covered = Counter(_covered(engine))
+    frontier = _frontier(engine)
+    own = [int(r["store_id"]) for r in _rows(engine)
+           if int(r["store_id"]) <= frontier and str(r.get("conversation_id") or "").strip() in ("", "conv")]
+    assert own and all(covered[store_id] == 1 for store_id in own), (frontier, own, covered)
+
+
+def _stage(engine, expected, covered, node_source=None):
+    node = SummaryNode(session_id="S", summary="s", token_count=1, source_token_count=1,
+                       source_ids=list(node_source or covered))
+
+    def stage(conn, node_id) -> None:
+        engine._lifecycle.stage_compaction_publication(conn, "conv", "S", node_id, expected, list(covered))
+
+    engine._dag.add_node(node, before_commit=stage)
+
+
+def _mixed_rows(engine):
+    """Own A, other X, own B, other Y, own C: two conversations interleaved under session S."""
+    store, ids = engine._store, {}
+    for tag, conversation in (("A", "conv"), ("X", "other"), ("B", "conv"), ("Y", "other"), ("C", "conv")):
+        ids[tag] = store.append("S", {"role": "assistant", "content": f"[{tag}] row" + PAD}, conversation_id=conversation)
+    return ids
+
+
+def test_5_bound_frontier_passes_other_conversation_rows_but_not_an_unproven_bound_row(tmp_path):
+    """#5 per conversation: A..C (own rows A, B, C) publishes past the other conversation's X and Y;
+    skipping the unproven own row B, which sits between X and Y, is refused."""
+    engine = _engine(tmp_path)
+    try:
+        ids = _mixed_rows(engine)
+        with pytest.raises(LifecyclePublicationConflictError, match="not contiguous"):
+            _stage(engine, 0, [ids["A"], ids["C"]])
+        assert _frontier(engine) == 0
+        _stage(engine, 0, [ids["A"], ids["B"], ids["C"]])
+        assert _frontier(engine) == ids["C"]
+    finally:
+        engine.shutdown()
+
+
+def test_proof_rejects_covering_another_conversations_row(tmp_path):
+    """A leaf that claims another conversation's row as coverage is still refused."""
+    engine = _engine(tmp_path)
+    try:
+        ids = _mixed_rows(engine)
+        with pytest.raises(LifecyclePublicationConflictError, match="ownership"):
+            _stage(engine, 0, [ids["A"], ids["X"], ids["B"]])
+        assert _frontier(engine) == 0 and _covered(engine) == []
     finally:
         engine.shutdown()
 

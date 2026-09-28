@@ -1082,6 +1082,7 @@ class CompactionMixin:
                     if (
                         store_id not in proven
                         and store_id not in proofs
+                        and str(row.get("conversation_id") or "").strip() in ("", str(self._conversation_id or ""))
                         and self._matches_ignore_message_patterns(row, stored_row=True)
                     ):
                         proofs[store_id] = row.get("content")
@@ -1657,15 +1658,13 @@ class CompactionMixin:
             summary_input_chunk = []
             anchor_claims: dict[int, list[int]] = {}  # #436 R4: id(input row) -> the store ids its text covers
             selected_input = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
-            self._store_complete_excluded, self._store_complete_cut, self._store_complete_foreign = [], False, False
+            self._store_complete_excluded, self._store_complete_cut = [], False
             anchored_input = self._identity_anchor_summary_input(
                 selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk,
                 budget=max(1, int(self._config.leaf_chunk_tokens)), accounted_ids=publication_excluded_store_ids,
             )
             if anchored_input == []:  # #581: the oldest owned row above the frontier is a retained occurrence
-                noop_reason = ("leaf would reach a row of another conversation under this session"
-                               if self._store_complete_foreign else
-                               "leaf would end before an unresolved retained occurrence")
+                noop_reason = "leaf would end before an unresolved retained occurrence"
                 break
             publication_excluded_store_ids.extend(self._store_complete_excluded)
             for message, claims in anchored_input or [(message, []) for message in selected_input]:

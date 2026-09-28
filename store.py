@@ -713,12 +713,17 @@ class MessageStore:
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
                   limit: int = 1000,
-                  conversation_id: str | None = None) -> List[Dict[str, Any]]:
-        """Get messages in a store_id range for a session."""
+                  conversation_id: str | None = None,
+                  include_blank_conversation: bool = False) -> List[Dict[str, Any]]:
+        """Get messages in a store_id range for a session (``include_blank_conversation``: rows with
+        no conversation id count as ``conversation_id``'s too)."""
         where = ["session_id = ?", "store_id >= ?"]
         args: list[Any] = [session_id, start_id]
         conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
-        if conversation_clause:
+        if conversation_clause and include_blank_conversation:
+            where.append("trim(coalesce(conversation_id, '')) IN ('', ?)")
+            args.extend(conversation_args)
+        elif conversation_clause:
             where.append(conversation_clause)
             args.extend(conversation_args)
         if end_id is not None:
