@@ -141,9 +141,9 @@ class StoreCompleteMixin:
         out, used, excluded, dependent, index = [], 0, [], False, 0
 
         def take(message, ids) -> bool:  # the budget cuts only at a group boundary: a result joins its call
-            nonlocal used
+            nonlocal used    # and never before the first row that carries a store id (the leaf's coverage)
             tokens = count_message_tokens(message)
-            if out and message.get("role") != "tool" and used + tokens > budget:
+            if message.get("role") != "tool" and used + tokens > budget and any(ids_of(m, i) for m, i in out):
                 return False
             out.append((message, ids))
             used += tokens
@@ -192,8 +192,9 @@ class StoreCompleteMixin:
                 break
             out = out[:next(i for i, (m, ids) in enumerate(out) if any(s > hole for s in ids_of(m, ids)))]
             complete = False
-        if not out:
-            return []
+        if not out or (not any(ids_of(m, ids) for m, ids in out)
+                       and all(self._is_context_summary_content(m.get("content")) for m in chunk)):
+            return []  # nothing to cover: at most a host summary of rows already at or below the frontier
         emitted = sum(1 for message, _ids in out if id(message) in in_chunk)
         if emitted == len(out) == len(chunk) and not excluded and not any(ids for _m, ids in out):
             return None  # nothing hidden, claimed or excluded: today's input and mapping

@@ -171,6 +171,30 @@ def test_c_leaf_ends_before_a_retained_occurrence(tmp_path, summaries):
         engine.shutdown()
 
 
+def test_b_native_on_off_host_summary_chunk_leaves_cover_the_stored_rows(tmp_path, summaries):
+    """The native-on-off shape: a native-ON ref left a host summary (a row the store does not map) as the
+    only raw chunk row, with the rows it summarised stored above frontier 0. The leaf covers stored rows
+    (the host summary never takes the whole budget) instead of publishing no coverage."""
+    engine = _engine(tmp_path, fresh_tail_count=6, leaf_chunk_tokens=300)
+    old = [row for i in range(1, 9) for row in _turn(f"T{i}", 10.0 * i)]
+    host_summary = {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+                                               "into the summary below." + PAD * 3, "timestamp": 95.0}
+    tail = [row for i in range(9, 12) for row in _turn(f"T{i}", 10.0 * i)]
+    try:
+        engine.ingest([*old, *tail])
+        view = [host_summary, *tail]
+        engine._ingest_cursor = len(view)
+        statuses = []
+        for _ in range(3):
+            view = engine.compress(view)
+            statuses.append(engine._last_compression_status)
+        assert statuses[0] == "compacted" and "error" not in statuses, (statuses, engine._last_compression_noop_reason)
+        assert _frontier(engine) > 0
+        _assert_contiguous(engine)
+    finally:
+        engine.shutdown()
+
+
 # -- (d) the carry set ----------------------------------------------------------------------------------
 
 def _state_db(tmp_path, sessions):

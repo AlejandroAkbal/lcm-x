@@ -72,7 +72,8 @@ class SurvivalFitMixin:
     def _survival_generated(self, message) -> bool:
         """LCM's own regenerated context (summaries, carriers): derived from stored rows, never a row."""
         return (self._is_replayed_context_scaffold_message(message)
-                or self._generated_context_carrier_remainder(message) is not None)
+                or self._generated_context_carrier_remainder(message) is not None
+                or self._is_context_summary_content(message.get("content")))  # a host summary of stored rows
 
     def _survival_fit(self, messages, result, observed_tokens, reason: str, *, after_exception: bool = False):
         """``result``, or the fitted list when ``result`` is over the survival budget."""
