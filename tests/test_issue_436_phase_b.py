@@ -213,3 +213,18 @@ def test_r3_gap_fill_never_rehydrates_a_row_the_view_shows(tmp_path, monkeypatch
         assert not [ids for _row, ids in out or () if b_id in ids], out
     finally:
         engine.shutdown()
+
+
+def test_r3_r1_a_multi_form_row_leaves_the_single_form_row_its_occurrence(tmp_path, monkeypatch):
+    """R1: A answers {xval, yval} (listed first in store order), B only xval; the host re-issues both. A takes
+    yval and B xval: nothing is stored again."""
+    engine = _engine(tmp_path)
+    try:
+        a, b = _u("yval", 1.0), _u("xval", 1.0)
+        engine.ingest([_u("[P] dropped prefix" + PAD, 0.5), a, b, _a("reply" + PAD, 2.0)])
+        _forms_first(engine, monkeypatch, {"yval": ["xval", "yval"]})
+        engine.ingest([dict(b), dict(a), _a("reply" + PAD, 2.0), _u("[N] new" + PAD, 5.0)])  # the prefix row left
+        assert [row["content"] for row in _rows(engine)].count("yval") == 1
+        assert [row["content"] for row in _rows(engine)].count("xval") == 1
+    finally:
+        engine.shutdown()
