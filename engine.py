@@ -375,8 +375,10 @@ _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 
-# #608: a threshold sweep does not start a summariser call with less time than this left.
+# #608: a threshold sweep does not start a summariser call with less time than this left, and after a
+# sweep that spent its budget before the first leaf, the threshold answer is no for the hold time.
 _THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS = 15.0
+_SWEEP_BUDGET_HOLD_SECONDS = 600.0
 
 
 class SweepBudgetExhausted(TimeoutError):
@@ -668,6 +670,9 @@ class LCMEngine(
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
+        # #608: wall clock until which the threshold answer is no, after a sweep
+        # spent its time budget before the first leaf. A stored leaf clears it.
+        self._sweep_budget_hold_until: float = 0.0
         # One-shot handoff from preflight: adopt an already-durable replay
         # cleanup during boundary cooldown without running summary work.
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
@@ -1545,6 +1550,20 @@ class LCMEngine(
             )
             return True
         self._last_boundary_skip_time = 0
+        return False
+
+    def _start_sweep_budget_hold(self) -> None:
+        self._sweep_budget_hold_until = time.time() + _SWEEP_BUDGET_HOLD_SECONDS
+
+    def _sweep_budget_hold_active(self) -> bool:
+        """#608: return true while a no-leaf sweep budget stop holds the threshold answer."""
+        if self._sweep_budget_hold_until <= 0:
+            return False
+        remaining = self._sweep_budget_hold_until - time.time()
+        if remaining > 0:
+            logger.debug("LCM threshold compression held: %.1f seconds left after a sweep budget stop", remaining)
+            return True
+        self._sweep_budget_hold_until = 0.0
         return False
 
     def _record_ingest_success(self) -> None:

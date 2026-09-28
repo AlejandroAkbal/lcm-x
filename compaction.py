@@ -84,7 +84,7 @@ class CompactionMixin:
             return True
         if self.threshold_tokens <= 0:
             return False
-        return tokens >= self.threshold_tokens
+        return tokens >= self.threshold_tokens and not self._sweep_budget_hold_active()
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
@@ -193,6 +193,12 @@ class CompactionMixin:
             if self._compression_boundary_cooldown_active():
                 return False
             if (
+                self.threshold_tokens > 0
+                and max(rough, replay_rough) >= self.threshold_tokens
+                and self._sweep_budget_hold_active()
+            ):
+                return False
+            if (
                 self._config.native_recovery
                 and self.threshold_tokens > 0
                 and replay_rough >= self.threshold_tokens
@@ -262,6 +268,8 @@ class CompactionMixin:
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+            if self._sweep_budget_hold_active():
+                return False
             if self._config.native_recovery:
                 return self._mark_preflight_compression_requested(
                     depends_on_pressure_yield=self._pressure_yield_preflight_candidate,
@@ -1883,6 +1891,7 @@ class CompactionMixin:
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
             pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
             leaf_compacted_this_turn = True
+            self._sweep_budget_hold_until = 0.0  # #608: a stored leaf ends the hold
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
             if (
@@ -1963,6 +1972,7 @@ class CompactionMixin:
                     _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
                     ", ".join(f"{step}={seconds:.1f}s" for step, seconds in sweep_step_seconds.items()),
                 )
+                self._start_sweep_budget_hold()
             self._refresh_raw_backlog_debt(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,

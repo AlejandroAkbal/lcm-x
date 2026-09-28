@@ -249,6 +249,34 @@ def test_condensation_budget_end_is_a_stop_reason_without_a_warning(
         engine.shutdown()
 
 
+# -- 6. the hold after a no-leaf stop -----------------------------------------------------------------------
+
+def test_no_leaf_budget_stop_holds_the_threshold_answer_only(tmp_path, summaries, clock, monkeypatch, caplog):
+    engine = _engine(tmp_path)
+    view = _view()
+    try:
+        _spend_budget_before_first_leaf(engine, view, clock, monkeypatch, caplog)
+        assert engine._sweep_budget_hold_until > time.time()
+        assert engine.should_compress(engine.threshold_tokens + 1) is False
+        assert engine.should_compress_preflight(view) is False
+        assert engine.should_compress(150_000) is True  # over the 100k assembly cap: overflow recovery
+        real_time = time.time
+        with monkeypatch.context() as later:
+            later.setattr(lcm_engine.time, "time", lambda: real_time() + 601.0)
+            assert engine.should_compress(engine.threshold_tokens + 1) is True
+        engine._sweep_budget_hold_until = time.time() + 600.0
+        assert engine.should_compress(engine.threshold_tokens + 1) is False
+        clock.offset = 0.0  # a normal budget: compress() is not gated, and a stored leaf clears the hold
+        monkeypatch.setattr(engine, "_get_store_id_map_for_messages",
+                            LCMEngine._get_store_id_map_for_messages.__get__(engine))
+        engine.compress(view, current_tokens=engine.threshold_tokens + 1)
+        assert engine._last_compression_status == "compacted" and summaries
+        assert engine._sweep_budget_hold_until == 0.0
+        assert engine.should_compress(engine.threshold_tokens + 1) is True
+    finally:
+        engine.shutdown()
+
+
 # -- 7. the empty anchor slice is not mapped -----------------------------------------------------------------
 
 def test_empty_anchor_slice_is_not_mapped_and_the_pass_result_is_the_same(tmp_path, summaries, monkeypatch):
