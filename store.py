@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional
 
 from .db_bootstrap import (
+    select_conversation_range,
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
@@ -720,10 +721,11 @@ class MessageStore:
         where = ["session_id = ?", "store_id >= ?"]
         args: list[Any] = [session_id, start_id]
         conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
-        if conversation_clause and include_blank_conversation:
-            where.append("trim(coalesce(conversation_id, '')) IN ('', ?)")
-            args.extend(conversation_args)
-        elif conversation_clause:
+        if conversation_clause and include_blank_conversation:  # index seeks, never the foreign rows
+            rows = select_conversation_range(self._conn, _MESSAGE_SELECT_COLUMNS, session_id, conversation_args[0],
+                                             int(start_id) - 1, end_id, limit)
+            return [self._row_to_dict(r) for r in rows]
+        if conversation_clause:
             where.append(conversation_clause)
             args.extend(conversation_args)
         if end_id is not None:

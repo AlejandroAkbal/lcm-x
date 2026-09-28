@@ -266,6 +266,34 @@ def test_5_bound_frontier_passes_other_conversation_rows_but_not_an_unproven_bou
         engine.shutdown()
 
 
+def _plans_of(conn, run) -> list[str]:
+    """EXPLAIN QUERY PLAN of every SELECT on messages that ``run()`` executes on ``conn``."""
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        run()
+    finally:
+        conn.set_trace_callback(None)
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT") and " messages" in sql]
+    return [" ".join(str(row[-1]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql)) for sql in selects]
+
+
+def test_r3_owned_reads_seek_the_conversation_index(tmp_path):
+    """R3 F3: the store-complete range read and the proof's obligation read are index seeks on
+    (conversation_id, session_id, store_id), never a walk over another conversation's rows."""
+    engine = _engine(tmp_path)
+    try:
+        ids = _mixed_rows(engine)
+        plans = _plans_of(engine._store.connection, lambda: engine._store_complete_owned_rows(0, None, []))
+        assert plans and all("idx_msg_conversation_session" in plan for plan in plans), plans
+        plans = _plans_of(engine._dag.connection, lambda: _stage(engine, 0, [ids["A"], ids["B"], ids["C"]]))
+        owned = [plan for plan in plans if "store_id" in plan and "json_each" not in plan and "summary" not in plan]
+        assert owned and all("idx_msg_conversation_session" in plan for plan in owned), plans
+        assert _frontier(engine) == ids["C"]
+    finally:
+        engine.shutdown()
+
+
 def test_proof_rejects_covering_another_conversations_row(tmp_path):
     """A leaf that claims another conversation's row as coverage is still refused."""
     engine = _engine(tmp_path)

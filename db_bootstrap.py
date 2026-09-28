@@ -641,6 +641,35 @@ def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def select_conversation_range(conn: sqlite3.Connection, columns: str, session_id: str, conversation_id: str,
+                              after_store_id: int, end_store_id: int | None = None,
+                              limit: int | None = None) -> list:
+    """#581: a session's rows in ``(after_store_id, end_store_id]`` whose conversation is ``conversation_id``
+    or blank, in store order (``columns`` starts with ``store_id``). One seek per value on
+    idx_msg_conversation_session, so another conversation's rows under the same session are never
+    walked. Writes store the id stripped with default '' (store.py append), so '' is the only blank."""
+    rows: list = []
+    for value in dict.fromkeys((str(conversation_id or ""), "")):
+        sql = (f"SELECT {columns} FROM messages INDEXED BY idx_msg_conversation_session "
+               "WHERE conversation_id = ? AND session_id = ? AND store_id > ?")
+        args: list = [value, session_id, int(after_store_id)]
+        if end_store_id is not None:
+            sql += " AND store_id <= ?"
+            args.append(int(end_store_id))
+        sql += " ORDER BY store_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        try:
+            rows.extend(conn.execute(sql, args).fetchall())
+        except sqlite3.OperationalError as exc:  # a store opened without the index: same rows, walked
+            if "no such index" not in str(exc):
+                raise
+            rows.extend(conn.execute(sql.replace(" INDEXED BY idx_msg_conversation_session", ""), args).fetchall())
+    rows.sort(key=lambda row: int(row[0]))
+    return rows if limit is None else rows[:limit]
+
+
 def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """

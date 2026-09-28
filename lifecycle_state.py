@@ -1052,11 +1052,12 @@ class LifecycleStateStore:
             ownership_args = [value for item in range_batch for value in item]
             # #581: the obligation is this conversation's rows (and blank ones); another
             # conversation's rows under the same session follow that conversation's lifecycle
-            # and are never accepted as coverage (checked above).
+            # and are never accepted as coverage (checked above). `IN (?, '')` keeps every
+            # range a seek on idx_msg_conversation_session (writes store the id stripped, '' blank).
             for row in conn.execute(
                 "SELECT store_id, session_id FROM messages WHERE ("
                 + ownership_clause
-                + ") AND trim(coalesce(conversation_id, '')) IN ('', ?)",
+                + ") AND conversation_id IN (?, '')",
                 [*ownership_args, conversation_id],
             ).fetchall():
                 rows_by_store_id[int(row[0])] = row
