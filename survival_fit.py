@@ -314,17 +314,19 @@ class SurvivalFitMixin:
         )
         self._last_survival_fit = {"reason": reason, "dropped_rows": count, "notice": notice, "at": time.time(),
                                    "reached_budget": after <= budget}
-        try:
-            record = self._store.read_metadata_json(SURVIVAL_FIT_COUNTER_KEY)
+
+        def counted(record):  # runs inside the store's write transaction: concurrent engines add, never overwrite
             record = record if isinstance(record, dict) else {}
-            record = {"count": int(record.get("count") or 0) + 1, "last_reason": reason, "last_at": time.time(),
-                      "last_conversation": str(self._conversation_id or self._session_id or ""),
-                      "last_reached_budget": after <= budget,
-                      "unreached_budget_count": int(record.get("unreached_budget_count") or 0) + (after > budget),
-                      # fits that projected a row (#601); a record from before the key stays unknown (no key)
-                      **({"projected_count": int(record.get("projected_count") or 0) + bool(projected)}
-                         if "projected_count" in record or not record.get("count") else {})}
-            self._store.write_metadata_json([SURVIVAL_FIT_COUNTER_KEY], json.dumps(record, sort_keys=True))
+            return {"count": int(record.get("count") or 0) + 1, "last_reason": reason, "last_at": time.time(),
+                    "last_conversation": str(self._conversation_id or self._session_id or ""),
+                    "last_reached_budget": after <= budget,
+                    "unreached_budget_count": int(record.get("unreached_budget_count") or 0) + (after > budget),
+                    # fits that projected a row (#601); a record from before the key stays unknown (no key)
+                    **({"projected_count": int(record.get("projected_count") or 0) + bool(projected)}
+                       if "projected_count" in record or not record.get("count") else {})}
+
+        try:
+            self._store.update_metadata_json(SURVIVAL_FIT_COUNTER_KEY, counted)
         except Exception:
             logger.debug("LCM survival-fit counter write failed", exc_info=True)
         key = str(self._conversation_id or self._session_id or "")

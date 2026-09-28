@@ -1288,6 +1288,27 @@ class MessageStore:
                 conn.commit()
         return wrote
 
+    def update_metadata_json(self, key: str, update: Any) -> Any:
+        """Atomic read-modify-write of one metadata JSON value: ``update(current)`` (None when absent) runs
+        under the store write lock inside ``BEGIN IMMEDIATE``, so a writer on another connection to the
+        same database waits instead of interleaving. Returns the value written."""
+        conn = self._conn
+        if conn is None:
+            return None
+        with self._write_lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                value = update(self.read_metadata_json(key))
+                conn.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, json.dumps(value, sort_keys=True)),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return value
+
     # -- Compaction telemetry ------------------------------------------------
 
     @staticmethod

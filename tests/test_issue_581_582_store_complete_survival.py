@@ -714,6 +714,34 @@ def test_rc2_survival_counter_records_projections(tmp_path, summaries, host_esti
         engine.shutdown()
 
 
+def test_rc3_survival_counter_update_is_atomic_across_engines(tmp_path):
+    """R3-2: two engines on one lcm.db. B reads the counter, A records a projecting fit, then B records a
+    drop-only fit: B's stale read never overwrites A's projection (projected_count never decreases)."""
+    import threading
+    import time as _time
+
+    a, b = _engine(tmp_path), _engine(tmp_path)
+    fit_a = threading.Thread(target=a._survival_record, args=("a", 1, [1], 10, 5, 10, True, "n"))
+    real = b._store.read_metadata_json
+
+    def stale_read(key):
+        value = real(key)
+        if key == "survival_fit:counter" and not fit_a.is_alive() and fit_a.ident is None:
+            fit_a.start()  # A records while B holds what it read
+            _time.sleep(0.3)
+        return value
+
+    b._store.read_metadata_json = stale_read
+    try:
+        b._survival_record("b", 1, [2], 10, 5, 10, False, "n")
+        fit_a.join(10)
+        record = a._store.read_metadata_json("survival_fit:counter")
+        assert record["count"] == 2 and record["projected_count"] >= 1, record
+    finally:
+        a.shutdown()
+        b.shutdown()
+
+
 def _projection_of(engine, store_id) -> dict:
     """The view copy the survival fit makes of stored row ``store_id`` (its host stamp kept)."""
     row = engine._store.get(store_id)
