@@ -375,6 +375,13 @@ _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 
+# #608: a threshold sweep does not start a summariser call with less time than this left.
+_THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS = 15.0
+
+
+class SweepBudgetExhausted(TimeoutError):
+    """The threshold sweep's own time budget is spent: a stop condition, not a provider failure."""
+
 
 def _normalize_total_compactions(value: Any) -> int:
     """Return a persisted compaction total only when it is a valid counter."""
@@ -1869,8 +1876,8 @@ class LCMEngine(
                 timeout_seconds = self._config.summary_timeout_ms / 1000
                 if deadline is not None:
                     remaining_seconds = deadline - time.monotonic()
-                    if remaining_seconds <= 0:
-                        raise TimeoutError("threshold full sweep time budget exhausted")
+                    if remaining_seconds < _THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS:
+                        raise SweepBudgetExhausted("threshold full sweep time budget exhausted")
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
@@ -1890,6 +1897,8 @@ class LCMEngine(
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
+                if isinstance(exc, SweepBudgetExhausted):
+                    raise  # a smaller chunk cannot get the time back
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
                     raise
                 smaller_chunk = self._next_leaf_rescue_chunk(attempt_chunk, source_tokens)
@@ -6689,8 +6698,8 @@ class LCMEngine(
         timeout_seconds = self._config.summary_timeout_ms / 1000
         if deadline is not None:
             remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                raise TimeoutError("threshold full sweep time budget exhausted")
+            if remaining_seconds < _THRESHOLD_FULL_SWEEP_MIN_CALL_SECONDS:
+                raise SweepBudgetExhausted("threshold full sweep time budget exhausted")
             timeout_seconds = min(timeout_seconds, remaining_seconds)
         summary_text, level = summarize_with_escalation(
             text=combined_text,
@@ -6791,6 +6800,8 @@ class LCMEngine(
                     focus_topic=focus_topic,
                     deadline=deadline,
                 )
+            except SweepBudgetExhausted:
+                return passes, "time_budget_exhausted"
             except Exception as exc:
                 if _is_sqlite_locked_error(exc):
                     setattr(exc, "lcm_completed_condensation_passes", passes)

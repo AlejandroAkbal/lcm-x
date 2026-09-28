@@ -1722,6 +1722,11 @@ class CompactionMixin:
                         **summary_kwargs,
                     )
                 except Exception as exc:
+                    from .engine import SweepBudgetExhausted  # engine imports this module
+
+                    if threshold_full_sweep_active and isinstance(exc, SweepBudgetExhausted):
+                        sweep_stop_reason = "time_budget_exhausted"  # #608: a stop, with or without a leaf
+                        break
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
                         logger.warning(
@@ -1925,6 +1930,8 @@ class CompactionMixin:
             sweep_stop_reason = "pass_budget_exhausted"
 
         if not leaf_compacted_this_turn:
+            if sweep_stop_reason == "time_budget_exhausted":
+                noop_reason = "threshold sweep time budget spent before the first leaf"
             self._refresh_raw_backlog_debt(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,
