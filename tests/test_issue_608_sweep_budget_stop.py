@@ -102,6 +102,27 @@ def _spend_budget_before_first_leaf(engine, view, clock, monkeypatch, caplog):
 
 # -- 1. the budget is spent before the first leaf ------------------------------------------------------
 
+def test_budget_spent_in_the_first_map_returns_the_input_unchanged(tmp_path, summaries, clock, monkeypatch, caplog):
+    engine = _engine(tmp_path, leaf_chunk_tokens=2000)  # a multi-row chunk: the base logs two retry lines
+    view = _view()
+    try:
+        result = _spend_budget_before_first_leaf(engine, view, clock, monkeypatch, caplog)
+        telemetry = engine.get_status()["threshold_full_sweep"]
+        assert result is view
+        assert engine._last_compression_status == "noop"
+        assert engine._last_compression_noop_reason == "threshold sweep time budget spent before the first leaf"
+        assert telemetry["status"] == "noop" and telemetry["leaf_passes"] == 0
+        assert telemetry["stop_reason"] == "time_budget_exhausted" and telemetry["budget_exhausted"] is True
+        assert summaries == []
+        assert _count(caplog, RETRY_LINE) == 0
+        assert _count(caplog, BUDGET_LINE) == 1
+        line = next(r.getMessage() for r in caplog.records if BUDGET_LINE in r.getMessage())
+        assert "(budget 120s); steps: " in line and "anchor_ids=121.0s" in line  # numbers and step names only
+        assert "user turn" not in line and "alpha" not in line
+    finally:
+        engine.shutdown()
+
+
 def test_budget_spent_in_the_store_complete_step_stops_before_the_identity_anchor(
         tmp_path, summaries, clock, monkeypatch, caplog):
     """The view is all fresh tail and the owned backlog is hidden: the store-complete step is the one
@@ -123,6 +144,7 @@ def test_budget_spent_in_the_store_complete_step_stops_before_the_identity_ancho
         assert result is view and engine._last_compression_status == "noop"
         assert telemetry["stop_reason"] == "time_budget_exhausted"
         assert anchor_calls == [] and summaries == []
+        assert _count(caplog, BUDGET_LINE) == 1
     finally:
         engine.shutdown()
 

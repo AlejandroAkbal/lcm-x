@@ -1957,6 +1957,12 @@ class CompactionMixin:
         if not leaf_compacted_this_turn:
             if sweep_stop_reason == "time_budget_exhausted":
                 noop_reason = "threshold sweep time budget spent before the first leaf"
+                logger.warning(
+                    "LCM threshold sweep spent its time budget before the first leaf: %.1fs (budget %.0fs); steps: %s",
+                    time.monotonic() - (sweep_deadline - _THRESHOLD_FULL_SWEEP_MAX_SECONDS),
+                    _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
+                    ", ".join(f"{step}={seconds:.1f}s" for step, seconds in sweep_step_seconds.items()),
+                )
             self._refresh_raw_backlog_debt(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,
