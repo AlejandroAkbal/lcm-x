@@ -1376,6 +1376,7 @@ class CompactionMixin:
                 working_messages[:leading_anchor_count]
             )
             filter_exclusion_proofs: Dict[int, Any] = {}
+            hidden_backlog = False
             if fresh_tail_start <= leading_anchor_count:
                 # Also reached with threshold_full_sweep_active: a sweep whose
                 # "drained" raw prefix is really a tail covering the whole
@@ -1387,6 +1388,8 @@ class CompactionMixin:
                     eligible_tokens=0,
                 ):
                     continue
+                hidden_backlog = self._store_complete_backlog(working_messages, leading_anchor_count)
+            if fresh_tail_start <= leading_anchor_count and not hidden_backlog:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 if threshold_full_sweep_active:
                     sweep_raw_drained = True
@@ -1404,7 +1407,7 @@ class CompactionMixin:
             # those with the scaffold, keeping any row committed lineage does not hold.
             # Reuse the map when the pass maps this same list.
             drops, premapped_store_ids, kept = set(range(leading_anchor_count, candidate_start)), None, 0
-            if leaf_passes == 0 and not resumed_prefix:
+            if leaf_passes == 0 and not resumed_prefix and not hidden_backlog:
                 resumed, store_ids, summary_tokens, kept = self._committed_replay_drops(
                     working_messages, candidate_start
                 )
@@ -1549,7 +1552,9 @@ class CompactionMixin:
                 focus_topic = self._derive_auto_focus_topic(working_messages)
 
             candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
-            if not candidate_raw:
+            if not candidate_raw and not hidden_backlog:  # #581: owned hidden backlog is scheduled, not a no-op
+                hidden_backlog = self._store_complete_backlog(working_messages, leading_anchor_count)
+            if not candidate_raw and not hidden_backlog:
                 if self._maybe_engage_fresh_tail_pressure_yield(
                     pressure_messages,
                     observed_prompt_tokens,
@@ -1564,7 +1569,9 @@ class CompactionMixin:
 
             pressure_candidate_raw = pressure_messages[leading_anchor_count:fresh_tail_start]
             raw_tokens_outside_tail = count_messages_tokens(pressure_candidate_raw)
-            if threshold_full_sweep_active:
+            if hidden_backlog:
+                to_compact = []
+            elif threshold_full_sweep_active:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(
                     raw_tokens_outside_tail
                 )
@@ -1624,7 +1631,7 @@ class CompactionMixin:
                 else:
                     to_compact = candidate_raw
 
-            if not to_compact:
+            if not to_compact and not hidden_backlog:
                 noop_reason = "no eligible leaf chunk selected"
                 break
             to_compact = self._identity_anchor_extend_chunk(to_compact, candidate_raw)  # #563
@@ -1634,9 +1641,15 @@ class CompactionMixin:
             summary_input_chunk = []
             anchor_claims: dict[int, list[int]] = {}  # #436 R4: id(input row) -> the store ids its text covers
             selected_input = [message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids]
+            self._store_complete_excluded, self._store_complete_cut = [], False
             anchored_input = self._identity_anchor_summary_input(
-                selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk
+                selected_input, self._current_compress_store_ids_by_message_id, working_messages, selected_raw_chunk,
+                budget=max(1, int(self._config.leaf_chunk_tokens)), accounted_ids=publication_excluded_store_ids,
             )
+            if anchored_input == []:  # #581: the oldest owned row above the frontier is a retained occurrence
+                noop_reason = "leaf would end before an unresolved retained occurrence"
+                break
+            publication_excluded_store_ids.extend(self._store_complete_excluded)
             for message, claims in anchored_input or [(message, []) for message in selected_input]:
                 remainder = self._generated_context_carrier_remainder(message)
                 if remainder is not None:
@@ -1690,11 +1703,6 @@ class CompactionMixin:
                         summary_input_chunk,
                         **summary_kwargs,
                     )
-                    selected_ids = {id(message) for message in selected_raw_chunk}
-                    if anchored_input and not any(id(sources.get(id(m), m)) in selected_ids for m in compacted_chunk):
-                        # #436 T6: a rescue prefix of rehydrated rows alone read no raw row; never let the
-                        # boundary fallback below consume raw rows the summarizer did not read.
-                        raise RuntimeError("adaptive leaf rescue kept only rehydrated rows")
                 except Exception as exc:
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
@@ -1714,9 +1722,15 @@ class CompactionMixin:
                 idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
             ]
             last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
+            if anchored_input and not compacted_positions:
+                # #436 T6 / #581: a leaf of stored rows alone (hidden rows, or a rescue prefix of them)
+                # consumes no raw row; the boundary fallback never consumes rows the summarizer did not read.
+                last_compacted_raw_pos = -1
             last_consumed_raw_pos = last_compacted_raw_pos
             while (
-                last_consumed_raw_pos + 1 < len(selected_raw_chunk)
+                not self._store_complete_cut
+                and last_consumed_raw_pos >= 0
+                and last_consumed_raw_pos + 1 < len(selected_raw_chunk)
                 and id(selected_raw_chunk[last_consumed_raw_pos + 1]) in dependent_reply_message_ids
             ):
                 last_consumed_raw_pos += 1

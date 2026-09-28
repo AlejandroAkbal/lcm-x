@@ -137,6 +137,7 @@ from .reconcile import _emission_identity
 from .reconcile import _has_lossy_redacted_identity, _merge_append_cut, _proof_user_identity
 from .compaction import CompactionMixin
 from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
+from .store_complete import StoreCompleteMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -397,6 +398,7 @@ class LCMEngine(
     ResetStateMixin,
     ReconcileMixin,
     IdentityAnchorMixin,
+    StoreCompleteMixin,
     AuxiliarySessionMixin,
     PlaceholderLedgerMixin,
     BypassMixin,

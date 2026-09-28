@@ -75,15 +75,13 @@ def test_duplicate_active_identity_cannot_orphan_a_durable_occurrence(
     finally:
         engine.shutdown()
 
-    assert result == active
-    assert nodes == []
+    # #581: the durable occurrence the duplicate view rows do not map is read from the store into the
+    # leaf, so publication proves contiguous coverage instead of failing open; nothing is orphaned.
     assert state is not None
-    assert state.current_frontier_store_id == 0
-    assert engine.last_compression_status == "error"
-    assert engine.last_compression_noop_reason == (
-        "summary publication could not prove contiguous source coverage"
-    )
+    assert engine.last_compression_status == "compacted"
+    assert result[-1] == active[-1]
     published_frontier = state.current_frontier_store_id
+    assert published_frontier == durable_ids[1]
     covered = {
         source_id
         for node in nodes

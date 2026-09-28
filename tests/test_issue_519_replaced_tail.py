@@ -187,16 +187,15 @@ def test_a_failed_carry_write_keeps_the_record(tmp_path, monkeypatch):
         r.engine.shutdown()
 
 @pytest.mark.parametrize("restart", [True, False], ids=["restart", "in-process"])
-def test_positive_control_the_base_re_stores_and_errors(tmp_path, monkeypatch, caplog, restart):
-    """T1-red in the suite: without R1/R2 the child re-stores S + 15 carried rows + the new pair and its
-    next compaction fails; R3's detail carries the publication's ids (authoritative 18..33 included)."""
+def test_positive_control_the_base_re_stores(tmp_path, monkeypatch, caplog, restart):
+    """T1-red in the suite: without R1/R2 the child re-stores S + 15 carried rows + the new pair. Its
+    next compaction used to fail on the carried rows the view no longer maps; since #581 the leaf reads
+    them from the store and publishes (the re-store itself stays #519's visible symptom)."""
     _base_behaviour(monkeypatch)
     r, _host, first, proof, status = _t1(tmp_path, monkeypatch, caplog, "emulated", restart=restart)
     try:
         assert len(first) == 18 and proof == r.proof
-        assert status == "error" and len(_conflicts(caplog)) == 1
-        detail = _conflicts(caplog)[0].split("detail=", 1)[1]
-        assert "authoritative=[" + ", ".join(map(str, range(18, 34))) in detail, detail
+        assert status == "compacted" and not _conflicts(caplog)
     finally:
         r.engine.shutdown()
 
@@ -314,7 +313,9 @@ def test_r2_voids_the_carry_when_the_empty_child_re_stores(tmp_path, monkeypatch
     caplog.clear()
     monkeypatch.undo()
     base = _backstop(tmp_path / "base", monkeypatch, caplog, fixed=False)
-    assert base[:4] == (18, [[P, 17, 33]], "error", 1) and len(base[5]) > 1  # the base re-stores again
+    # Since #581 the base's compaction commits over its re-stored copies too, so its grandchild then
+    # re-stores nothing either; R2's own effect is the voided carry.
+    assert base[:4] == (18, [[P, 17, 33]], "compacted", 0) and base[5] == grandchild
 
 
 def _assistant_last(r):
