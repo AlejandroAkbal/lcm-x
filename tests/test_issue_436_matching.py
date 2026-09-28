@@ -8,7 +8,7 @@ import random
 import time
 
 from hermes_lcm import identity_anchor
-from hermes_lcm.identity_anchor import _match_occurrences
+from hermes_lcm.identity_anchor import _match_occurrences, _reserve_shown
 
 KEYS = ("a", "b", "c")
 BOUND = 20.0  # s: >= 20x the measured times (<= 0.9 s) on a shared box; the no-WARNING asserts are the guard
@@ -117,3 +117,42 @@ def test_a_spent_budget_leaves_a_valid_deterministic_direct_matching(caplog, mon
     with caplog.at_level(logging.WARNING, logger="hermes_lcm.identity_anchor"):
         assert _run(rows, [(10, "a"), (11, "b")]) == {1: 10, 2: 11}
     assert [record.levelname for record in caplog.records] == ["WARNING"]
+
+
+# -- #583: a NULL-stamped row the host now shows stamped is reserved by form alone, after the stamped pass.
+
+def _null(sid, *forms):
+    return {"store_id": sid, "observed_at": None, "forms": set(forms)}
+
+
+def _reserve(caplog, pool, occurrences, bound=BOUND):
+    started = time.perf_counter()
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.identity_anchor"):
+        result = _reserve_shown(pool, lambda row: row["forms"], occurrences)
+    assert time.perf_counter() - started < bound and not caplog.records
+    return result
+
+
+def test_null_rows_answer_a_leftover_stamped_occurrence_of_their_form_in_store_order(caplog):
+    pool = [{"store_id": 1, "observed_at": 1.0, "forms": {"foo"}}, _null(2, "foo"), _null(3, "foo"), _null(4, "bar")]
+    assert _reserve(caplog, pool, [(0, (1.0, "foo"))]) == {1}  # the stamped pass keeps its occurrence
+    assert _reserve(caplog, pool, [(0, (1.0, "foo")), (1, (2.0, "foo"))]) == {1, 2}  # (a) first NULL row only
+    assert _reserve(caplog, pool, [(0, (None, "foo")), (1, (2.0, "foo"))]) == {2, 3}  # unstamped: pass one
+    assert _reserve(caplog, pool, [(0, (5.0, "R\n\nfoo"))]) == set()  # (b) shown inside a composite only
+    assert _reserve(caplog, pool[1:], []) == set()
+
+
+def test_scale_null_rows_and_occurrences_at_distinct_stamps(caplog):
+    """100k NULL rows x 100k occurrences of one form, each at its own stamp (r3f's rows x stamps keys: 1e10)."""
+    rows = [_null(i, "f") for i in range(100_000)]
+    for n in (100_000, 10):
+        assert len(_reserve(caplog, rows, [(j, (float(j), "f")) for j in range(n)])) == n
+
+
+def test_scale_null_hub_of_many_forms(caplog):
+    """NULL rows answer {a, b_i} (exact + override) and {b_i}; hub a and each b_i shown at distinct stamps."""
+    n = 50_000
+    rows = [_null(i, "a", ("b", i)) for i in range(n)] + [_null(n + i, ("b", i)) for i in range(n // 2)]
+    rows += [_null(2 * n + i, "a") for i in range(n // 2)]
+    occurrences = [(j, (float(j), "a")) for j in range(n)] + [(n + i, (float(n + i), ("b", i))) for i in range(n)]
+    assert len(_reserve(caplog, rows, occurrences)) == 2 * n

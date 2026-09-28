@@ -386,12 +386,8 @@ class IdentityAnchorMixin:
         if "\n\n" not in content:
             return
         # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
-        # A stamped row answers only its own stamp, a NULL-stamped (legacy) row only an unstamped occurrence.
-        pool, reserved = self._identity_anchor_pool(donors, consumed), set()
-        if pool:
-            reserved = set(_match_occurrences(pool, lambda row: {(_normalize_observed_at(row.get("observed_at")), form)
-                                                                for form in self._stored_row_forms(row)},
-                                              list(enumerate(shown(idx).elements()))))
+        pool = self._identity_anchor_pool(donors, consumed)
+        reserved = _reserve_shown(pool, self._stored_row_forms, list(enumerate(shown(idx).elements()))) if pool else set()
         pool = [row for row in pool if int(row["store_id"]) not in reserved]
         donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
@@ -949,6 +945,23 @@ def _match_occurrences(rows, keys_of, occurrences) -> dict:
         logger.warning("LCM identity-anchor matching spent its work budget %d: rows=%d occurrences=%d keys=%d matched=%d",
                        budget, len(kinds), len(occurrences), len(slots), len(result))
     return result
+
+
+def _reserve_shown(pool, forms_of, occurrences) -> set:
+    """B-ID-1: store ids of ``pool`` rows (store order) the host view shows as their own occurrences
+    ``[(occurrence, (stamp, form))]``. A stamped row answers only its own stamp, a NULL-stamped (legacy) row an
+    unstamped occurrence. #583: then a NULL row LCM stored before the host stamped it answers a stamped
+    occurrence of its form still unmatched, keyed by form alone (a row's keys are its forms, never its
+    stamps: linear), in store order."""
+    reserved = _match_occurrences(pool, lambda row: {(_normalize_observed_at(row.get("observed_at")), form)
+                                                     for form in forms_of(row)}, occurrences)
+    null = [row for row in pool if _normalize_observed_at(row.get("observed_at")) is None
+            and int(row["store_id"]) not in reserved]
+    taken = set(reserved.values())
+    left = [(occurrence, ("null", key[1])) for occurrence, key in occurrences if key[0] is not None and occurrence not in taken]
+    if null and left:  # over-reservation only stores a composite whole: duplication, never loss
+        reserved.update(_match_occurrences(null, lambda row: {("null", form) for form in forms_of(row)}, left))
+    return set(reserved)
 
 
 def _composite_relation(group, stamp) -> list:

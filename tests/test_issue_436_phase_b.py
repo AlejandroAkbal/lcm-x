@@ -230,7 +230,6 @@ def test_r3_r1_a_multi_form_row_leaves_the_single_form_row_its_occurrence(tmp_pa
         engine.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="#583: NULL-stamped row shown stamped below the cursor; fix in v0.24.5")
 @pytest.mark.parametrize("restart", [False, True], ids=["steady", "restart"])
 @pytest.mark.parametrize("text", ["foo", LONG], ids=["short", "long"])
 def test_r3f_a_null_stored_row_the_host_shows_stamped_is_reserved(tmp_path, text, restart):
@@ -247,5 +246,42 @@ def test_r3f_a_null_stored_row_the_host_shows_stamped_is_reserved(tmp_path, text
         expected = [("user", text)] * 2 + [("user", r["content"]), ("assistant", "reply to R+U")]
         assert _stored(_rows(engine)) == Counter(expected + [("user", text)] * restart)  # restart re-store: as above
         _assert_shown_row_is_no_constituent(engine, text)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("shown_alone", [1, 2], ids=["one-shown", "both-shown"])
+@pytest.mark.parametrize("text", ["foo", LONG], ids=["short", "long"])
+def test_r3f_two_null_rows_one_stamped_occurrence_reserves_the_first_in_store_order(tmp_path, text, shown_alone):
+    """#583 (a): stored U1@NULL, R@3, U2@NULL (same text); the host shows U alone ``shown_alone`` times, stamped,
+    and "R\\n\\nU"@3. One occurrence reserves U1 (store order) and the composite absorbs U2; a genuine second
+    occurrence reserves U2 too, so the composite's U is new and stored."""
+    engine = _engine(tmp_path)
+    try:
+        r = _u("[R] failed turn" + PAD, 3.0)
+        engine.ingest([_u(text, None), r, _u(text, None)])
+        u1, u2 = _ids(engine, text)
+        engine.ingest([_u(text, 1.0 + k) for k in range(shown_alone)]
+                      + [_u(r["content"] + "\n\n" + text, 3.0), _a("reply to R+U", 5.0)])
+        members = [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert u1 not in members
+        assert (u2 in members) == (shown_alone == 1), members
+        assert _stored(_rows(engine))[("user", text)] == 2 + (shown_alone - 1)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("other", [False, True], ids=["alone", "other-stamped-row"])
+def test_r3f_a_null_row_shown_only_inside_a_composite_is_no_reservation(tmp_path, other):
+    """#583 (b): stored U@NULL, R@3; the host shows U only inside "R\\n\\nU"@3 (a stamped row of another text
+    left over does not reserve it): the composite still decomposes into R and U, nothing is stored again."""
+    engine = _engine(tmp_path)
+    try:
+        r, x = _u("[R] failed turn" + PAD, 3.0), _u("[X] other row" + PAD, 1.0)
+        engine.ingest([x, _u("foo", None), r] if other else [_u("foo", None), r])
+        [u] = _ids(engine, "foo")
+        engine.ingest([dict(x)] * other + [_u(r["content"] + "\n\n" + "foo", 3.0), _a("reply to R+U", 5.0)])
+        assert u in [rel[2] for rel in _relations(engine) if rel[1] == "composite"]
+        assert _stored(_rows(engine))[("user", "foo")] == 1
     finally:
         engine.shutdown()
