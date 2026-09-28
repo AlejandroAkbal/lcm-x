@@ -261,6 +261,10 @@ class IdentityAnchorMixin:
                     view_counts[key] = view_counts.get(key, 0) + 1
             return view_counts.get(identity, 0)
 
+        def shown(idx: int) -> Counter:  # B-ID-1: the view's own occurrences no stored row has matched yet
+            return Counter((stamps[i], identity_at(i)) for i in stamps
+                           if i != idx and i not in matched and identity_at(i) is not None)
+
         consumed: set[int] = set()
         matched: dict[int, list] = {}
         # R1: per key, the host view's occurrences consume the stored ones in order; the rest are new.
@@ -283,7 +287,8 @@ class IdentityAnchorMixin:
                     plan.setdefault("ws", []).append((row, identity_messages[idx]))
                     self._identity_anchor_take(idx, [row], consumed, matched, plan)
                     continue
-                self._identity_anchor_user_row(idx, identity, stamps[idx], by_stamp, consumed, matched, plan, view_count)
+                self._identity_anchor_user_row(idx, identity, stamps[idx], by_stamp, consumed, matched, plan, view_count,
+                                               shown)
             elif idx not in stamps and idx not in plan["replayed"]:  # D-D plan (ii): H1 merged LCM's carrier
                 group = self._identity_anchor_carrier_group(identity_messages[idx], consumed)
                 if group is not None:
@@ -351,7 +356,7 @@ class IdentityAnchorMixin:
             logger.info("LCM identity-anchor: host changed its list before the cursor; %d unstored rows from %d: session=%s",
                         len(missed), min(missed), self._session_id)
 
-    def _identity_anchor_user_row(self, idx, identity, stamp, by_stamp, consumed, matched, plan, view_count) -> None:
+    def _identity_anchor_user_row(self, idx, identity, stamp, by_stamp, consumed, matched, plan, view_count, shown) -> None:
         """R2/R3/R5 for one unmatched user row: a recorded witness, an exact unique decomposition,
         the H1 unstable current-turn stamp, else a held head plus a new remainder. Else: new."""
         content = identity[1]
@@ -381,7 +386,16 @@ class IdentityAnchorMixin:
             return self._identity_anchor_constituent_copy(idx, identity, stamp, consumed, matched, plan)
         if "\n\n" not in content:
             return
-        pool = self._identity_anchor_pool(donors, consumed)
+        # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
+        view, pool, reserved = shown(idx), self._identity_anchor_pool(donors, consumed), set()
+        for row in pool:
+            row_stamp = _normalize_observed_at(row.get("observed_at"))
+            form = next((form for form in self._stored_row_forms(row) if view[(row_stamp, form)] > 0), None)
+            if row_stamp is not None and form is not None:
+                view[(row_stamp, form)] -= 1
+                reserved.add(int(row["store_id"]))
+        pool = [row for row in pool if int(row["store_id"]) not in reserved]
+        donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
         donor_texts = {self._identity_text(row) for row in donors}
         group, ambiguous = self._identity_anchor_compose(content, texts, pool, donors, consumed)
@@ -399,7 +413,9 @@ class IdentityAnchorMixin:
         if (len(recent) == 1 and recent[0][2] not in consumed and view_count(identity) == 1
                 and any(content.startswith(text + "\n\n") for text in donor_texts)):
             row = self._store.get_batch([recent[0][2]]).get(recent[0][2])
-            if row is not None:
+            # B-ID-2: the cached id names this occurrence only while the row still is it (same store, scope).
+            if (row is not None and row.get("role") == "user" and str(row.get("session_id") or "") in scope
+                    and recent[0][1] in self._stored_row_forms(row)):
                 plan["relations"].append(("alt_stamp", stamp, [row], None))
                 return self._identity_anchor_take(idx, [row], consumed, matched, plan)
         # R3: held constituents then a new remainder, stored once with its own stamp unknown.
@@ -504,7 +520,8 @@ class IdentityAnchorMixin:
 
     def _identity_anchor_pool(self, donors, consumed) -> list:
         """Candidate constituents: unconsumed user rows of the lineage near each stamp donor, plus the
-        bound session's recent rows (bounded)."""
+        bound session's recent rows (bounded); never a row stored before every donor (B-ID-1)."""
+        first = min((int(row["store_id"]) for row in donors), default=0)
         rows: dict[int, dict] = {}
         for donor in donors:
             store_id = int(donor["store_id"])
@@ -514,16 +531,19 @@ class IdentityAnchorMixin:
         for row in self._store.get_session_tail(str(self._session_id), limit=64):
             rows[int(row["store_id"])] = row
         return [row for store_id, row in sorted(rows.items())
-                if row.get("role") == "user" and store_id not in consumed]
+                if row.get("role") == "user" and store_id not in consumed and store_id >= first]
 
     def _identity_anchor_assign(self, parts, pool, donors, consumed) -> Optional[list]:
-        """Bind each part to one stored occurrence (a donor for a donor's text first), each used once."""
+        """Bind each part to one stored occurrence (a donor for a donor's text first), each used once:
+        a donor first, then rows stored after it, in store order (B-ID-1)."""
         taken: set[int] = set(consumed)
         donor_ids = {int(row["store_id"]) for row in donors}
         group = []
         for text in parts:
             options = sorted((row for row in pool if self._identity_text(row) == text
-                              and int(row["store_id"]) not in taken),
+                              and int(row["store_id"]) not in taken
+                              and (int(row["store_id"]) > int(group[-1]["store_id"]) if group
+                                   else int(row["store_id"]) in donor_ids)),
                              key=lambda row: (int(row["store_id"]) not in donor_ids, int(row["store_id"])))
             if not options:
                 return None
