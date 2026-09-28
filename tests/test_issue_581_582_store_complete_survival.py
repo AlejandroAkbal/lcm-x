@@ -742,6 +742,31 @@ def test_rc3_survival_counter_update_is_atomic_across_engines(tmp_path):
         b.shutdown()
 
 
+@pytest.mark.parametrize("eligible", [False, True], ids=["nothing-eligible", "one-eligible-row"])
+def test_rc4_projected_count_counts_only_fits_that_replaced_a_row(tmp_path, summaries, host_estimator, caplog,
+                                                                  eligible):
+    """R4-1: the newest turn alone is over budget and older turns are dropped. When no row of that turn can be
+    projected (each under 256 tokens), the fit projected nothing: projected_count 0 and projected=False."""
+    rows = [{"role": "assistant", "content": f"[P{i}] " + "alpha " * 150} for i in range(30)]  # ~230 tokens each
+    if eligible:
+        rows[0] = {"role": "assistant", "content": "[P0] " + "alpha " * 3000}
+    view = [{"role": "system", "content": "system prompt"},
+            *[r for i in range(3) for r in _turn(f"L{i}", 10.0 * i)],
+            {"role": "user", "content": "[N] newest", "timestamp": 99.0}, *rows]
+    engine = _engine(tmp_path, context_length=WINDOW)
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            engine.compress(view, current_tokens=host_estimator(view))
+        record = engine._store.read_metadata_json("survival_fit:counter")
+        assert record["count"] == 1 and record["projected_count"] == int(eligible), record
+        line = next(r.getMessage() for r in caplog.records if "LCM survival fit applied" in r.getMessage())
+        assert f"projected={eligible}" in line, line
+    finally:
+        engine.shutdown()
+
+
 def _projection_of(engine, store_id) -> dict:
     """The view copy the survival fit makes of stored row ``store_id`` (its host stamp kept)."""
     row = engine._store.get(store_id)

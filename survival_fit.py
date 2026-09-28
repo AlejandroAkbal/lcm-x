@@ -134,7 +134,7 @@ class SurvivalFitMixin:
                 logger.warning("LCM survival fit skipped: an over-budget list holds rows not yet stored (reason=%s)", reason)
                 return result
             kept = self._survival_projection(body[cut:], store_ids, budget - self._survival_measure(head))
-            projected = True
+            projected = any(new is not old for new, old in zip(kept, body[cut:]))  # a row was actually replaced
         else:
             kept = body[cut:]
         dropped = body[:cut]
