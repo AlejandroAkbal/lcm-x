@@ -27,7 +27,7 @@ ISSUES = {
     546: (("B1", "B2", "B3", "B4"), ""), 547: (("B1", "B2", "B3", "B4"), ""), 549: (("B1", "B2"), ""),
     485: (("B2",), "upgrade from a pre-fix DB (R2)"), 542: (("B4",), "upgrade from a pre-#535 wedged DB (R2)"),
     559: (("B6", "B4"), ""), 566: (("B1", "B2", "B5"), ""),  # B5: a cross-lineage summary is recorded only there
-    581: (("B3", "B4"), ""), 582: (("B8",), ""),  # native-on-off: counted from the candidate's first publication
+    581: (("B3", "B4"), ""), 582: (("B8",), ""),  # native-on-off: every candidate event after the plugin switch
 }
 
 
@@ -101,8 +101,9 @@ def registry() -> list[dict]:
             cells.append(cell(f"native-on-off/{ref}/{m}", [581, 582], in_place=ip, native=True, from_ref=ref,
                               faults=[{"kind": "plugin_switch", "turn": 31}], bars=["B3", "B4", "B8"],
                               doc=f"Turns 1-30 run lcm-x {ref} with native recovery ON; the candidate then takes over the "
-                                  "same HERMES_HOME and store with native OFF. B3/B8 count from the candidate's first "
-                                  "publication; B4 asks it to publish. B1/B2/B5-B7 are reported, not scored: the older "
+                                  "same HERMES_HOME and store with native OFF. B3/B8 count every candidate-phase "
+                                  "event after the plugin switch (pre_publication_counts: a diagnostic); B4 asks it "
+                                  "to publish. B1/B2/B5-B7 are reported, not scored: the older "
                                   "ref's own phase decides them."))
         for tr in ("acp-history", "gateway-reload"):
             cells.append(cell(f"crash-after-compaction/{m}/{tr}", [553, 561], in_place=ip,

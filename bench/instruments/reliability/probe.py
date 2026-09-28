@@ -79,7 +79,7 @@ FILLER = "alpha beta gamma delta "
 
 def phase_log_fields(log: str) -> dict:
     """The log-derived phase fields, computed before the phase JSON is written: the counts, and (for
-    native-on-off, B3/B8 from the first publication) the counts after this phase's first publication."""
+    native-on-off, the pre_publication_counts diagnostic) the counts after this phase's first publication."""
     first_commit = log.find("LCM compaction #")
     return {"compactions_logged": len(re.findall(r"LCM compaction #\d+", log)),
             "log_counts": {k: log.count(v) for k, v in LOG_COUNTS.items()},

@@ -80,7 +80,9 @@ the host reported `interrupted`. Any other assistant row is surplus.
 
 `native-on-off/<ref>/<mode>` (#581/#582) runs turns 1-30 on lcm-x `<ref>` (v0.23.3, v0.24.3) with native recovery ON;
 the `plugin_switch` fault then exits between turns and the candidate takes over the same HERMES_HOME and store with
-native OFF. B3 and B8 count only the candidate's phases, from its first publication; B4 asks it to publish. R1 only.
+native OFF. B3 and B8 count every event of the candidate's phases after the plugin switch, before its first
+publication too; `numbers.pre_publication_counts` reports the pre-publication share as a diagnostic, not a bar. B4
+asks it to publish. R1 only.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
   (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
   re-invoked once after a cleanup-only `sanitized`) does not end in error, conflict or exception; an
