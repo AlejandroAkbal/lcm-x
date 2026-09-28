@@ -494,6 +494,10 @@ class LCMEngine(
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
+        # (session, conversation) whose compaction-commit end finalized the lifecycle row
+        # and has had no start or reset since: a host that refuses the candidate after the
+        # end (would_grow) never sends the start that re-binds it.
+        self._commit_end_unbound: tuple[str, str] | None = None
 
         # Cursor: index in the current messages list up to which all
         # messages have been persisted.  After compress() shortens the
@@ -2957,6 +2961,35 @@ class LCMEngine(
             )
         self._update_model_pending_session_start = False
 
+    def _rebind_after_unadopted_compaction_commit(self) -> None:
+        """The host ran the compaction-commit end, then refused the candidate and sent no
+        compression start, so this process still serves a finalized (unbound) row.
+
+        Re-bind it as that start would. bind_session restores the session's own finalized
+        frontier, or 0 when a reset came after the finalize (the reset dropped the leaves
+        claiming it). The frontier moves only through a proven publication (#5), never from
+        the in-process value.
+        """
+        marker, self._commit_end_unbound = self._commit_end_unbound, None
+        if marker != (self._session_id, self._conversation_id) or self._bypasses_lcm_context_management():
+            return
+        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        if state is None or state.current_session_id is not None or state.last_finalized_session_id != self._session_id:
+            return
+        state = self._lifecycle.bind_session(self._session_id, conversation_id=state.conversation_id)
+        frontier = int(state.current_frontier_store_id or 0)
+        if int(self._last_compacted_store_id or 0) != frontier:
+            logger.warning(
+                "LCM re-bind of %s found in-process frontier %d but lifecycle frontier %d; using the lifecycle row",
+                self._session_id,
+                int(self._last_compacted_store_id or 0),
+                frontier,
+            )
+        self._last_compacted_store_id = frontier
+        logger.info(
+            "LCM re-bound %s after an unadopted compaction commit (frontier=%d)", self._session_id, frontier
+        )
+
     def _continue_in_place_compression_boundary(
         self,
         session_id: str,
@@ -3393,6 +3426,7 @@ class LCMEngine(
         with self._exclusive_lifecycle("rebind"):
             if self._stable_use_closed:
                 raise RuntimeError("LCM engine is closed")
+            self._commit_end_unbound = None
             self._on_session_start_unlocked(session_id, **kwargs)
             binding = self._emission_binding()
             for name in ("_compress_commit_proof", "_last_emission_descriptors"):
@@ -3999,6 +4033,7 @@ class LCMEngine(
                         session_id,
                         frontier_store_id=self._last_compacted_store_id,
                     )
+                self._commit_end_unbound = (session_id, self._conversation_id)
             except (Exception, KeyboardInterrupt) as exc:
                 logger.warning("LCM compaction-commit session-end finalization skipped: %r", exc)
             logger.info(
@@ -4092,6 +4127,7 @@ class LCMEngine(
         with self._exclusive_lifecycle("reset"):
             if self._stable_use_closed:
                 return
+            self._commit_end_unbound = None
             self._on_session_reset_unlocked()
 
     def _on_session_reset_unlocked(self) -> None:

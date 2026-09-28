@@ -1212,6 +1212,7 @@ class CompactionMixin:
                 focus_topic=focus_topic,
                 force=force,
             )
+        self._rebind_after_unadopted_compaction_commit()
 
         # ``current_tokens`` is optional in the ContextEngine contract. After a
         # yield-aware preflight, use the current active messages as the
