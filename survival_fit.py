@@ -276,7 +276,8 @@ class SurvivalFitMixin:
                 messages[idx].get("content")) or "") is None:
             return []
         stored = self._store.get_range(str(row["session_id"]), start_id=int(row["store_id"]) + 1,
-                                       limit=max(len(messages) - idx - 1, 1))
+                                       limit=max(len(messages) - idx - 1, 1),  # the source's conversation only
+                                       conversation_id=row.get("conversation_id"), include_blank_conversation=True)
         out = []
         for k, stored_row in zip(range(idx + 1, len(messages)), stored):
             if (k in stamps or str(messages[k].get("role") or "") in ("user", "system")

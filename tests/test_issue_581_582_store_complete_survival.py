@@ -17,6 +17,7 @@ import pytest
 import hermes_lcm.compaction as lcm_compaction
 import hermes_lcm.engine as lcm_engine
 import hermes_lcm.store_complete as lcm_store_complete
+import hermes_lcm.survival_fit as lcm_survival_fit
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -691,6 +692,30 @@ def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, ho
         assert not any(NOTICE in str(r["content"]) for r in _rows(cold))
     finally:
         cold.shutdown()
+
+
+def _projection_of(engine, store_id) -> dict:
+    """The view copy the survival fit makes of stored row ``store_id`` (its host stamp kept)."""
+    row = engine._store.get(store_id)
+    fields = engine._survival_projected_fields(row, 3000, lcm_survival_fit._HEAD, lcm_survival_fit._TAIL)
+    return {"role": row["role"], "timestamp": row["observed_at"], **{k: v for k, v in fields.items() if v is not None}}
+
+
+@pytest.mark.parametrize("foreign", ["ok reply", "another conversation's text"], ids=["identical", "different"])
+def test_rc2_projection_followers_read_only_the_sources_conversation(tmp_path, foreign):
+    """A row of another conversation under the same session, stored between the projected source and its
+    reply, is never taken (byte-identical) and never ends the walk early (different)."""
+    engine = _engine(tmp_path)
+    try:
+        source = engine._store.append("S", {"role": "user", "content": "[N] newest " + "word " * 600,
+                                            "timestamp": 99.0}, conversation_id="conv")
+        engine._store.append("S", {"role": "assistant", "content": foreign}, conversation_id="other")
+        reply = engine._store.append("S", {"role": "assistant", "content": "ok reply"}, conversation_id="conv")
+        view = [_projection_of(engine, source), {"role": "assistant", "content": "ok reply"}]
+        taken = engine._survival_projection_followers(view, 0, engine._store.get(source), {0: 99.0})
+        assert [(k, int(row["store_id"])) for k, row in taken] == [(1, reply)]
+    finally:
+        engine.shutdown()
 
 
 def test_rc2_a_new_reply_after_a_projected_user_row_is_stored(tmp_path, summaries, host_estimator):
