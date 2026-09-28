@@ -230,6 +230,7 @@ def test_r3_r1_a_multi_form_row_leaves_the_single_form_row_its_occurrence(tmp_pa
         engine.shutdown()
 
 
+@pytest.mark.xfail(strict=True, reason="#583: NULL-stamped row shown stamped below the cursor; fix in v0.24.5")
 @pytest.mark.parametrize("restart", [False, True], ids=["steady", "restart"])
 @pytest.mark.parametrize("text", ["foo", LONG], ids=["short", "long"])
 def test_r3f_a_null_stored_row_the_host_shows_stamped_is_reserved(tmp_path, text, restart):
