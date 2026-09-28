@@ -670,14 +670,15 @@ def _stored_conversation_ids(conn: sqlite3.Connection) -> list:
     return values
 
 
-def refresh_legacy_conversation_ids(conn: sqlite3.Connection) -> dict[str, list]:
+def refresh_legacy_conversation_ids(conn: sqlite3.Connection) -> dict[str, list] | None:
     """ONE probe per store (engine bind) over the distinct stored conversation ids (eva's 1.4 GB store:
-    261 ids by index seeks in ~7 ms; a DISTINCT scan takes ~1.4 s)."""
+    261 ids by index seeks in ~7 ms; a DISTINCT scan takes ~1.4 s). None when the probe failed (a lock):
+    nothing is cached, so the next read probes again (R6-3: never "no legacy ids" by failure)."""
     legacy: dict[str, list] = {}
     try:
         values = _stored_conversation_ids(conn)
     except sqlite3.OperationalError:
-        values = []
+        return None
     for value in values:
         if value is None or str(value) != str(value).strip():
             legacy.setdefault(str(value or "").strip(), []).append(value)
@@ -691,6 +692,8 @@ def owned_conversation_values(conn: sqlite3.Connection, conversation_id: str) ->
     legacy = _LEGACY_CONVERSATION_IDS.get(_conversation_store_key(conn))
     if legacy is None:
         legacy = refresh_legacy_conversation_ids(conn)
+    if legacy is None:  # the probe failed: this read cannot rule legacy values out, so it fails too
+        raise sqlite3.OperationalError("legacy conversation-id probe failed; retried on the next read")
     wanted = dict.fromkeys((str(conversation_id or "").strip(), ""))
     return list(wanted) + [value for key in wanted for value in legacy.get(key, ())]
 

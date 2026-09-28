@@ -3441,8 +3441,8 @@ class LCMEngine(
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
         if getattr(self, "_legacy_conversation_ids_store", None) is not self._store:
             try:  # #581: one probe per bound store for legacy unnormalized conversation ids
-                refresh_legacy_conversation_ids(self._store.connection)
-                self._legacy_conversation_ids_store = self._store
+                if refresh_legacy_conversation_ids(self._store.connection) is not None:
+                    self._legacy_conversation_ids_store = self._store  # R6-3: a failed probe is retried
             except Exception:
                 logger.debug("LCM legacy conversation-id probe failed; probed on first use", exc_info=True)
 

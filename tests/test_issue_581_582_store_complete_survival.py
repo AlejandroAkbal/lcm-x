@@ -894,6 +894,36 @@ def test_r6_1_a_restamped_copy_of_an_unstamped_sources_projection_is_that_row(tm
         cold.shutdown()
 
 
+def test_r6_3_a_failed_legacy_probe_is_retried_not_cached_empty(tmp_path, monkeypatch):
+    """R6-3: the bind probe fails once (a transient lock); it is not recorded as "no legacy ids": the next
+    read probes again and the legacy whitespace-only row stays owned."""
+    import hermes_lcm.db_bootstrap as db_bootstrap
+
+    engine = _engine(tmp_path)
+    try:
+        ids = _mixed_rows(engine)
+        engine._store.connection.execute("UPDATE messages SET conversation_id = '  ' WHERE store_id = ?", (ids["B"],))
+        engine._store.connection.commit()
+    finally:
+        engine.shutdown()
+    real, calls = db_bootstrap._stored_conversation_ids, []
+
+    def flaky(conn):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(conn)
+
+    monkeypatch.setattr(db_bootstrap, "_stored_conversation_ids", flaky)
+    db_bootstrap._LEGACY_CONVERSATION_IDS.clear()
+    engine = _engine(tmp_path)  # the bind probe fails
+    try:
+        rows, _truncated = engine._store_complete_owned_rows(0, None, [])
+        assert len(calls) >= 2 and ids["B"] in [int(r["store_id"]) for r in rows]
+    finally:
+        engine.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"
