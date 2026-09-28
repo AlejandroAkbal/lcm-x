@@ -1,7 +1,9 @@
 import json
+import logging
 import re
 import sqlite3
 import time
+from collections import Counter
 
 import pytest
 
@@ -473,6 +475,102 @@ def test_host_that_keeps_the_compress_input_resumes_after_it(tmp_path, monkeypat
         assert engine._compress_commit_proof is None
     finally:
         engine.shutdown()
+
+
+def _refused_commit(tmp_path, monkeypatch):
+    """Cycle 1 commits in place. Cycle 2 compresses and the host runs the commit end, then its
+    would_grow guard refuses the candidate: no compression start, the host keeps `pre` + reply."""
+    engine, pre, compressed = _compacted_engine(tmp_path, monkeypatch)
+    engine.on_session_end("S0", pre)
+    engine.on_session_start("S0", boundary_reason="compression", old_session_id="S0", platform="acp")
+    host = list(compressed) + [_turn(13)[1]]
+    for i in range(14, 21):
+        host.extend(_turn(i)[:1] if i == 20 else _turn(i))
+        engine.ingest(host)
+    pre = list(host)
+    engine.compress(list(host), force=True)
+    assert engine._last_compression_status == "compacted"
+    engine.on_session_end("S0", pre)
+    host.append(_turn(20)[1])
+    engine.ingest(host)
+    return engine, host, engine._lifecycle.get_by_session("S0").last_finalized_frontier_store_id
+
+
+def _compress_next(engine, host):
+    for i in range(21, 28):
+        host.extend(_turn(i)[:1] if i == 27 else _turn(i))
+        engine.ingest(host)
+    engine.compress(list(host), force=True)
+
+
+def _spy_binds(engine, monkeypatch):
+    calls, bind = [], engine._lifecycle.bind_session
+    monkeypatch.setattr(engine._lifecycle, "bind_session", lambda *a, **k: calls.append(a) or bind(*a, **k))
+    return calls
+
+
+def test_compress_rebinds_after_a_commit_end_the_host_did_not_adopt(tmp_path, monkeypatch, caplog):
+    """The commit end finalized the row and the compression start never came: the next compress
+    re-binds the session at its finalized frontier instead of publishing against frontier 0."""
+    caplog.set_level(logging.INFO)
+    engine, host, frontier = _refused_commit(tmp_path, monkeypatch)
+    try:
+        assert frontier > 0
+        _compress_next(engine, host)
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        covered = Counter(i for n in engine._dag.get_session_nodes("S0") if n.source_type == "messages"
+                          for i in n.source_ids)
+        below = [r["store_id"] for r in engine._store.get_session_messages("S0", limit=10_000)
+                 if r["store_id"] <= state.current_frontier_store_id]
+    finally:
+        engine.shutdown()
+    assert engine._last_compression_status == "compacted"
+    assert not [r for r in caplog.records if "publication_invariant_conflict" in r.getMessage()]
+    assert state.current_session_id == "S0" and state.current_frontier_store_id >= frontier
+    assert below and all(covered[i] == 1 for i in below), (below, covered)
+
+
+@pytest.mark.parametrize("control", ["start", "other_conversation", "reset"])
+def test_no_rebind_when_the_commit_end_was_followed_up(tmp_path, monkeypatch, caplog, control):
+    """(i) a normal start clears the marker; (ii) another conversation and (iii) a reset never re-bind."""
+    caplog.set_level(logging.INFO)
+    engine, host, _frontier = _refused_commit(tmp_path, monkeypatch)
+    try:
+        if control == "start":
+            engine.on_session_start("S0", boundary_reason="compression", old_session_id="S0", platform="acp")
+        elif control == "reset":
+            engine.on_session_reset()
+        assert (engine._commit_end_unbound is None) == (control != "other_conversation")
+        if control == "other_conversation":
+            engine._conversation_id = "C-other"
+        binds = _spy_binds(engine, monkeypatch)
+        if control == "start":
+            engine._rebind_after_unadopted_compaction_commit()
+        else:
+            _compress_next(engine, host)
+        state = engine._lifecycle.get_by_session("S0")
+    finally:
+        engine.shutdown()
+    assert binds == [] and engine._commit_end_unbound is None
+    assert not [r for r in caplog.records if "after an unadopted compaction commit" in r.getMessage()]
+    assert (state.current_session_id is None) == (control != "start")  # only the host's start binds
+
+
+def test_rebind_never_advances_from_the_in_process_frontier(tmp_path, monkeypatch, caplog):
+    """(iv) the in-process frontier differs from the row: warn, move nothing without a publication."""
+    caplog.set_level(logging.INFO)
+    engine, _host, frontier = _refused_commit(tmp_path, monkeypatch)
+    try:
+        engine._last_compacted_store_id = frontier + 5
+        monkeypatch.setattr(engine._lifecycle, "advance_frontier", lambda *a, **k: pytest.fail("advanced"))
+        engine._rebind_after_unadopted_compaction_commit()
+        state = engine._lifecycle.get_by_session("S0")
+    finally:
+        engine.shutdown()
+    assert state.current_session_id == "S0" and state.current_frontier_store_id == frontier
+    assert engine._last_compacted_store_id == frontier
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(frontier + 5) in m and str(frontier) in m for m in warnings), warnings
 
 
 class TestBindSessionFrontierAfterOwnFinalize:
