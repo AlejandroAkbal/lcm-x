@@ -26,12 +26,12 @@ def _stored(rows) -> Counter:
     return Counter((row["role"], str(row["content"])) for row in rows)
 
 
-def _merge_turn(engine, tmp_path, new_u, *, host_object, restart):
+def _merge_turn(engine, tmp_path, new_u, *, host_object, restart, u_stamp=1.0, reply=True):
     """[U@1, A@2, R@3], then Hermes' _merge_consecutive_users folds the new U into the dangling R
     (R's dict keeps its stamp): [U@1, A@2, "R\\n\\nU"@3, reply@5]."""
-    u, a, r = _u(new_u[0], 1.0), _a("reply to U" + PAD, 2.0), _u("[R] failed turn" + PAD, 3.0)
+    u, a, r = _u(new_u[0], u_stamp), _a("reply to U" + PAD, 2.0), _u("[R] failed turn" + PAD, 3.0)
     r_text = r["content"]
-    engine.ingest([u, a, r])
+    engine.ingest([u, a, r] if reply else [u, r])
     if restart:
         engine.shutdown()
         engine = _engine(tmp_path)
@@ -41,6 +41,8 @@ def _merge_turn(engine, tmp_path, new_u, *, host_object, restart):
         live = [u, a, composite, _a("reply to R+U", 5.0)]
     else:
         live = [dict(u), dict(a), _u(r_text + "\n\n" + new_u[1], 3.0), _a("reply to R+U", 5.0)]
+    if not reply:
+        live.remove(a)
     engine.ingest(live)
     return engine, live, r_text
 
@@ -66,6 +68,27 @@ def test_bid1_merged_user_turn_is_stored_even_when_its_text_repeats_an_earlier_r
         engine, _live, r_text = _merge_turn(engine, tmp_path, (text, second), host_object=host_object, restart=restart)
         expected = Counter([("user", text), ("assistant", "reply to U" + PAD), ("user", r_text),
                             ("user", second), ("assistant", "reply to R+U")])
+        assert _stored(_rows(engine)) == expected
+        _assert_shown_row_is_no_constituent(engine, text)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["steady", "restart"])
+@pytest.mark.parametrize("reply", [True, False], ids=["replied", "unreplied"])
+@pytest.mark.parametrize("text", ["continue", LONG], ids=["continue", "long"])
+def test_bid1_an_unstamped_earlier_row_is_reserved_too(tmp_path, text, reply, restart):
+    """Mixed legacy/current history: the earlier U has no host stamp (stored NULL, shown unstamped).
+    It is still the view's own occurrence, so the new repeated U is stored, not absorbed."""
+    engine = _engine(tmp_path)
+    try:
+        engine, _live, r_text = _merge_turn(engine, tmp_path, (text, text), host_object="in-place", restart=restart,
+                                            u_stamp=None, reply=reply)
+        expected = Counter([("user", text), ("user", r_text), ("user", text), ("assistant", "reply to R+U")]
+                           + [("assistant", "reply to U" + PAD)] * reply
+                           # A restart whose list no longer proves the stored tail re-stores an unstamped row
+                           # (pre-existing: nothing keys it; flag off re-stores the whole list): duplication, never loss.
+                           + [("user", text)] * restart)
         assert _stored(_rows(engine)) == expected
         _assert_shown_row_is_no_constituent(engine, text)
     finally:
