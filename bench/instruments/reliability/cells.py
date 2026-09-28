@@ -1,0 +1,166 @@
+"""The R1 cell registry: JSON-serialisable cells, glob selection and axis validation.
+
+Tight tuning is the #553 probes' (tests/test_real_turn_loop_acp_override.py) scaled by window/64000, so a
+128k cell has the same compaction cadence as the proven 64k probes. ``long-*`` cells use LCM's default
+tuning with provider-reported usage, as that file's LONG cells do.
+"""
+from __future__ import annotations
+
+import fnmatch
+
+BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+TRANSPORTS = ("acp", "gateway")
+FAULTS = {"crash_after_compaction_before_reply", "clean_exit_before_turn", "crash_mid_tool_call",
+          "crash_after_rotation_before_child_row", "crash_between_session_end_and_start", "cancel_then_retry",
+          "publication_failure"}
+# issue -> (the bars that decide it, what an uncovered issue would need)
+ISSUES = {
+    553: (("B1", "B2", "B3", "B4"), ""), 561: (("B1", "B2"), ""), 563: (("B4",), ""),
+    509: (("B7",), ""), 464: (("B7", "B6"), ""), 463: (("B7",), "Desktop/tui_gateway transport, >12k externalised user rows"),
+    479: (("B7",), ""), 420: (("B4", "B5"), ""), 489: (("B1", "B2", "B4"), ""), 493: (("B1", "B2"), ""),
+    496: (("B1", "B2"), "real gateway process with message timestamps rendered (gateway.message_timestamps.enabled)"),
+    497: (("B6",), ""), 499: (("B1", "B2"), "fresh_tail 0 + objective-head merge + restart x3"),
+    500: (("B7",), "native ON + dropped call + tool_call_id reuse"), 501: (("B1", "B2"), "fresh_tail 0 + restart x3"),
+    503: (("B2",), ""), 534: (("B4",), "forced provider overflow after a prior compaction + cold restart"),
+    538: (("B1", "B2"), "merge behind the todo annotation"), 540: (("B1", "B2"), "folded carrier across rotation restart"),
+    541: (("B1", "B2", "B4"), ""), 544: (("B1", "B2", "B4"), ""), 545: (("B1", "B2", "B3", "B4"), ""),
+    546: (("B1", "B2", "B3", "B4"), ""), 547: (("B1", "B2", "B3", "B4"), ""), 549: (("B1", "B2"), ""),
+    485: (("B2",), "upgrade from a pre-fix DB (R2)"), 542: (("B4",), "upgrade from a pre-#535 wedged DB (R2)"),
+    559: (("B6", "B4"), ""), 566: (("B1", "B2", "B5"), ""),  # B5: a cross-lineage summary is recorded only there
+}
+
+
+def tight(window: int) -> dict:
+    k = window / 64000
+    return {"LCM_CONTEXT_THRESHOLD": "0.5", "LCM_FRESH_TAIL_COUNT": "24", "LCM_FRESH_TAIL_MAX_TOKENS": str(int(12000 * k)),
+            "LCM_LEAF_CHUNK_TOKENS": str(int(4000 * k)), "LCM_THRESHOLD_FULL_SWEEP_ENABLED": "true"}
+
+
+def cell(cid, targets, *, in_place, transport="acp", turns=60, window=128000, repeat=None, native=False, user=None,
+         assistant=None, tool_plan=(), faults=(), lcm_env=None, min_compactions=5, bars=None, doc="", **extra) -> dict:
+    return {"id": cid, "targets": list(targets), "in_place": in_place, "native_recovery": native, "transport": transport,
+            "turns": turns, "window": window,
+            "user_text": {"repeat": repeat or int(400 * window / 64000), **(user or {})},
+            "assistant": {"mode": "unique", "real_usage": False, "usage_scale": 1.0, **(assistant or {})},
+            "tool_plan": list(tool_plan), "faults": list(faults),
+            "lcm_env": tight(window) if lcm_env is None else lcm_env, "min_compactions": min_compactions,
+            "final_compaction_check": True, "bars": list(bars or BARS), "doc": doc, **extra}
+
+
+def modes():
+    return (("in-place", True), ("rotation", False))
+
+
+def registry() -> list[dict]:
+    crash = {"kind": "crash_after_compaction_before_reply"}
+    group559 = [{"name": "read_file", "args": {"path": "{files}/small.txt"}},
+                {"name": "lcm_expand", "args": {"store_id": 1, "max_tokens": 20000}, "expect": {"min_chars": 10000}}]
+    cells = []
+    for m, ip in modes():
+        cells += [
+            cell(f"baseline/{m}/acp", [], in_place=ip, doc="Negative control: no faults, no tools; must PASS on main."),
+            cell(f"acp-trailing/{m}", [483, 494], in_place=ip, user={"trailing_ws": True},
+                 doc="ACP raw prompt with a trailing newline, persisted stripped (the #483/#494 persist rewrite)."),
+            cell(f"repeat-identical-replies/{m}", [503], in_place=ip,
+                 assistant={"mode": "repeat-identical", "repeat_turns": list(range(3, 61, 3))},
+                 doc="Byte-identical replies on every third turn: only the multiset bar (B2) can see duplicates."),
+            cell(f"crash-then-lcm-tool-in-merge-turn/{m}", [553, 563], in_place=ip, faults=[crash],
+                 tool_plan=[{"turns": "restart", "calls": [{"name": "lcm_status", "args": {}}]}],
+                 doc="#553 S1: crash after a preflight compaction; the merge turn dispatches a real LCM tool call."),
+            cell(f"gateway-second-restart/{m}", [546, 547], in_place=ip, transport="gateway",
+                 faults=[crash, {"kind": "clean_exit_before_turn", "after_restart": 3}],
+                 doc="Crash after compaction, gateway restart, then a clean second restart (a deploy) 3 turns later."),
+            cell(f"parallel-tool-group/{m}", [559, 497], in_place=ip,
+                 tool_plan=[{"turns": list(range(2, 61, 3)), "calls": group559}],
+                 doc="#559 shape: one assistant row calls read_file + lcm_expand (large result); lcm_expand ingests mid-turn."),
+            cell(f"lcm-tool-mid-turn/{m}", [], in_place=ip,
+                 tool_plan=[{"turns": list(range(4, 61, 4)), "calls": [{"name": "lcm_grep", "args": {"query": "alpha"}}]}],
+                 doc="A single LCM tool call every fourth turn, no crash."),
+            cell(f"cancel-retry/{m}", [493, 544], in_place=ip, faults=[{"kind": "cancel_then_retry", "turn": 22}],
+                 doc="ACP cancel (request_hard_interrupt) during the provider call, then the same prompt re-sent: the "
+                     "host re-attaches the cancelled prompt (acp_adapter/server.py _attach_interrupted_prompt)."),
+            cell(f"native-short-prefix/tool-dense/{m}", [], in_place=ip, native=True,
+                 tool_plan=[{"turns": list(range(1, 61)), "calls": [{"name": "read_file", "args": {"path": "{files}/big.txt"}}]}],
+                 doc="Data, not #509: native ON under tight tuning with a large read_file result every turn. Rejected "
+                     "BEFORE the summary call (prefix_too_short, compaction.py _compress_native_recovery)."),
+            cell(f"native-long-prefix/{m}", [509, 479, 464], in_place=ip, native=True, window=1000000, turns=80,
+                 repeat=3000, lcm_env={}, assistant={"real_usage": True}, min_compactions=2,
+                 doc="Native ON, LCM default tuning (threshold 0.35, fresh tail 32), 1M window, ~17k tokens a turn: the "
+                     "host's 0.8 threshold fires at ~46 turns with a ~30-turn prefix before the fresh tail (hundreds of "
+                     "k tokens), so the host ContextCompressor "
+                     "summary call runs (stubbed aux LLM) and LCM's post-summary checks decide (#509 field shape)."),
+            cell(f"long-80/{m}", [], in_place=ip, turns=80, repeat=1000, lcm_env={},
+                 assistant={"real_usage": True}, min_compactions=8,
+                 doc="LCM default tuning with provider-reported usage, 80 turns (the LONG cells of the #553 probe file)."),
+            cell(f"multi-session-one-process/{m}", [566], in_place=ip, cron_every=5,
+                 doc="A chat session S0 and a fresh platform='cron' agent every 5 S0 turns in ONE host process "
+                     "(cron/scheduler.py); cron turns are tagged K."),
+        ]
+        for tr in ("acp-history", "gateway-reload"):
+            cells.append(cell(f"crash-after-compaction/{m}/{tr}", [553, 561], in_place=ip,
+                              transport="acp" if tr == "acp-history" else "gateway", faults=[crash],
+                              doc="#553: os._exit inside the provider call of the first turn whose preflight compaction "
+                                  "committed; the restart restores the dangling row and the next prompt merges into it."))
+    cells += [
+        cell("preflight-continue/in-place", [503], in_place=True, turns=40, user={"trailing_ws": True, "continue_turns": [17, 18, 19]},
+             lcm_env={**tight(128000), "LCM_FRESH_TAIL_COUNT": "8"}, min_compactions=2,
+             doc="Repeated 'continue' prompts under sub-threshold preflight ingest, fresh_tail 8."),
+        cell("publication-failure/rotation-child", [541], in_place=False, turns=80, repeat=1000, lcm_env={},
+             assistant={"real_usage": True}, faults=[{"kind": "publication_failure", "where": "rotation_child"}],
+             bars=["B1", "B2", "B4"], min_compactions=0,
+             doc="#541's bar: the FIRST rotation-child publication raises LifecyclePublicationConflictError "
+                 "(generalises PROBE_CHILD_CONFLICT); the next child compaction must commit, with 0 parent copies. "
+                 "B3/B5 do not apply to an injected conflict."),
+        cell("publication-failure/rotation-child-persistent", [], in_place=False, turns=80, repeat=1000, lcm_env={},
+             assistant={"real_usage": True}, bars=["B1", "B2", "B4"], min_compactions=0,
+             faults=[{"kind": "publication_failure", "where": "rotation_child", "persistent": True}],
+             doc="Data, not G-REL-1 (ci.NON_GATE): EVERY rotation-child publication raises, so no child compaction "
+                 "can ever publish; a degraded-mode product question outside stabilization (DESIGN-436 REVISION 2 D-B)."),
+        cell("publication-failure/pass-3-in-place", [541], in_place=True,
+             faults=[{"kind": "publication_failure", "where": "pass_3"}], bars=["B1", "B2", "B4"], min_compactions=0,
+             doc="The third publication attempt raises; later passes must recover."),
+        cell("separator-heavy-retained/in-place", [545], in_place=True, user={"separator_turns": "all"}, faults=[crash],
+             doc="Every prompt carries >=64 blank-line separators, so the dangling retained row does too (#545)."),
+        cell("native-short-prefix/baseline/in-place", [], in_place=True, native=True,
+             doc="Data, not #509: native ON under tight tuning; rejected before the summary call (prefix_too_short)."),
+        cell("native-long-prefix/tool-dense/in-place", [509, 479, 464], in_place=True, native=True, window=1000000,
+             turns=100, repeat=400, lcm_env={}, assistant={"real_usage": True}, min_compactions=2, big_lines=400,
+             tool_plan=[{"turns": list(range(1, 101)), "calls": [{"name": "read_file", "args": {"path": "{files}/big.txt"}}]}],
+             doc="native-long-prefix with a ~20k-token read_file result every turn: a tool-heavy prefix and tail."),
+        cell("pressure-disagreement/in-place", [420], in_place=True, assistant={"real_usage": True, "usage_scale": 1.3},
+             doc="The provider reports 1.3x the tokens actually sent (#420)."),
+        cell("window-1m/in-place", [], in_place=True, window=1000000, turns=60,
+             doc="1M window through engine.update_model; tight tuning and text volume scaled x15.6 from the 64k probes, "
+                 "so LCM's threshold math runs at 1M (threshold 500k tokens, ~36k tokens per turn)."),
+        cell("crash-after-rotation/rotation", [519, 549], in_place=False, user={"trailing_ws": True},
+             faults=[{"kind": "crash_after_rotation_before_child_row"}],
+             doc="os._exit right after the engine's rotation on_session_start, before any child row (#519/#549)."),
+        cell("crash-between-end-and-start/rotation", [489], in_place=False,
+             faults=[{"kind": "crash_between_session_end_and_start"}],
+             doc="os._exit between on_session_end and on_session_start of a rotation (#489). UNSUPPORTED where the "
+                 "host's rotation path never calls on_session_end."),
+    ]
+    return cells
+
+
+def validate(c: dict) -> None:
+    assert c["transport"] in TRANSPORTS, c["id"]
+    assert set(c["bars"]) <= set(BARS), c["id"]
+    assert {f["kind"] for f in c["faults"]} <= FAULTS, c["id"]
+    assert c["window"] in (128000, 1000000), c["id"]
+    assert all(t in ISSUES or t in (483, 494, 519) for t in c["targets"]), c["id"]
+    for g in c["tool_plan"]:
+        assert g["turns"] == "restart" or all(1 <= t <= c["turns"] for t in g["turns"]), c["id"]
+
+
+def select(patterns: str, extra=()) -> list[dict]:
+    cells = registry() + list(extra)  # extra: transport-only cells (R2 process_cell.R2_CELLS)
+    for c in cells:
+        validate(c)
+    if patterns.strip() == "all":
+        return cells
+    pats = [p.strip() for p in patterns.split(",") if p.strip()]
+    chosen = [c for c in cells if any(fnmatch.fnmatchcase(c["id"], p) for p in pats)]
+    if not chosen:
+        raise ValueError(f"no cell matches {patterns!r}")
+    return chosen
