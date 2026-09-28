@@ -738,6 +738,20 @@ def test_rc2_projection_followers_read_only_the_sources_conversation(tmp_path, f
         engine.shutdown()
 
 
+def test_rc3_projection_followers_of_a_blank_conversation_source_stay_in_the_active_conversation(tmp_path):
+    """R3-1: a legacy source row with a blank conversation never widens the read to every conversation of
+    the session: a byte-identical reply of another conversation is not taken, so the active reply is stored."""
+    engine = _engine(tmp_path)
+    try:
+        source = engine._store.append("S", {"role": "user", "content": "[N] newest " + "word " * 600,
+                                            "timestamp": 99.0}, conversation_id="")
+        engine._store.append("S", {"role": "assistant", "content": "ok reply"}, conversation_id="foreign")
+        view = [_projection_of(engine, source), {"role": "assistant", "content": "ok reply"}]
+        assert engine._survival_projection_followers(view, 0, engine._store.get(source), {0: 99.0}) == []
+    finally:
+        engine.shutdown()
+
+
 def test_rc2_projection_followers_bind_to_the_named_source(tmp_path):
     """Two identical user rows under one stamp; the projection names the later one. Matched to the earlier
     row, the walk would read the earlier reply as this one: it takes nothing unless the row is the source."""
