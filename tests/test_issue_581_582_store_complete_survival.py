@@ -511,6 +511,153 @@ def test_g_fitted_list_re_ingests_without_new_rows(tmp_path, summaries, host_est
         cold.shutdown()
 
 
+def _conflicted(engine) -> None:
+    engine._lifecycle.stage_compaction_publication = lambda *a, **k: (_ for _ in ()).throw(
+        LifecyclePublicationConflictError("injected"))
+
+
+def test_r3a_an_unstored_summary_looking_row_is_never_dropped(tmp_path, summaries, host_estimator, monkeypatch):
+    """R3-A LOSSLESS: the store write for the newest turn fails (a lock); a reply that merely mentions
+    "CONTEXT SUMMARY" is not durable, so the fit never cuts past it, and it is stored once the lock clears."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _long_view()
+    try:
+        engine.ingest(view)
+        reply = {"role": "assistant", "content": "Here is the CONTEXT SUMMARY you asked for:" + " word" * 6000}
+        view2 = [*view, reply, {"role": "user", "content": "[N] newest question", "timestamp": 999.0}]
+        real = engine._store._append_protected_batch
+
+        def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine._store, "_append_protected_batch", locked)
+        engine.ingest(view2)  # the per-turn ingest swallows the failure
+        try:
+            kept = engine.compress(view2, current_tokens=host_estimator(view2))
+        except sqlite3.OperationalError:
+            kept = view2  # compress() re-raised: the host keeps its list
+        assert any(m is reply for m in kept)
+        monkeypatch.setattr(engine._store, "_append_protected_batch", real)  # the lock clears
+        host = [*kept, {"role": "assistant", "content": "answer to newest"}]
+        engine.ingest(host)
+        engine.on_session_end("S", host)
+        assert any(r["content"] == reply["content"] for r in _rows(engine)), "reply never reached the store"
+    finally:
+        engine.shutdown()
+
+
+def _big_user_view() -> list[dict]:
+    return [{"role": "system", "content": "system prompt"},
+            *[r for i in range(4) for r in _turn(f"L{i}", 10.0 * i, tool=i % 3 == 0)],
+            {"role": "user", "content": "[N] newest " + "word " * 12_000, "timestamp": 99.0},
+            {"role": "assistant", "content": "ok reply"}]
+
+
+def _big_tool_view() -> list[dict]:
+    call = {"id": "call_big", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    return [{"role": "system", "content": "system prompt"},
+            *[r for i in range(4) for r in _turn(f"L{i}", 10.0 * i, tool=i % 3 == 0)],
+            {"role": "user", "content": "[N] newest", "timestamp": 99.0},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_big", "content": "row " * 12_000}]
+
+
+def _list_system_view() -> list[dict]:
+    view = _long_view()
+    return [{"role": "system", "content": [{"type": "text", "text": "system prompt"}]}, *view[1:]]
+
+
+@pytest.mark.parametrize("conflict", [True, False])
+def test_r3b_a_projected_row_re_ingests_as_its_source_row(tmp_path, summaries, host_estimator, conflict):
+    """R3-B (Q1): the newest user turn alone is over the window; its projected view copy keeps the host
+    stamp, and the next ingest of the fitted list plus a new turn stores only the new turn."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_user_view()
+    try:
+        engine.ingest(view)
+        if conflict:
+            _conflicted(engine)
+        fitted = engine.compress(view, current_tokens=host_estimator(view))
+        assert engine._last_survival_fit and any(NOTICE in str(m.get("content")) for m in fitted[1:])
+        before = len(_rows(engine))
+        new = _turn("NEW", 500.0)
+        engine.ingest([*fitted, *new])
+        added = _rows(engine)[before:]
+        assert [r["content"] for r in added] == [m["content"] for m in new]
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("view_of", [_big_tool_view, _list_system_view], ids=["projected-tool", "list-system"])
+def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, host_estimator, view_of):
+    """R3-B (Q3, Q2): the host adopts the fitted list (a projected tool row; a list-content system slot
+    carrying the notice) and a cold process resumes it: only the new turn is stored, never the notice."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = view_of()
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        fitted = engine.compress(view, current_tokens=host_estimator(view))
+        assert engine._last_survival_fit
+        before = len(_rows(engine))
+        engine.on_session_end("S", fitted)
+    finally:
+        engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        new = _turn("NEW", 500.0)
+        cold.ingest([*fitted, *new])
+        added = _rows(cold)[before:]
+        assert [r["content"] for r in added] == [m["content"] for m in new]
+        assert not any(NOTICE in str(r["content"]) for r in _rows(cold))
+    finally:
+        cold.shutdown()
+
+
+class _Heartbeat:
+    """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
+    pattern = "HEARTBEAT_PING"
+
+    def search(self, text, timeout=None):
+        return object() if self.pattern in str(text) else None
+
+
+@pytest.mark.parametrize("ignored", [True, False])
+def test_r3c_a_skipped_prompt_ends_an_ignored_dependent_run(tmp_path, summaries, ignored):
+    """R3-C (#5): after a resume re-binds the frontier at 0, a stored ignore-matched prompt makes the
+    next replies dependent; a node-covered (skipped) prompt ends that run, so the first uncovered reply
+    to a real prompt is summarized, never passed uncovered."""
+    engine = _engine(tmp_path)
+    view = []
+    for i in range(1, 9):
+        text = "HEARTBEAT_PING check" + PAD if (i == 2 and ignored) else f"[U{i}] turn" + PAD
+        view += [{"role": "user", "content": text, "timestamp": 10.0 * i},
+                 {"role": "assistant", "content": f"reply U{i}" + PAD}]
+    view.append({"role": "user", "content": "[U9] turn" + PAD, "timestamp": 90.0})
+    try:
+        engine.ingest(view)
+        engine.compress(view)
+        reply = next(int(r["store_id"]) for r in _rows(engine) if r["content"].startswith("reply U8"))
+        engine.on_session_start("C", boundary_reason="compression", old_session_id="S", platform="telegram",
+                                conversation_id="conv")
+    finally:
+        engine.shutdown()
+    engine = _engine(tmp_path)
+    try:
+        assert _frontier(engine) == 0
+        engine._compiled_ignore_message_patterns = [_Heartbeat()]  # the operator adds an ignore pattern
+        tail = [{"role": "user", "content": "[U10] new" + PAD, "timestamp": 100.0},
+                {"role": "assistant", "content": "reply U10" + PAD}]
+        engine.ingest(tail)
+        engine.compress(list(tail))
+        covered = {int(r[0]) for r in engine._store.connection.execute(
+            "SELECT source.value FROM summary_nodes AS node, json_each(node.source_ids) AS source "
+            "WHERE node.source_type = 'messages'").fetchall()}  # any session's summaries
+        assert not (_frontier(engine) >= reply and reply not in covered), (_frontier(engine), reply)
+    finally:
+        engine.shutdown()
+
+
 def test_h_survival_fit_off_leaves_the_result_unchanged(tmp_path, summaries, host_estimator):
     engine = _engine(tmp_path, context_length=WINDOW, survival_fit=False)
     view = _long_view()

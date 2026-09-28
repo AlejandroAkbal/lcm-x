@@ -841,6 +841,9 @@ class ReconcileMixin:
     ) -> tuple[str, str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        source = None if stored_row else self._survival_projection_source(msg, role, content)
+        if source is not None:  # #582: a survival-fit projection is its source row, never a new occurrence
+            return self._message_replay_identity(source, stored_row=True, strip_carrier=strip_carrier)
         strip_payload = False
         # Opt-in: only occurrence/position-bound consumers read the override (#498).
         if stored_row and with_host_rewrite and role == "user":

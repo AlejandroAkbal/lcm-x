@@ -16,6 +16,9 @@ chunk row the budget cut. Ignore-matched rows keep their stored filter-exclusion
 existing summary already covers, a stored system prompt (the anchor rule) and a hidden reply to an
 ignored hidden prompt are excluded.
 Duplicate copies are summarized like any other row (no duplicate-exclusion machinery).
+Parity: with nothing hidden, claimed or excluded the leaf is today's input, except that one pass
+reads at most ``_SCAN_LIMIT`` owned rows per source; a longer backlog is taken as a prefix and
+drains over later passes (never past a row the scan did not read).
 """
 from __future__ import annotations
 
@@ -167,13 +170,15 @@ class StoreCompleteMixin:
             if not emit_chunk(store_id):
                 complete = False
                 break
-            if store_id in ignored:
-                dependent = dependent or role == "user"
+            if store_id in ignored:  # as compaction.py: an ignored row of any role makes the next replies dependent
+                dependent = True
                 continue
             if store_id in taken or store_id in passive:
+                dependent = dependent and role not in ("user", "system")
                 continue
             if store_id in covered or role == "system" or (dependent and role in ("assistant", "tool")):
-                excluded.append(store_id)
+                excluded.append(store_id)  # a skipped prompt still ends a dependent run (compaction.py:1524)
+                dependent = dependent and role not in ("user", "system")
                 continue
             if store_id not in text or not take(text[store_id], [store_id]):  # a retained row, or the budget
                 complete = False

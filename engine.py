@@ -138,7 +138,7 @@ from .reconcile import _has_lossy_redacted_identity, _merge_append_cut, _proof_u
 from .compaction import CompactionMixin
 from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
 from .store_complete import StoreCompleteMixin
-from .survival_fit import SurvivalFitMixin
+from .survival_fit import SurvivalFitMixin, _carries_survival_notice
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -5074,7 +5074,7 @@ class LCMEngine(
             return (
                 "[Note: This conversation uses Lossless Context Management (LCM)." in content
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
-            ) or "\n\n[LCM survival fit: " in content  # #582: the fit's notice in the system slot
+            ) or _carries_survival_notice(msg.get("content"), content)  # #582: the fit's notice in the system slot
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
         if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):
