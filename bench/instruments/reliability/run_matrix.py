@@ -124,8 +124,9 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
     (home / "plugins").mkdir(parents=True)
     (d / "home").mkdir()
     (d / "db").mkdir()
-    (home / "plugins" / plugin["dir"]).symlink_to(plugin["tree"])
-    (home / "config.yaml").write_text(config_yaml(cell, plugin))
+    start = cell.get("from_plugin") or plugin  # native-on-off: an older ref runs until the plugin_switch fault
+    (home / "plugins" / start["dir"]).symlink_to(start["tree"])
+    (home / "config.yaml").write_text(config_yaml(cell, start))
     (d / "cell.json").write_text(json.dumps({**cell, "plugin": plugin, "host": host_name, "host_src": host["src"],
                                              "host_python": host["python"]}, indent=1))
     env = {"HOME": str(d / "home"), "PATH": "/usr/bin:/bin", "HERMES_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPYCACHEPREFIX": str(d / "pycache"),
@@ -151,7 +152,12 @@ def run_cell(cell: dict, host_name: str, host: dict, plugin: dict, out: Path, ti
         lines = [x for x in done.stdout.splitlines() if x.startswith('{"exit"')]
         last = json.loads(lines[-1]) if lines else {"exit": "error", "reason": f"phase {phase} rc={done.returncode}: "
                                                     + (done.stderr.strip().splitlines() or ["no output"])[-1][:300]}
-        if last["exit"] in ("crash", "clean_exit", "tip_switch"):
+        if last["exit"] == "plugin_switch":  # the candidate takes over the same home and store, native OFF
+            (home / "plugins" / start["dir"]).unlink()
+            (home / "plugins" / plugin["dir"]).symlink_to(plugin["tree"])
+            (home / "config.yaml").write_text(config_yaml(cell, plugin))
+            env["LCM_NATIVE_RECOVERY"] = "false"
+        if last["exit"] in ("crash", "clean_exit", "tip_switch", "plugin_switch"):
             start_turn = last["next_turn"]
             continue
         break
@@ -230,6 +236,9 @@ def main(argv=None) -> int:
         from bench.instruments.reliability import process_cell
     selected = C.select(a.cells, extra=process_cell.R2_CELLS if a.transport else ())
     plugins = [plugin_tree.export(Path(a.lcm_repo), ref.strip(), out / "plugins", out) for ref in a.plugin_ref.split(",")]
+    for ref in sorted({c["from_ref"] for c in selected if c.get("from_ref")}):  # native-on-off starting refs
+        old = plugin_tree.export(Path(a.lcm_repo), ref, out / "plugins", out)
+        selected = [{**c, "from_plugin": old} if c.get("from_ref") == ref else c for c in selected]
     if len({p["sha"] for p in plugins}) < len(plugins):
         ap.error(f"--plugin-ref values resolve to the same commit: {[(p['ref'], p['sha'][:12]) for p in plugins]}")
     out.mkdir(parents=True, exist_ok=True)

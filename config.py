@@ -483,6 +483,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("large_output_transcript_gc_enabled", "LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", bool),
     _EnvFieldSpec("summary_model", "LCM_SUMMARY_MODEL", str),
     _EnvFieldSpec("native_recovery", "LCM_NATIVE_RECOVERY", bool),
+    _EnvFieldSpec("survival_fit", "LCM_SURVIVAL_FIT", bool),
+    _EnvFieldSpec("survival_reserve", "LCM_SURVIVAL_RESERVE", float),
     _EnvFieldSpec("summary_circuit_breaker_failure_threshold", "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", int),
     _EnvFieldSpec("summary_circuit_breaker_cooldown_seconds", "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", int),
     _EnvFieldSpec("summary_spend_max_calls", "LCM_SUMMARY_SPEND_MAX_CALLS", int),
@@ -955,6 +957,10 @@ class LCMConfig:
     # predates native recovery. Keyword construction remains preferred.
     # Opt-in native context recovery; preserves LCM sources and never changes the frontier.
     native_recovery: bool = False
+    # #582: fit an over-window compress() result by dropping the oldest stored user turns (never a row).
+    survival_fit: bool = True
+    # Share of the model window the survival fit keeps free for the response and host overhead.
+    survival_reserve: float = 0.15
 
     @classmethod
     def from_env(cls) -> "LCMConfig":

@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 from .fresh_tail import tool_group_safe_end
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .store import _normalize_observed_at
+from .tokens import count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -612,19 +613,19 @@ class IdentityAnchorMixin:
 
     # -- R4: coverage bound to the summarizer input ----------------------------
 
-    def _identity_anchor_summary_input(self, chunk, full_map, view=(), raw_chunk=()) -> Optional[list]:
+    def _identity_anchor_summary_input(self, chunk, full_map, view=(), raw_chunk=(), budget=None,
+                                       accounted_ids=()) -> Optional[list]:
         """The summarizer input for ``chunk`` built TOGETHER with what each input row may claim:
-        ``[(input_row, [store_id, ...]), ...]``, or None (today's input and mapping).
+        ``[(input_row, [store_id, ...]), ...]``, ``[]`` (no leaf can start), or None (today's input).
         - A live composite LCM recorded (R2 witness) claims its constituents: their text is in it.
-        - An owned, host-stamped user row above the frontier that no live row maps, that no unmapped
+        - #581: every other owned row above the frontier that no live row maps, and that no unmapped
           occurrence of the host ``view`` accounts for (occurrence for occurrence: one live row never
-          hides two stored ones), and that sits below the chunk's last mapped row (a host merge absorbed
-          it, a persist override rewrote its survivor, ...) is REHYDRATED from its stored bytes, in store
-          order, and claims only itself.
+          hides two stored ones), is REHYDRATED from its stored bytes, in store order, and claims only
+          itself; the leaf is a bounded contiguous prefix of the owned rows (store_complete.py).
         Nothing is claimed without its text in the input; rows with valid coverage (<= frontier) keep it."""
-        if not identity_anchor_enabled() or not isinstance(full_map, dict) or not chunk:
-            return None
-        frontier, mapped = int(self._last_compacted_store_id or 0), set(full_map.values())
+        if not identity_anchor_enabled() or not isinstance(full_map, dict) or not (chunk or budget) or (raw_chunk and not chunk):
+            return None  # an empty chunk is the #581 hidden-backlog leaf, never a chunk of dependent replies
+        frontier, mapped = self._store_complete_frontier(), set(full_map.values())
         carry = self._load_compression_carry_ranges()
 
         def owned(row) -> bool:
@@ -633,6 +634,7 @@ class IdentityAnchorMixin:
         claimed: set[int] = set()
         claims: dict[int, list] = {}
         shown: Optional[Counter] = None  # the view's unmapped occurrences, built once on first need
+        in_view: set[int] = set()  # id() of the view objects, built with ``shown``
         self._identity_anchor_text_memo = {}
         scope = [str(self._session_id), *self._identity_anchor_chain()]
         for message in chunk:
@@ -668,8 +670,11 @@ class IdentityAnchorMixin:
                 if shown is None:
                     shown = Counter(self._identity_anchor_view_key(m) for m in view if id(m) not in full_map)
                     shown.pop(None, None)
+                    in_view = {id(m) for m in view}
                 pool = self._identity_anchor_pool(donors, mapped)
-                own = self._identity_anchor_view_key(message)
+                # Only a view object's own occurrence is in ``shown``: a row that is not one (a stored row the
+                # #581 input carries) subtracting its key would release another view row's reservation.
+                own = self._identity_anchor_view_key(message) if id(message) in in_view else None
                 reserved = self._identity_anchor_reserved(pool, shown - Counter([own] if own else []))
                 pool = [row for row in pool if int(row["store_id"]) not in reserved]
                 donors = [row for row in donors if int(row["store_id"]) not in mapped | reserved]
@@ -692,33 +697,10 @@ class IdentityAnchorMixin:
         if bound is not None and any(store_id > bound for store_id in claimed):
             claims = {key: [store_id for store_id in ids if store_id < bound] for key, ids in claims.items()}
             claimed = {store_id for ids in claims.values() for store_id in ids}
-        last = max([full_map[id(m)] for m in chunk if id(m) in full_map] + list(claimed), default=0)
-        gaps = []
-        if last > frontier:
-            shown = Counter(self._message_replay_identity(message, strip_carrier=False)  # a retained anchor, ...
-                            for message in view if id(message) not in full_map)
-
-            rows = self._store.get_range(str(self._session_id), start_id=frontier + 1, end_id=last - 1, limit=100000)
-            for source, start, end in carry:
-                if end > frontier and start < last:
-                    rows += self._store.get_range(source, start_id=max(start, frontier) + 1, end_id=min(end, last - 1), limit=100000)
-            gaps = [row for row in sorted(rows, key=lambda row: int(row["store_id"]))
-                    if row.get("role") == "user" and owned(row)
-                    and row.get("observed_at") is not None
-                    and int(row["store_id"]) not in mapped | claimed
-                    and not self._matches_ignore_message_patterns(row, stored_row=True)]
-            shown_rows = _match_occurrences(gaps, self._stored_row_forms, list(enumerate(shown.elements())))
-            gaps = [row for row in gaps if int(row["store_id"]) not in shown_rows]
-        if not gaps and not claims:
-            return None
-        out, pending = [], list(gaps)
-        for message in chunk:
-            position = full_map.get(id(message)) or max(claims.get(id(message)) or [0])
-            while pending and position and int(pending[0]["store_id"]) < position:
-                row = pending.pop(0)
-                out.append(({"role": "user", "content": row.get("content") or ""}, [int(row["store_id"])]))
-            out.append((message, claims.get(id(message), [])))
-        return out
+        if budget is None:
+            budget = count_messages_tokens(chunk)
+        return self._store_complete_input(chunk, claims, full_map, view, raw_chunk, frontier, carry,
+                                          max(budget, count_messages_tokens(chunk)), accounted_ids)
 
     def _identity_anchor_view_key(self, message) -> Optional[tuple]:
         """A view row's occurrence key ``(stamp, form)`` as the ingest site keys it; None for LCM's own scaffold

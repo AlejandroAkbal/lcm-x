@@ -711,7 +711,10 @@ def _metadata_head_run(tmp_path, monkeypatch, case, *, term):
         got = _retry_and_measure(engine, provider, retry)
         stored = engine._store.get_session_messages(SID, limit=100_000)
         return {**got, "new_stored": any(NEW in json.dumps(row.get("tool_calls"), default=str) for row in stored),
-                "new_returned": any(NEW in json.dumps(row.get("tool_calls"), default=str) for row in got.pop("out"))}
+                "new_returned": any(NEW in json.dumps(row.get("tool_calls"), default=str) for row in got.pop("out")),
+                "new_covered": any(NEW in json.dumps(row.get("tool_calls"), default=str) and int(row["store_id"]) in {
+                    store_id for node in engine._dag.get_session_nodes(SID) if node.source_type == "messages"
+                    for store_id in node.source_ids} for row in stored)}
     finally:
         engine.shutdown()
 
@@ -724,7 +727,8 @@ def test_a_head_with_identity_beyond_its_bytes_is_not_skipped(tmp_path, monkeypa
     monkeypatch.undo()
     today = _metadata_head_run(tmp_path / "today", monkeypatch, case, term=False)
     assert fixed["reason"] != REASON and fixed == today
-    assert fixed["new_stored"] and fixed["new_returned"], fixed
+    # Stored, then live or (#581: the retry now publishes) covered by the leaf that consumed it.
+    assert fixed["new_stored"] and (fixed["new_returned"] or fixed["new_covered"]), fixed
 
 
 # -- eva-shaped cell: the real Hermes host helpers around a real (unpatched) engine ------------------

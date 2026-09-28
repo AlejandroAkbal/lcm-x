@@ -156,6 +156,11 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "safe to ignore if compaction proceeds normally; inspect lcm_status only if pressure stays high or compaction loops"
         warning_only = True
         rationale = "context pressure is an operating state, not persisted-state corruption"
+    elif name == "survival_fit":
+        command = ("inspect the 'LCM survival fit applied' log lines and the compaction failure reason; the dropped "
+                   "turns stay stored verbatim (lcm_grep / lcm_load_session); nothing needs deleting")
+        warning_only = True
+        rationale = "a survival fit kept an over-window session alive; it points at a compaction that could not publish"
     elif name == "cleanup_candidates":
         action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
         command = "run `/lcm doctor clean` first; if candidates are expected junk/noise, run `/lcm backup` before `/lcm doctor clean apply`"

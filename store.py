@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional
 
 from .db_bootstrap import (
+    select_conversation_range,
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
@@ -713,11 +714,17 @@ class MessageStore:
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
                   limit: int = 1000,
-                  conversation_id: str | None = None) -> List[Dict[str, Any]]:
-        """Get messages in a store_id range for a session."""
+                  conversation_id: str | None = None,
+                  include_blank_conversation: bool = False) -> List[Dict[str, Any]]:
+        """Get messages in a store_id range for a session (``include_blank_conversation``: rows with
+        no conversation id count as ``conversation_id``'s too)."""
         where = ["session_id = ?", "store_id >= ?"]
         args: list[Any] = [session_id, start_id]
         conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause and include_blank_conversation:  # index seeks, never the foreign rows
+            rows = select_conversation_range(self._conn, _MESSAGE_SELECT_COLUMNS, session_id, conversation_args[0],
+                                             int(start_id) - 1, end_id, limit)
+            return [self._row_to_dict(r) for r in rows]
         if conversation_clause:
             where.append(conversation_clause)
             args.extend(conversation_args)

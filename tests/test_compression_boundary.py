@@ -1,7 +1,9 @@
 import json
+import logging
 import re
 import sqlite3
 import time
+from collections import Counter
 
 import pytest
 
@@ -471,6 +473,280 @@ def test_host_that_keeps_the_compress_input_resumes_after_it(tmp_path, monkeypat
         assert _row_count(engine) == rows + 1
         assert engine._ingest_cursor == len(pre) + 1
         assert engine._compress_commit_proof is None
+    finally:
+        engine.shutdown()
+
+
+def _refused_commit(tmp_path, monkeypatch):
+    """Cycle 1 commits in place. Cycle 2 compresses and the host runs the commit end, then its
+    would_grow guard refuses the candidate: no compression start, the host keeps `pre` + reply."""
+    engine, pre, compressed = _compacted_engine(tmp_path, monkeypatch)
+    engine.on_session_end("S0", pre)
+    engine.on_session_start("S0", boundary_reason="compression", old_session_id="S0", platform="acp")
+    host = list(compressed) + [_turn(13)[1]]
+    for i in range(14, 21):
+        host.extend(_turn(i)[:1] if i == 20 else _turn(i))
+        engine.ingest(host)
+    pre = list(host)
+    engine.compress(list(host), force=True)
+    assert engine._last_compression_status == "compacted"
+    engine.on_session_end("S0", pre)
+    host.append(_turn(20)[1])
+    engine.ingest(host)
+    return engine, host, engine._lifecycle.get_by_session("S0").last_finalized_frontier_store_id
+
+
+def _compress_next(engine, host):
+    for i in range(21, 28):
+        host.extend(_turn(i)[:1] if i == 27 else _turn(i))
+        engine.ingest(host)
+    engine.compress(list(host), force=True)
+
+
+def _spy_binds(engine, monkeypatch):
+    calls, bind, rebind = [], engine._lifecycle.bind_session, engine._lifecycle.rebind_own_finalized
+    monkeypatch.setattr(engine._lifecycle, "bind_session", lambda *a, **k: calls.append(a) or bind(*a, **k))
+
+    def spy_rebind(*a, **k):  # the row-state rebind's compare-and-bind (R6-2): a write is a bind
+        state = rebind(*a, **k)
+        if state is not None:
+            calls.append(a)
+        return state
+
+    monkeypatch.setattr(engine._lifecycle, "rebind_own_finalized", spy_rebind)
+    return calls
+
+
+def test_compress_rebinds_after_a_commit_end_the_host_did_not_adopt(tmp_path, monkeypatch, caplog):
+    """The commit end finalized the row and the compression start never came: the next compress
+    re-binds the session at its finalized frontier instead of publishing against frontier 0."""
+    caplog.set_level(logging.INFO)
+    engine, host, frontier = _refused_commit(tmp_path, monkeypatch)
+    try:
+        assert frontier > 0
+        _compress_next(engine, host)
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        covered = Counter(i for n in engine._dag.get_session_nodes("S0") if n.source_type == "messages"
+                          for i in n.source_ids)
+        below = [r["store_id"] for r in engine._store.get_session_messages("S0", limit=10_000)
+                 if r["store_id"] <= state.current_frontier_store_id]
+    finally:
+        engine.shutdown()
+    assert engine._last_compression_status == "compacted"
+    assert not [r for r in caplog.records if "publication_invariant_conflict" in r.getMessage()]
+    assert state.current_session_id == "S0" and state.current_frontier_store_id >= frontier
+    assert below and all(covered[i] == 1 for i in below), (below, covered)
+
+
+@pytest.mark.parametrize("control", ["start", "other_conversation", "reset"])
+def test_no_rebind_when_the_commit_end_was_followed_up(tmp_path, monkeypatch, caplog, control):
+    """(i) a normal start binds the row (nothing left to re-bind); (ii) another conversation and (iii) a
+    reset after the finalize never re-bind."""
+    caplog.set_level(logging.INFO)
+    engine, host, _frontier = _refused_commit(tmp_path, monkeypatch)
+    try:
+        if control == "start":
+            engine.on_session_start("S0", boundary_reason="compression", old_session_id="S0", platform="acp")
+        elif control == "reset":
+            engine.on_session_reset()
+        if control == "other_conversation":
+            engine._conversation_id = "C-other"
+        binds = _spy_binds(engine, monkeypatch)
+        if control == "start":
+            engine._rebind_after_unadopted_compaction_commit()
+        else:
+            _compress_next(engine, host)
+        state = engine._lifecycle.get_by_session("S0")
+    finally:
+        engine.shutdown()
+    assert binds == []
+    assert not [r for r in caplog.records if "after an unadopted compaction commit" in r.getMessage()]
+    assert (state.current_session_id is None) == (control != "start")  # only the host's start binds
+
+
+def test_rebind_never_advances_from_the_in_process_frontier(tmp_path, monkeypatch, caplog):
+    """(iv) the in-process frontier differs from the row: warn, move nothing without a publication."""
+    caplog.set_level(logging.INFO)
+    engine, _host, frontier = _refused_commit(tmp_path, monkeypatch)
+    try:
+        engine._last_compacted_store_id = frontier + 5
+        monkeypatch.setattr(engine._lifecycle, "advance_frontier", lambda *a, **k: pytest.fail("advanced"))
+        engine._rebind_after_unadopted_compaction_commit()
+        state = engine._lifecycle.get_by_session("S0")
+    finally:
+        engine.shutdown()
+    assert state.current_session_id == "S0" and state.current_frontier_store_id == frontier
+    assert engine._last_compacted_store_id == frontier
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(frontier + 5) in m and str(frontier) in m for m in warnings), warnings
+
+
+_CLONE_CONV = "agent:main:telegram:dm:42"
+
+
+def _lifecycle_row(engine, conv=_CLONE_CONV):
+    state = engine._lifecycle.get_by_conversation(conv)
+    return (state.current_session_id, state.current_frontier_store_id, state.last_finalized_session_id)
+
+
+@pytest.mark.parametrize("other_end", ["empty", "messages"], ids=["hygiene-cleanup-end", "background-review-end"])
+def test_r5_3a_another_clone_unbinding_the_row_never_costs_the_bound_engine_a_conflict(
+        tmp_path, monkeypatch, caplog, other_end):
+    """R5-3a: another engine clone in the same process (the gateway hygiene agent's deferred cleanup,
+    on_session_end(sid, []); a background-review agent's turn end, on_session_end(sid, messages)) lands on
+    the same lifecycle row and finalizes it (frontier 0) while the turn engine stays bound. The turn
+    engine's next compress re-binds from the ROW's state (unbound, last finalized by its session) to the
+    session's own finalized frontier: no publication_invariant_conflict, and nothing advanced from the
+    in-process value."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(lcm_engine_module, "summarize_with_escalation", _stub_summarizer())
+    cfg = LCMConfig(database_path=str(tmp_path / "lcm.db"), fresh_tail_count=6, leaf_chunk_tokens=400,
+                    large_output_externalization_path=str(tmp_path / "ext"))
+    proto = LCMEngine(config=cfg, hermes_home=str(tmp_path / "home"))
+    turn_engine = proto.clone_for_agent()
+    sid, host, count = "S0", [], [0]
+    turn_engine.on_session_start(sid, platform="telegram", context_length=200_000, conversation_id=_CLONE_CONV)
+
+    def turns(n):
+        for _ in range(n):
+            count[0] += 1
+            user, reply = _turn(count[0])
+            host.append(user)
+            turn_engine.ingest(host)
+            host.append(reply)
+            turn_engine.ingest(host)
+
+    try:
+        turns(12)
+        count[0] += 1
+        host.append(_turn(count[0])[0])
+        turn_engine.ingest(host)
+        pre = list(host)
+        compressed = turn_engine.compress(list(host), force=True)
+        turn_engine.on_session_end(sid, pre)
+        turn_engine.on_session_start(sid, boundary_reason="compression", old_session_id=sid, platform="telegram",
+                                     conversation_id=_CLONE_CONV)
+        host[:] = [*compressed, _turn(count[0])[1]]
+        turn_engine.ingest(host)
+        bound, frontier, _fin = _lifecycle_row(turn_engine)
+        assert bound == sid and frontier > 0
+        other = proto.clone_for_agent()  # a fresh AIAgent's clone, started without the gateway key
+        other.on_session_start(sid, platform="cli", context_length=200_000)
+        assert other._conversation_id == _CLONE_CONV  # the same lifecycle row
+        other.on_session_end(sid, [] if other_end == "empty" else [dict(m) for m in host[-4:]])
+        other.shutdown()
+        assert _lifecycle_row(turn_engine) == (None, 0, sid)
+        turns(6)
+        count[0] += 1
+        host.append(_turn(count[0])[0])
+        turn_engine.ingest(host)
+        caplog.clear()
+        turn_engine.compress(list(host), force=True)
+        after = _lifecycle_row(turn_engine)
+    finally:
+        turn_engine.shutdown()
+    conflicts = [r.getMessage() for r in caplog.records if "publication_invariant_conflict" in r.getMessage()]
+    assert not conflicts and turn_engine._last_compression_status == "compacted", conflicts[:1]
+    assert after[0] == sid and after[1] > frontier
+
+
+def test_r6_2_a_stale_rebind_never_overwrites_a_session_that_bound_after_its_read(tmp_path, monkeypatch, caplog):
+    """R6-2: stale engine A reads the row unbound and last finalized by A; B binds before A acts. A's
+    rebind is a compare-and-bind: it writes nothing, B stays bound at its frontier, and A's compress
+    publishes nothing against B's row."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(lcm_engine_module, "summarize_with_escalation", _stub_summarizer())
+    cfg = LCMConfig(database_path=str(tmp_path / "lcm.db"), fresh_tail_count=6, leaf_chunk_tokens=400,
+                    large_output_externalization_path=str(tmp_path / "ext"))
+    proto = LCMEngine(config=cfg, hermes_home=str(tmp_path / "home"))
+    stale, other = proto.clone_for_agent(), proto.clone_for_agent()
+    stale.on_session_start("A", platform="telegram", context_length=200_000, conversation_id=_CLONE_CONV)
+    host = []
+    try:
+        for i in range(1, 13):
+            host.extend(_turn(i))
+            stale.ingest(host)
+        stale.compress(list(host), force=True)
+        assert stale._last_compacted_store_id > 0
+        stale.on_session_end("A", [])  # a normal end: the row is unbound, last finalized by A
+        read, fired = stale._lifecycle.get_by_conversation, []
+
+        def racing(conversation_id):
+            state = read(conversation_id)
+            if not fired:  # B's start lands between A's eligibility read and its bind
+                fired.append(1)
+                other.on_session_start("B", platform="telegram", context_length=200_000, conversation_id=_CLONE_CONV)
+            return state
+
+        monkeypatch.setattr(stale._lifecycle, "get_by_conversation", racing)
+        stale._rebind_after_unadopted_compaction_commit()
+        monkeypatch.setattr(stale._lifecycle, "get_by_conversation", read)
+        held = ("B", 0)  # B bound as a new session of the conversation
+        assert fired and _lifecycle_row(other)[:2] == held
+        nodes = len(stale._dag.get_session_nodes("A"))
+        for i in range(13, 20):
+            host.extend(_turn(i))
+            stale.ingest(host)
+        stale.compress(list(host), force=True)
+        assert _lifecycle_row(other)[:2] == held and len(stale._dag.get_session_nodes("A")) == nodes
+    finally:
+        stale.shutdown()
+        other.shutdown()
+
+
+def test_r5_3b_an_orphaned_tool_result_is_claimed_on_the_next_pass(tmp_path, monkeypatch, caplog):
+    """R5-3b pin: the view's copy of a tool result was rewritten by the host, so it maps to no stored row
+    and the first leaf's frontier may stop on the call. After the commit end and start and three turns,
+    the next pass rehydrates the stored result (hidden=1) and claims it, with no publication conflict."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(lcm_engine_module, "summarize_with_escalation", _stub_summarizer())
+    conv = "agent:main:telegram:dm:7"
+    cfg = LCMConfig(database_path=str(tmp_path / "lcm.db"), fresh_tail_count=5, leaf_chunk_tokens=400,
+                    large_output_externalization_path=str(tmp_path / "ext"))
+    engine = LCMEngine(config=cfg, hermes_home=str(tmp_path / "home")).clone_for_agent()
+    sid, host = "S1", []
+    engine.on_session_start(sid, platform="telegram", context_length=200_000, conversation_id=conv)
+
+    def add(*messages):
+        for message in messages:
+            host.append(message)
+            engine.ingest(host)
+
+    def claimed():
+        return {i for (src,) in engine._store.connection.execute(
+            "SELECT source_ids FROM summary_nodes WHERE session_id = ? AND source_type = 'messages'", (sid,))
+            for i in json.loads(src)}
+
+    try:
+        for i in range(1, 4):
+            add(*_turn(i))
+        call = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_9", "type": "function", "function": {"name": "read_file", "arguments": "{\"p\": \"a\"}"}}]}
+        result = {"role": "tool", "tool_call_id": "call_9", "content": "file body " * 30}
+        add({"role": "user", "content": "[T09] user turn 9: read the file " + "alpha " * 30}, call, result,
+            {"role": "assistant", "content": "done 9"})
+        for i in (10, 11):
+            add(*_turn(i))
+        result_id = next(int(r["store_id"]) for r in engine._store.get_session_messages(sid, limit=100)
+                         if r["role"] == "tool")
+        view = [dict(m) for m in host]
+        view[host.index(result)] = {**result, "content": "[tool output projected by host]"}  # a host rewrite
+        pre = list(view)
+        compressed = engine.compress(list(view), force=True)
+        engine.on_session_end(sid, pre)
+        engine.on_session_start(sid, boundary_reason="compression", old_session_id=sid, platform="telegram",
+                                conversation_id=conv)
+        host2 = list(compressed)
+        for i in (12, 13, 14):
+            for message in _turn(i):
+                host2.append(message)
+                engine.ingest(host2)
+        caplog.clear()
+        engine.compress(list(host2), force=True)
+        messages = [r.getMessage() for r in caplog.records]
+        assert not [m for m in messages if "publication_invariant_conflict" in m]
+        assert any("store-complete leaf" in m and "hidden=1" in m for m in messages), messages
+        assert result_id in claimed()
     finally:
         engine.shutdown()
 

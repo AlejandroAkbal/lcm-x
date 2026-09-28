@@ -137,6 +137,9 @@ from .reconcile import _emission_identity
 from .reconcile import _has_lossy_redacted_identity, _merge_append_cut, _proof_user_identity
 from .compaction import CompactionMixin
 from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
+from .store_complete import StoreCompleteMixin
+from .survival_fit import SurvivalFitMixin, _carries_survival_notice
+from .db_bootstrap import refresh_legacy_conversation_ids
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -397,6 +400,8 @@ class LCMEngine(
     ResetStateMixin,
     ReconcileMixin,
     IdentityAnchorMixin,
+    StoreCompleteMixin,
+    SurvivalFitMixin,
     AuxiliarySessionMixin,
     PlaceholderLedgerMixin,
     BypassMixin,
@@ -594,6 +599,11 @@ class LCMEngine(
         # silent maintenance. Manual /lcm diagnostics and warning/error paths
         # remain explicit.
         self.emit_automatic_compaction_status = False
+        # #582 survival fit: the failure reason of this compress(), the last fit, and the one-shot warning.
+        self._survival_fit_reason: Optional[str] = None
+        self._last_survival_fit: Optional[Dict[str, Any]] = None
+        self._survival_fit_pending_warning: Optional[tuple[str, str]] = None  # (conversation key, text)
+        self._survival_fit_warned: set = set()
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
@@ -877,6 +887,9 @@ class LCMEngine(
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        # R6-4: survival-fit warnings belong to the store they were raised on.
+        self._survival_fit_pending_warning, self._survival_fit_warned = None, set()
+        self.emit_automatic_compaction_status = False
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
@@ -2947,6 +2960,43 @@ class LCMEngine(
             )
         self._update_model_pending_session_start = False
 
+    def _rebind_after_unadopted_compaction_commit(self) -> None:
+        """This engine is bound to (session, conversation), but the conversation's lifecycle row is
+        unbound and was last finalized by this session: an end ran with no start after it. The host
+        refused the candidate after the compaction-commit end (would_grow) and sent no start, or
+        ANOTHER engine on the same row ended the session (R5-3a: a gateway hygiene agent's deferred
+        cleanup, a background-review agent's turn end). The trigger is the row's state, so it
+        covers any engine or process that unbinds it.
+
+        Re-bind it as that start would. bind_session restores the session's own finalized
+        frontier (#5: never another session's, never from the in-process value); a reset after the
+        finalize means the host is moving on, so nothing is re-bound then.
+        """
+        if not self._session_id or not self._conversation_id or self._bypasses_lcm_context_management():
+            return
+        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        if state is None or state.current_session_id is not None or state.last_finalized_session_id != self._session_id:
+            return
+        if state.last_reset_at is not None and (state.last_finalized_at or 0) < state.last_reset_at:
+            return
+        # R6-2: the read above can be stale (another session may bind in between): compare-and-bind.
+        state = self._lifecycle.rebind_own_finalized(self._session_id, state.conversation_id)
+        if state is None:
+            return  # another session holds the row now: nothing written, the frontier unchanged
+        frontier = int(state.current_frontier_store_id or 0)
+        if int(self._last_compacted_store_id or 0) != frontier:
+            logger.warning(
+                "LCM re-bind of %s found in-process frontier %d but lifecycle frontier %d; using the lifecycle row",
+                self._session_id,
+                int(self._last_compacted_store_id or 0),
+                frontier,
+            )
+        self._last_compacted_store_id = frontier
+        logger.info(
+            "LCM re-bound %s after an unadopted compaction commit or another engine's end (frontier=%d)",
+            self._session_id, frontier,
+        )
+
     def _continue_in_place_compression_boundary(
         self,
         session_id: str,
@@ -3392,6 +3442,12 @@ class LCMEngine(
     def _on_session_start_unlocked(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+        if getattr(self, "_legacy_conversation_ids_store", None) is not self._store:
+            try:  # #581: one probe per bound store for legacy unnormalized conversation ids
+                if refresh_legacy_conversation_ids(self._store.connection) is not None:
+                    self._legacy_conversation_ids_store = self._store  # R6-3: a failed probe is retried
+            except Exception:
+                logger.debug("LCM legacy conversation-id probe failed; probed on first use", exc_info=True)
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
@@ -4441,6 +4497,7 @@ class LCMEngine(
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "last_survival_fit": dict(self._last_survival_fit) if self._last_survival_fit else None,
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
@@ -5064,7 +5121,7 @@ class LCMEngine(
             return (
                 "[Note: This conversation uses Lossless Context Management (LCM)." in content
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
-            )
+            ) or _carries_survival_notice(msg.get("content"), content)  # #582: the fit's notice in the system slot
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
         if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):

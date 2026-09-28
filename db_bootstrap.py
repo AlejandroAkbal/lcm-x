@@ -641,6 +641,103 @@ def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
     )
 
 
+# #581: per store, the stored conversation ids that are not in their written form (NULL, or not equal to
+# their strip()), keyed by the normalized id they stand for. Writes strip with default '' (store.py), so
+# only legacy rows can land here; an empty map (every store written by this code) keeps the fast path.
+_LEGACY_CONVERSATION_IDS: dict[str, dict[str, list]] = {}
+
+
+def _conversation_store_key(conn: sqlite3.Connection) -> str:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        row = None
+    return str(row[2]) if row and row[2] else f"memory:{id(conn)}"
+
+
+def _stored_conversation_ids(conn: sqlite3.Connection) -> list:
+    """The distinct stored conversation ids (None for NULL): one index seek each when the conversation
+    index exists (``MIN(conversation_id) > previous``), else one DISTINCT scan."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                        "AND name = 'idx_msg_conversation_session'").fetchone():
+        return [row[0] for row in conn.execute("SELECT DISTINCT conversation_id FROM messages")]
+    values: list = [None] if conn.execute(
+        "SELECT 1 FROM messages WHERE conversation_id IS NULL LIMIT 1").fetchone() else []
+    value = conn.execute("SELECT MIN(conversation_id) FROM messages WHERE conversation_id IS NOT NULL").fetchone()[0]
+    while value is not None:
+        values.append(value)
+        value = conn.execute("SELECT MIN(conversation_id) FROM messages WHERE conversation_id > ?", (value,)).fetchone()[0]
+    return values
+
+
+def refresh_legacy_conversation_ids(conn: sqlite3.Connection) -> dict[str, list] | None:
+    """ONE probe per store (engine bind) over the distinct stored conversation ids (eva's 1.4 GB store:
+    261 ids by index seeks in ~7 ms; a DISTINCT scan takes ~1.4 s). None when the probe failed (a lock):
+    nothing is cached, so the next read probes again (R6-3: never "no legacy ids" by failure)."""
+    legacy: dict[str, list] = {}
+    try:
+        values = _stored_conversation_ids(conn)
+    except sqlite3.OperationalError:
+        return None
+    for value in values:
+        if value is None or str(value) != str(value).strip():
+            legacy.setdefault(str(value or "").strip(), []).append(value)
+    _LEGACY_CONVERSATION_IDS[_conversation_store_key(conn)] = legacy
+    return legacy
+
+
+def owned_conversation_values(conn: sqlite3.Connection, conversation_id: str) -> list:
+    """The stored ``conversation_id`` values owned by ``conversation_id``: it and '' (blank), plus any
+    legacy value that normalizes (strip, NULL -> '') to either. None stands for NULL."""
+    legacy = _LEGACY_CONVERSATION_IDS.get(_conversation_store_key(conn))
+    if legacy is None:
+        legacy = refresh_legacy_conversation_ids(conn)
+    if legacy is None:  # the probe failed: this read cannot rule legacy values out, so it fails too
+        raise sqlite3.OperationalError("legacy conversation-id probe failed; retried on the next read")
+    wanted = dict.fromkeys((str(conversation_id or "").strip(), ""))
+    return list(wanted) + [value for key in wanted for value in legacy.get(key, ())]
+
+
+def owned_conversation_clause(conn: sqlite3.Connection, conversation_id: str, column: str = "conversation_id"):
+    """(``column IN (...)`` [OR ``column IS NULL``], args) for :func:`owned_conversation_values`."""
+    values = owned_conversation_values(conn, conversation_id)
+    given = [value for value in values if value is not None]
+    clause = f"{column} IN ({', '.join('?' for _ in given)})"
+    if len(given) < len(values):
+        clause = f"({clause} OR {column} IS NULL)"
+    return clause, given
+
+
+def select_conversation_range(conn: sqlite3.Connection, columns: str, session_id: str, conversation_id: str,
+                              after_store_id: int, end_store_id: int | None = None,
+                              limit: int | None = None) -> list:
+    """#581: a session's rows in ``(after_store_id, end_store_id]`` whose conversation is ``conversation_id``
+    or blank, in store order (``columns`` starts with ``store_id``). One seek per owned value on
+    idx_msg_conversation_session, so another conversation's rows under the same session are never
+    walked; a legacy unnormalized id (NULL, padded, whitespace-only) is one more seek, never a miss."""
+    rows: list = []
+    for value in owned_conversation_values(conn, conversation_id):
+        sql = (f"SELECT {columns} FROM messages INDEXED BY idx_msg_conversation_session "
+               + ("WHERE conversation_id IS NULL" if value is None else "WHERE conversation_id = ?")
+               + " AND session_id = ? AND store_id > ?")
+        args: list = ([] if value is None else [value]) + [session_id, int(after_store_id)]
+        if end_store_id is not None:
+            sql += " AND store_id <= ?"
+            args.append(int(end_store_id))
+        sql += " ORDER BY store_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        try:
+            rows.extend(conn.execute(sql, args).fetchall())
+        except sqlite3.OperationalError as exc:  # a store opened without the index: same rows, walked
+            if "no such index" not in str(exc):
+                raise
+            rows.extend(conn.execute(sql.replace(" INDEXED BY idx_msg_conversation_session", ""), args).fetchall())
+    rows.sort(key=lambda row: int(row[0]))
+    return rows if limit is None else rows[:limit]
+
+
 def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """

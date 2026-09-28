@@ -744,7 +744,8 @@ class ReconcileMixin:
     def _load_host_rewrite_overrides(self, rows) -> None:
         """Batch-load the overrides of the stored user rows a matcher is about to read."""
         overrides = self._host_rewrite_state()[1]
-        wanted = {int(row.get("store_id") or 0) for row in rows if row.get("role") == "user"} - set(overrides) - {0}
+        wanted = {store_id for store_id in (int(row.get("store_id") or 0) for row in rows if row.get("role") == "user")
+                  if store_id and store_id not in overrides}  # never copy the whole cache per row (#581 cost)
         if wanted:
             keys = {f"{_HOST_REWRITE_IDENTITY_METADATA_PREFIX}:{store_id}": store_id for store_id in wanted}
             found = self._store.read_metadata_json_many(list(keys))
@@ -840,6 +841,9 @@ class ReconcileMixin:
     ) -> tuple[str, str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        source = None if stored_row else self._survival_projection_source(msg, role, content)
+        if source is not None:  # #582: a survival-fit projection is its source row, never a new occurrence
+            return self._message_replay_identity(source, stored_row=True, strip_carrier=strip_carrier)
         strip_payload = False
         # Opt-in: only occurrence/position-bound consumers read the override (#498).
         if stored_row and with_host_rewrite and role == "user":

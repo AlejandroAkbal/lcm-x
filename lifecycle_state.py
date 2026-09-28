@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import (
+    configure_connection,
+    owned_conversation_clause,
+    refuse_schema_version_too_new,
+    run_versioned_migrations,
+)
 
 
 _OWNERSHIP_QUERY_MAX_RANGES = 200
@@ -280,6 +285,31 @@ class LifecycleStateStore:
         state = self.get_by_conversation(conversation_id)
         assert state is not None
         return state
+
+    @_synchronized
+    def rebind_own_finalized(self, session_id: str, conversation_id: str) -> LifecycleState | None:
+        """Compare-and-bind (R6-2): bind ``session_id`` at its own finalized frontier only if the row is
+        STILL unbound, last finalized by this session, and not reset since that finalize, checked and
+        written by ONE conditional UPDATE (atomic across engines and processes). Same fields as
+        :meth:`bind_session`'s own-finalize branch. None (nothing written) when another session bound it
+        first or the row no longer qualifies."""
+        now = time.time()
+        cursor = self._conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_session_id = ?,
+                current_frontier_store_id = last_finalized_frontier_store_id,
+                current_bound_at = ?,
+                updated_at = ?
+            WHERE conversation_id = ?
+              AND current_session_id IS NULL
+              AND last_finalized_session_id = ?
+              AND (last_reset_at IS NULL OR COALESCE(last_finalized_at, 0) >= last_reset_at)
+            """,
+            (session_id, now, now, conversation_id, session_id),
+        )
+        self._conn.commit()
+        return self.get_by_conversation(conversation_id) if cursor.rowcount == 1 else None
 
     @_synchronized
     def finalize_session(
@@ -1050,10 +1080,18 @@ class LifecycleStateStore:
                 for _item in range_batch
             )
             ownership_args = [value for item in range_batch for value in item]
+            # #581: the obligation is this conversation's rows (and blank ones); another
+            # conversation's rows under the same session follow that conversation's lifecycle
+            # and are never accepted as coverage (checked above). `IN (?, '')` keeps every
+            # range a seek on idx_msg_conversation_session (writes store the id stripped, '' blank);
+            # a store holding legacy unnormalized ids adds those values, so no owned row is missed.
+            owned_clause, owned_args = owned_conversation_clause(conn, conversation_id)
             for row in conn.execute(
-                "SELECT store_id, session_id FROM messages WHERE "
-                + ownership_clause,
-                ownership_args,
+                "SELECT store_id, session_id FROM messages WHERE ("
+                + ownership_clause
+                + ") AND "
+                + owned_clause,
+                [*ownership_args, *owned_args],
             ).fetchall():
                 rows_by_store_id[int(row[0])] = row
         rows = [rows_by_store_id[store_id] for store_id in sorted(rows_by_store_id)]

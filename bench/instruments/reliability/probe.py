@@ -72,8 +72,19 @@ LOG_COUNTS = {
     "resident_engine_conflict": "resident_engine_conflict",
     "skipped_ingest_resident_conflict": "skipped ingest: stable engine use ended with resident_engine_conflict",
     "recorded_replaced": "LCM recorded host-replaced rows",
+    "survival_fit": "LCM survival fit applied",
 }
 FILLER = "alpha beta gamma delta "
+
+
+def phase_log_fields(log: str) -> dict:
+    """The log-derived phase fields, computed before the phase JSON is written: the counts, and (for
+    native-on-off, the pre_publication_counts diagnostic) the counts after this phase's first publication."""
+    first_commit = log.find("LCM compaction #")
+    return {"compactions_logged": len(re.findall(r"LCM compaction #\d+", log)),
+            "log_counts": {k: log.count(v) for k, v in LOG_COUNTS.items()},
+            "log_counts_after_commit": None if first_commit < 0 else {
+                k: log[first_commit:].count(LOG_COUNTS[k]) for k in ("publication_invariant_conflict", "survival_fit")}}
 
 
 def provenance(cell, extra=()):
@@ -176,6 +187,9 @@ def main():
         sys.exit(3)
     cell = json.loads(Path(a.cell).read_text())
     cell_dir, phase, first = Path(a.cell_dir), a.phase, a.start_turn
+    switched = cell_dir / "faults-fired.jsonl"  # native-on-off: the older ref is the plugin until the switch
+    if cell.get("from_plugin") and not (switched.exists() and "plugin_switch" in switched.read_text()):
+        cell = {**cell, "plugin": cell["from_plugin"]}
     out = {"phase": phase, "start_turn": first, "citations": {k: cite(k) for k in ANCHORS}}
     tfile = open(cell_dir / "transcript.jsonl", "a", encoding="utf-8")
     buf = io.StringIO()
@@ -196,15 +210,14 @@ def main():
             if out["provenance"]["violations"] and exit_kind not in ("unsupported", "refused"):
                 exit_kind, extra = "error", {"reason": "import provenance: " + "; ".join(out["provenance"]["violations"][:3])}
         log = buf.getvalue()
-        out.update(exit=exit_kind, **extra, counters=counters, compactions_logged=len(re.findall(r"LCM compaction #\d+", log)),
-                   log_counts={k: log.count(v) for k, v in LOG_COUNTS.items()}, session_count=session_count())
+        out.update(exit=exit_kind, **extra, counters=counters, **phase_log_fields(log), session_count=session_count())
         (cell_dir / f"phase-{phase}.json").write_text(json.dumps(out, indent=1, default=str))
         (cell_dir / f"probe-{phase}.hermes.log").write_text("\n".join(
             line for line in log.splitlines() if "LCM" in line or "WARNING" in line or "ERROR" in line
             or "compress" in line.lower() or "orphan" in line)[-2_000_000:])
         print(json.dumps({"exit": exit_kind, **extra}), flush=True)
         tfile.close()
-        if exit_kind in ("crash", "clean_exit", "tip_switch"):  # between turns for the latter two, as _CRASH_PROBE
+        if exit_kind in ("crash", "clean_exit", "tip_switch", "plugin_switch"):  # between turns, as _CRASH_PROBE
             os._exit(0)  # the host process dies here: no atexit, no flush, no engine shutdown
 
     faults = {f["kind"]: f for f in cell.get("faults", [])}
@@ -586,6 +599,10 @@ def main():
     def low_backlog(last_turn):
         return backlog_low(cell_dir, last_turn, backlog_log)
     for t in extend_turns(cell, first, low_backlog):
+        f = faults.get("plugin_switch")  # native-on-off: exit between turns; run_matrix swaps in the candidate
+        if f and t == f["turn"] and t != first and "plugin_switch" not in fired:
+            fire("plugin_switch", t)
+            finish("plugin_switch", next_turn=t)
         f = faults.get("clean_exit_before_turn")
         if f and phase != "A" and t == f.get("turn", first + f.get("after_restart", 0)) and t != first \
                 and "clean_exit_before_turn" not in fired:
