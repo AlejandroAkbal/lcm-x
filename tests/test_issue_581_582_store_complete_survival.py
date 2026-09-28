@@ -322,6 +322,26 @@ def test_r4_a_legacy_unnormalized_conversation_row_stays_owned(tmp_path, legacy)
         engine.shutdown()
 
 
+@pytest.mark.parametrize("indexed", [True, False])
+def test_r4_a_the_bind_probe_finds_legacy_ids_with_or_without_the_index(tmp_path, indexed):
+    """The bind probe (index seeks per distinct id, or one scan without the index) finds every legacy
+    value and maps it to the normalized id it stands for."""
+    from hermes_lcm.db_bootstrap import owned_conversation_values, refresh_legacy_conversation_ids
+
+    conn = sqlite3.connect(str(tmp_path / "probe.db"))
+    conn.execute("CREATE TABLE messages (store_id INTEGER PRIMARY KEY, session_id TEXT, conversation_id TEXT)")
+    if indexed:
+        conn.execute("CREATE INDEX idx_msg_conversation_session ON messages (conversation_id, session_id, store_id)")
+    conn.executemany("INSERT INTO messages (session_id, conversation_id) VALUES ('S', ?)",
+                     [("conv",), ("",), ("  ",), (None,), (" conv",), ("other",), ("other ",)])
+    legacy = refresh_legacy_conversation_ids(conn)
+    assert {key: sorted(map(repr, values)) for key, values in legacy.items()} == {
+        "": sorted(map(repr, [None, "  "])), "conv": ["' conv'"], "other": ["'other '"]}
+    assert sorted(map(repr, owned_conversation_values(conn, "conv"))) == sorted(
+        map(repr, ["conv", "", " conv", None, "  "]))
+    conn.close()
+
+
 def test_proof_rejects_covering_another_conversations_row(tmp_path):
     """A leaf that claims another conversation's row as coverage is still refused."""
     engine = _engine(tmp_path)
