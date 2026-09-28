@@ -1,6 +1,6 @@
 # LCM-X project state
 
-This page separates released product identity, current development source, evaluation evidence, and later roadmap work. GitHub issues, pull requests, tags, releases, and exact commit heads are the live source of truth. This snapshot was reconciled on 2026-09-05; the naming table and latest-stable identity were updated on 2026-09-24 for the #471 rename and on 2026-09-25 for the v0.24.1 GA, and on 2026-09-26 for the v0.24.2 GA, and on 2026-09-27 for the v0.24.3 GA.
+This page separates released product identity, current development source, evaluation evidence, and later roadmap work. GitHub issues, pull requests, tags, releases, and exact commit heads are the live source of truth. This snapshot was reconciled on 2026-09-05; the naming table and latest-stable identity were updated on 2026-09-24 for the #471 rename and on 2026-09-25 for the v0.24.1 GA, and on 2026-09-26 for the v0.24.2 GA, and on 2026-09-28 for the v0.24.3 GA.
 
 ## Naming and compatibility
 
