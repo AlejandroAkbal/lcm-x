@@ -105,6 +105,22 @@ self-updater. An install pinned with `--ref <sha>` (outside the catalog) refuses
 
 Restart Hermes after updating.
 
+### Rollback
+
+Take an `lcm.db` backup before every upgrade (`/lcm backup`, or a quiescent
+copy as in [Upgrade to v0.23.1](#upgrade-to-v0231)). To roll back to v0.23.3,
+reinstall v0.23.3 with `LCM_NATIVE_RECOVERY=true` and keep `lcm.db` as it is,
+never with native recovery off: v0.23.3 does not recognise the summary carrier
+that v0.24.x puts in the host list, so with native recovery off its
+compactions conflict on every attempt (with it on, v0.23.3 does not attempt a
+publication), and restoring the pre-upgrade backup does not avoid that and
+also drops rows stored since the backup. Within the 0.24.x line a plugin-only
+rollback is supported only while no survival-fit projection was persisted
+(#601); once `/lcm doctor` reports a `survival_fit` count above 0, an older
+plugin re-stores rows it cannot compact, so restore the `lcm.db` backup taken
+before the upgrade together with the plugin, accepting that rows stored after
+that backup leave the LCM store (they remain in the host session).
+
 ## Migrate from hermes-lcm (v0.23.x and earlier)
 
 **BREAKING in v0.24.0** (#471): the plugin manifest is now `hermes-lcm-x` and
