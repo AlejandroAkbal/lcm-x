@@ -26,7 +26,7 @@ ISSUES = {
     541: (("B1", "B2", "B4"), ""), 544: (("B1", "B2", "B4"), ""), 545: (("B1", "B2", "B3", "B4"), ""),
     546: (("B1", "B2", "B3", "B4"), ""), 547: (("B1", "B2", "B3", "B4"), ""), 549: (("B1", "B2"), ""),
     485: (("B2",), "upgrade from a pre-fix DB (R2)"), 542: (("B4",), "upgrade from a pre-#535 wedged DB (R2)"),
-    559: (("B6", "B4"), ""), 566: (("B1", "B2"), ""),
+    559: (("B6", "B4"), ""), 566: (("B1", "B2", "B5"), ""),  # B5: a cross-lineage summary is recorded only there
 }
 
 
@@ -108,8 +108,14 @@ def registry() -> list[dict]:
         cell("publication-failure/rotation-child", [541], in_place=False, turns=80, repeat=1000, lcm_env={},
              assistant={"real_usage": True}, faults=[{"kind": "publication_failure", "where": "rotation_child"}],
              bars=["B1", "B2", "B4"], min_compactions=0,
-             doc="Every rotation-child publication raises LifecyclePublicationConflictError (generalises "
-                 "PROBE_CHILD_CONFLICT); B3/B5 do not apply to an injected conflict."),
+             doc="#541's bar: the FIRST rotation-child publication raises LifecyclePublicationConflictError "
+                 "(generalises PROBE_CHILD_CONFLICT); the next child compaction must commit, with 0 parent copies. "
+                 "B3/B5 do not apply to an injected conflict."),
+        cell("publication-failure/rotation-child-persistent", [], in_place=False, turns=80, repeat=1000, lcm_env={},
+             assistant={"real_usage": True}, bars=["B1", "B2", "B4"], min_compactions=0,
+             faults=[{"kind": "publication_failure", "where": "rotation_child", "persistent": True}],
+             doc="Data, not G-REL-1 (ci.NON_GATE): EVERY rotation-child publication raises, so no child compaction "
+                 "can ever publish; a degraded-mode product question outside stabilization (DESIGN-436 REVISION 2 D-B)."),
         cell("publication-failure/pass-3-in-place", [541], in_place=True,
              faults=[{"kind": "publication_failure", "where": "pass_3"}], bars=["B1", "B2", "B4"], min_compactions=0,
              doc="The third publication attempt raises; later passes must recover."),
@@ -147,8 +153,8 @@ def validate(c: dict) -> None:
         assert g["turns"] == "restart" or all(1 <= t <= c["turns"] for t in g["turns"]), c["id"]
 
 
-def select(patterns: str) -> list[dict]:
-    cells = registry()
+def select(patterns: str, extra=()) -> list[dict]:
+    cells = registry() + list(extra)  # extra: transport-only cells (R2 process_cell.R2_CELLS)
     for c in cells:
         validate(c)
     if patterns.strip() == "all":

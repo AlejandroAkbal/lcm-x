@@ -25,7 +25,7 @@ uv run --no-project python bench/instruments/reliability/run_matrix.py \
   `plugins.enabled` entry and engine name are read from that tree (v0.23.x = `hermes-lcm`/`lcm`).
 - Per cell: `<out>/cells/<host>/<sha12>/<cell-slug>/` holds cell.json, transcript.jsonl, phase-*.json,
   probe logs, `db/` (sqlite backup-API copies) and verdict.json. `--keep-homes` keeps hermes-home.
-- `--keep-dbs fail` (default) drops the db/ copies of PASS cells (regenerable); `--lcm-env` overrides LCM_*
+- `--keep-dbs fail` (default) drops the db/ copies of PASS cells (regenerable), except a PASS that carries host-parity licences; `--lcm-env` overrides LCM_*
   on every cell and is recorded in run.json and MATRIX.md.
 - Output: `results.jsonl`, `MATRIX.md`, `ISSUE-MAP.md`. Re-render: `python report.py <out>`.
 - Standalone scoring: `python -m bench.instruments.reliability.scorers.cli --db <lcm.db> --gauntlet-run <dir>`
@@ -55,7 +55,8 @@ The expected assistant rows come from the provider log, not the host result: exa
 completed non-cancel attempt (a reply the host dropped is a deficit), plus the host's own cited failed-turn copy
 (`agent/turn_failure_copy.py` `FAILED_TURN_NOTICE`/`PARTIAL_FAILED_TURN_NOTICE`, exact text) only on an attempt
 the host reported `interrupted`. Any other assistant row is surplus.
-- **B1** every `[Tnn]` user tag and `reply to Tnn` sits in exactly as many stored rows as expected,
+- **B1** every `[Tnn]` user tag (`[A-Z]\d{2,3}`: T100-T103 on 100-turn cells) and `reply to Tnn` sits in
+  exactly as many stored rows as expected,
   and every stored `continue` row is followed by the reply of its own turn (position-bound).
 - **B2** multiset-v1 (port of the gauntlet's `lossless_bar_multiset.py`), per session lineage: per (role,
   sha256(content with only leading/trailing whitespace stripped, the host's ACP prompt strip
@@ -64,6 +65,14 @@ the host reported `interrupted`. Any other assistant row is surplus.
   stored-only key and every split reply is surplus and fails. Expected =
   what the host held per attempt after its ACP strip and consecutive-user merge (a crashed prompt folded
   into the next composite counts once).
+- **Host-parity licence (D-A, DESIGN-436 REVISION 2 P-HOST; `scorers/host_parity.py`).** A stored USER-row surplus
+  of a B2 key (or a B1 user tag) in lineage L is licensed only up to what the cell's own host state.db holds in L:
+  `min(surplus, host_count - expected)`, floored at 0. host_count is what one host view holds: the most ACTIVE rows
+  one session of L holds at once, else 1 if L holds it only on inactive rows; rotation copies, in-place generation
+  copies and H1's fresh-stamp re-issues never add up. Deficits, assistant and tool rows are never licensed. No
+  readable state.db, no licence (`unavailable` records why). Every licence is reported: `host_parity_licensed`
+  under `numbers.B1`/`numbers.B2` (count + up to 10 records: LCM store ids, host row ids, content sha256, tags), the
+  MATRIX `host-dup` column and "PASS with host-parity licences" section, and the ISSUE-MAP licence list.
 - **B3** zero `publication_invariant_conflict` log lines across phases.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
   (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
@@ -73,17 +82,24 @@ the host reported `interrupted`. Any other assistant row is surplus.
   `skipped`, `lock_skipped` or no fresh engine pass is INCONCLUSIVE.
 - **B5** depth-0 message-sourced summary nodes grow after every LCM pass; every host-native pass has its own
   host `commit_status: committed` telemetry line in the same turn; published passes (LCM or host-native,
-  the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes.
+  the final forced compaction excluded) >= `min_compactions`; `LCM compaction #` log lines == LCM passes;
+  every message-sourced node covers >= 1 stored message (`empty_source_nodes`), only of its own lineage.
 - **B6** (tool cells) no message-sourced summary covers part of a tool group (#559 invariant); zero host
   orphan-tool-result drops; every planned call (name, id, args) ran for real at the cited host dispatch hook
   (`model_tools.handle_function_call` with its call id, or the context engine's `handle_tool_call` via
   `agent/tool_executor.py`, bound by name + args) with a successful, complete result (`read_file`: the whole
   file; `expect.min_chars` where a cell asks for a large result), and no unplanned dispatch. Tool rows are in B2:
   `(call id, name, args)` per tool-call entry and `(call id, sha256 of the result the next provider request
-  carried)` per result row, stored vs expected as a multiset. A planned call the host never dispatched is
+  carried)` per result row, stored vs expected as a multiset; a `tool_calls` value that is not a JSON list of objects
+  is a `malformed_tool_calls` surplus key. A planned call the host never dispatched is
   UNSUPPORTED.
 - **B7** (native cells) no `native recovery did not produce a usable summary`, no host
   `summary_generation_aborted`, at most one native attempt per turn.
+
+`publication-failure/rotation-child` (G-REL-1, #541's bar) injects ONE publication failure, on the first rotation-child
+publication; the next child compaction must commit. `publication-failure/rotation-child-persistent` fails every
+rotation-child publication: a data cell (no target, `ci.NON_GATE`) for the degraded mode where no child compaction can
+ever publish, a product question outside stabilization.
 
 Native cells: `native-short-prefix/*` are rejected before the host summary call (`prefix_too_short`) and are
 data; `native-long-prefix/*` (default tuning, 1M window) run the host ContextCompressor summary (stubbed aux
@@ -111,3 +127,53 @@ and upstream-main: `baseline/in-place/acp` PASSes at both, `acp-trailing/in-plac
 In-process only: no real `hermes acp`/gateway process, transport, model or timing. Gateway timestamp
 rendering stays at its default (off). Upgrades from pre-fix DBs (#485/#542) and the Desktop/tui transport
 (#463) are not covered; see ISSUE-MAP.md for every uncovered issue and the capability it needs.
+
+## R2 transport cells (`--transport acp-process`)
+`run_matrix.py ... --transport acp-process` runs the same cell ids and scorers through `<host venv>/bin/hermes acp`
+over stdio (`acp_driver.py`, ported from the WS3 gauntlet driver), one process per phase, HERMES_HOME/HOME under the
+cell dir. Every model route (main, `LCM_SUMMARY_MODEL`, host aux) is the localhost `fake_provider.py` (OpenAI JSON/SSE,
+Anthropic messages, `/v1/models`); its request log is reconciled with the transcript (`accounting` in verdict.json).
+`observer/` is put on the host's PYTHONPATH and records, without changing arguments or results, the host seams R1's
+probe traces (R1's transcript schema). Faults are real: SIGKILL of the host process group while the provider holds the
+turn's request; ACP `session/cancel` while it is in flight; the final check is the ACP `/compress` command.
+Containment: localhost base URLs, no API-key env, every proxy variable at a recording sink that refuses
+(`proxy-attempts.jsonl`), `model_catalog: {enabled: false, excluded_providers: [opencode-free]}`, a seeded models.dev
+cache, macOS `sandbox-exec` (localhost-only network), and the socket guard; any attempt makes the cell ERROR (STOP).
+`excluded_providers` is read at `hermes_cli/inventory.py:54`; without it customer-0.21.2 fetches the keyless
+opencode-free catalog on ACP `session/new` (`hermes_cli/models.py:2105 _fetch_opencode_free_models`). The R2
+summariser runs with `LCM_SUMMARY_SPEND_MAX_CALLS=100000` (60 turns in ~20 s would trip the per-window spend guard).
+Cells whose fault is injected in-process (publication failure, crash between end/start), cron cells and the R1
+gateway cells are UNSUPPORTED with the reason; `--transport gateway-process` is UNSUPPORTED with per-host citations
+(the webhook platform is one-shot per delivery; api_server bypasses TurnRunner). `scorers/chronology.py` reports
+(never gates) user-row tag order per lineage.
+
+- **Backlog guarantee (R1 and R2).** Before the final check, if fewer than 3 turns have passed since the last
+  committed non-final compaction, up to 3 extra scripted turns run (tagged and scored like any turn); the checks
+  are in `final_check.backlog_checks`. B4 still `sanitized` after that is INCONCLUSIVE with the checks in the reason.
+- **Private byte-code.** Every host invocation (R1 probe, R2 host process) sets `PYTHONPYCACHEPREFIX=<cell>/pycache`;
+  `hosts.verify` refuses a sourceless `.pyc` (outside `__pycache__`, or with no matching `.py`).
+- **Legacy `/compress` fallback.** `final_check` falls back to `_compress_context(force=True)` only on
+  `ModuleNotFoundError` for exactly `agent.conversation_compression_manual`; any other ImportError is recorded and B4 fails.
+- **crash-after-rotation over acp-process.** `RotationKiller` polls `lcm_lifecycle_state` every 20 ms and SIGKILLs the
+  host group while the rotated child session has 0 lcm rows; a rotation seen after the child has rows is skipped
+  (`missed_rotations`) and the next one is used. No provider request is held, so accounting does not count it as one.
+- **anthropic-route/acp-process** routes main to the fake provider's `/anthropic` endpoint and needs the host's
+  `anthropic` extra (`hermes-agent[anthropic]`); without the SDK the cell is UNSUPPORTED. The local hosts lack it.
+- **customer-0.21.2 lcm-tool-mid-turn is UNSUPPORTED over ACP.** That host defers plugin tools behind the
+  `tool_search`/`tool_call` bridge by default (`tools.tool_search.enabled: "auto"`, `hermes_cli/config_defaults.py:1793`),
+  so the scripted direct `lcm_grep` call is never dispatched ("scenario not proven"). The default is not changed.
+
+### Nightly CI (`.github/workflows/reliability-nightly.yml`)
+Triggers: daily schedule and `workflow_dispatch` (effective once on main), and `pull_request` path-filtered to
+`bench/instruments/reliability/**` and the workflow file. Not a required check; default token only. Matrix over
+`hosts.ci.json` (pinned shas): eva-0.21.5 and customer-0.21.2 on Python 3.11, upstream-main on 3.14. `ci.py prep`
+fetches the sha and installs it editable with `[acp,edge-tts,bedrock,vertex,anthropic]` (the harness verifies git HEAD
+and cites source); R1 all cells and R2 acp-process all cells run with `--plugin-ref HEAD`; MATRIX.md is the job
+summary and results are uploaded. `ci.py gate` fails on any ERROR, on a FAIL in the G-REL-1 cell set unless the
+cell targets an open issue, and on an empty set or any missing, duplicate or unexpected row per (host, transport,
+plugin sha) against that transport's `--cells all` list. Linux has no `sandbox-exec`: there containment is the proxy sink plus the socket guard.
+
+### Claim boundary
+R2 proves the plugin's behaviour through a real `hermes acp` process on the pinned host shas, with every model route
+at a deterministic localhost fake. It does not prove live-model behaviour, the gateway process, several sessions in
+one process, or the process-side publication-failure hook (R2b, #569), and it says nothing about customer boxes.

@@ -13,6 +13,8 @@ from bench.instruments.reliability.cells import ISSUES, registry  # noqa: E402
 BOUNDARY = ("Claim class: advisory / code_green_local. A PASS proves this lcm-x tree, on this host sha, under this "
             "scripted in-process scenario, meets the bars; not behaviour under real models, the real ACP/gateway "
             "processes, real transports or customer boxes.")
+BOUNDARY_R2 = ("Claim class: advisory / code_green_local. Transport {t}: real host processes with a scripted localhost "
+               "model. A PASS says nothing about real-model behaviour, real messaging platforms or customer boxes.")
 VERDICTS = ("PASS", "FAIL", "INCONCLUSIVE", "ERROR", "UNSUPPORTED")
 
 
@@ -22,6 +24,20 @@ def cell_word(r: dict) -> str:
     if r["verdict"] == "INCONCLUSIVE":
         return "INCONCLUSIVE " + "/".join(sorted(r.get("inconclusive_bars", {})))
     return r["verdict"]
+
+
+def licensed(r: dict) -> tuple[int, int]:
+    """(B2, B1) rows licensed by host parity (D-A, scorers/host_parity.py)."""
+    n = r.get("numbers") or {}
+    return tuple((n.get(b, {}).get("host_parity_licensed") or {}).get("rows", 0) for b in ("B2", "B1"))
+
+
+def host_dup(r: dict) -> str:
+    """One cell's licences with their evidence: LCM store ids, host state.db row ids, content hash, tags."""
+    recs = (r.get("numbers") or {}).get("B2", {}).get("host_parity_licensed", {}).get("records") or []
+    return "; ".join(f"{x['session']} sha256 {x['sha256'][:12]} tags {','.join(x.get('tags') or []) or '-'} "
+                     f"expected {x['expected']} stored {x['stored']} host {x['host']} licensed {x['licensed']} "
+                     f"lcm {x['store_ids']} host rows {x['host_row_ids']}" for x in recs)
 
 
 def signature(r: dict) -> str:
@@ -42,6 +58,8 @@ def signature(r: dict) -> str:
         parts.append("rejections=" + ",".join(f"{k}x{v}" for k, v in sorted(rejections.items())))
     if n.get("B6", {}).get("split_groups"):
         parts.append(f"split_groups={n['B6']['split_groups']}")
+    if any(licensed(r)):
+        parts.append("host-dup=B2:{}/B1:{}".format(*licensed(r)))
     return " ".join(parts)
 
 
@@ -68,14 +86,21 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
     hosts = sorted({r["host"] for r in results})
     refs = sorted({(r["plugin_ref"], r["plugin_sha"][:12]) for r in results})
     order = [c["id"] for c in registry()]
+    order += sorted({r["cell"] for r in results} - set(order))  # transport-only (R2) cells
     env = f"Global LCM env override: `{json.dumps(lcm_env)}`." if lcm_env else "No global LCM env override."
-    lines = ["# Reliability matrix", "", BOUNDARY, "", env, f"Wall clock: {wall:.0f} s for {len(results)} cells.", ""]
+    transports = sorted({r["transport"] for r in results if r.get("transport")})
+    boundary = BOUNDARY_R2.format(t="/".join(transports)) if transports else BOUNDARY
+    lines = ["# Reliability matrix", "", boundary, "", env, f"Wall clock: {wall:.0f} s for {len(results)} cells.", ""]
     for ref, sha in refs:
         rs = [r for r in results if r["plugin_ref"] == ref and r["plugin_sha"][:12] == sha]
         by = {(r["cell"], r["host"]): r for r in rs}
-        lines += [f"## lcm-x `{ref}` ({sha})", "", "| cell | " + " | ".join(hosts) + " |", "|---|" + "---|" * len(hosts)]
+        lines += [f"## lcm-x `{ref}` ({sha})", "", "| cell | " + " | ".join(hosts) + " | host-dup |",
+                  "|---|" + "---|" * (len(hosts) + 1)]
         for cid in [c for c in order if any((c, h) in by for h in hosts)]:
-            lines.append(f"| `{cid}` | " + " | ".join(cell_word(by[(cid, h)]) if (cid, h) in by else "-" for h in hosts) + " |")
+            dup = ", ".join("{}: B2 {}/B1 {}".format(h, *licensed(by[(cid, h)])) for h in hosts
+                            if (cid, h) in by and any(licensed(by[(cid, h)])))
+            lines.append(f"| `{cid}` | " + " | ".join(cell_word(by[(cid, h)]) if (cid, h) in by else "-" for h in hosts)
+                         + f" | {dup or '-'} |")
         lines += ["", "| host | host sha | " + " | ".join(VERDICTS) + " |", "|---|---|" + "---|" * len(VERDICTS)]
         for h in hosts:
             n = Counter(r["verdict"] for r in rs if r["host"] == h)
@@ -89,6 +114,9 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
                 lines.append(f"- INCONCLUSIVE `{r['cell']}` on {r['host']}: {json.dumps(r['inconclusive_bars'])[:300]}")
             elif r["verdict"] in ("ERROR", "UNSUPPORTED"):
                 lines.append(f"- {r['verdict']} `{r['cell']}` on {r['host']}: {str(r.get('reason'))[:300]}")
+        lines += ["", "### PASS with host-parity licences", ""]
+        lines += [f"- `{r['cell']}` on {r['host']}: " + "B2 {} / B1 {} rows licensed".format(*licensed(r))
+                  for r in sorted(rs, key=lambda r: (r["cell"], r["host"])) if r["verdict"] == "PASS" and any(licensed(r))] or ["- none"]
         lines.append("")
     (out / "MATRIX.md").write_text("\n".join(lines) + "\n")
 
@@ -96,7 +124,7 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
     for c in registry():
         for t in c["targets"]:
             targeting[t].append(c["id"])
-    im = ["# Issue map", "", BOUNDARY, "", env, "",
+    im = ["# Issue map", "", boundary, "", env, "",
           "\"target cell FAILS\" = a cell targeting the issue fails that issue's bar at the evaluated ref. It is a "
           "signal, not an attribution: whether the failure IS that issue is a human call from the signature.", ""]
     for ref, sha in refs:
@@ -110,6 +138,9 @@ def write(out: Path, results: list[dict], wall: float, lcm_env: dict | None = No
                 status, sig = ("not run", "") if not hr and cells_for else issue_status(hr, capability, issue_bars)
                 im.append(f"| {issue} | {'/'.join(issue_bars)} | {', '.join(f'`{c}`' for c in cells_for) or '-'} "
                           f"| {h} | {status} | {sig} |")
+        im += ["", "### Host-parity licences (D-A): licensed rows per cell", ""]
+        im += [f"- `{r['cell']}` on {r['host']} ({r['verdict']}): " + "B2 {} / B1 {} rows; ".format(*licensed(r)) + host_dup(r)
+               for r in sorted(rs, key=lambda r: (r["cell"], r["host"])) if any(licensed(r))] or ["- none"]
         im.append("")
     (out / "ISSUE-MAP.md").write_text("\n".join(im) + "\n")
 

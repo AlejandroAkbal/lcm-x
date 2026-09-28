@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import inspect
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -234,11 +235,7 @@ def main():
         finish("unsupported", reason=f"host shape not citable at this sha: {missing}")
         return
 
-    def _blocked(*_a, **_k):
-        raise OSError("network blocked by probe")
-    socket.socket.connect = _blocked
-    socket.create_connection = _blocked
-    socket.getaddrinfo = _blocked
+    guard_sockets(local_ok=False)
     handler = logging.StreamHandler(buf)
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
@@ -278,7 +275,7 @@ def main():
     def summarise(*args, **kw):  # tag-preserving; "U05" never collides with a "[T05]" user tag
         n_summ["c"] += 1
         text = kw.get("text") if "text" in kw else (args[0] if args else "")
-        tags = sorted(set(re.findall(r"\[([A-Z]\d\d)\] user", text or "")))
+        tags = sorted(set(re.findall(r"\[([A-Z]\d{2,3})\] user", text or "")))
         return f"Stub summary #{n_summ['c']} covers " + " ".join("U" + x for x in tags) + ".\nExpand for details about: stub", 1
 
     window = int(cell["window"])
@@ -441,7 +438,9 @@ def main():
 
         def inject(conn, conversation_id, session_id, *args, **kwargs):
             stages["n"] += 1
-            if (pf["where"] == "rotation_child" and session_id != "S0") or pf["where"] == f"pass_{stages['n']}":
+            # rotation_child: only the first child publication (#541's bar), unless the cell asks for every one
+            child = pf["where"] == "rotation_child" and session_id != "S0" and (pf.get("persistent") or pf["kind"] not in fired)
+            if child or pf["where"] == f"pass_{stages['n']}":
                 if pf["kind"] not in fired:
                     fire(pf["kind"], cur["turn"], where=pf["where"])
                 raise err(f"injected publication failure ({pf['where']})")
@@ -517,7 +516,7 @@ def main():
         tags = {}
         for m in msgs:
             if m.get("role") == "user" and isinstance(m.get("content"), str):
-                for x in set(re.findall(r"\[([A-Z]\d\d)\] user turn", m["content"])):
+                for x in set(re.findall(r"\[([A-Z]\d{2,3})\] user turn", m["content"])):
                     tags[x] = tags.get(x, 0) + 1
         if not idx:
             return None, False, [], tags, []
@@ -581,8 +580,12 @@ def main():
     history = []
     if phase != "A":  # ACP _restore reads the stable ACP id; a gateway reads the durable tip (load_transcript)
         history = sdb_read.get_messages_as_conversation(sid, repair_alternation=True)
-    turns, cancel = int(cell["turns"]), faults.get("cancel_then_retry")
-    for t in range(first, turns + 1):
+    cancel = faults.get("cancel_then_retry")
+    backlog_log = out.setdefault("final_backlog", [])
+
+    def low_backlog(last_turn):
+        return backlog_low(cell_dir, last_turn, backlog_log)
+    for t in extend_turns(cell, first, low_backlog):
         f = faults.get("clean_exit_before_turn")
         if f and phase != "A" and t == f.get("turn", first + f.get("after_restart", 0)) and t != first \
                 and "clean_exit_before_turn" not in fired:
@@ -609,8 +612,99 @@ def main():
             cron_run(t // int(cell["cron_every"]))
     if cell.get("final_compaction_check", True):
         cur["final"] = True  # its compaction events are B4 evidence, not B5 passes
-        out["final_check"] = final_check(agent, history, buf)
+        out["final_check"] = {**final_check(agent, history, buf), "backlog_checks": backlog_log}
     finish("done", next_turn=None)
+
+
+LOCAL_HOSTS = ("::1", "localhost")
+
+
+def is_loopback(host) -> bool:
+    """Only the exact names in LOCAL_HOSTS, or an IP literal that is loopback: ``127.attacker.example`` is a name
+    the real resolver would look up, so it is not local."""
+    host = host.decode() if isinstance(host, bytes) else host
+    if str(host) in LOCAL_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(str(host)).is_loopback
+    except ValueError:
+        return False
+
+
+def guard_sockets(local_ok, on_refuse=None):
+    """Refuse outbound traffic at every Python socket entry: connect, connect_ex, sendto, sendmsg (UDP and
+    literal addresses included), create_connection and name resolution. ``local_ok`` lets loopback through (the
+    R2 host observer); R1's in-process probe needs no network at all. ``on_refuse(what, host, port)`` records."""
+    def local(host):
+        return local_ok and (host is None or is_loopback(host))
+
+    def refuse(what, host, port):
+        if on_refuse:
+            on_refuse(what, str(host), port)
+        raise OSError(f"network blocked by probe: {what} {host}:{port}")
+
+    def blocked(sock, name, address):
+        if not local_ok and name in ("connect", "connect_ex"):  # R1: no socket connects at all, any family
+            return True
+        inet = sock.family in (socket.AF_INET, socket.AF_INET6) and isinstance(address, tuple)
+        return inet and not local(address[0])
+
+    def wrap(name, pos):
+        orig = getattr(socket.socket, name)
+
+        def guarded(self, *args):
+            address = args[pos] if len(args) > max(pos, 0) or (pos < 0 and args) else None
+            if (address is not None or name in ("connect", "connect_ex")) and blocked(self, name, address):
+                host, port = address[:2] if isinstance(address, tuple) else (address, None)
+                refuse(name, host, port)
+            return orig(self, *args)
+        setattr(socket.socket, name, guarded)
+    for name, pos in (("connect", 0), ("connect_ex", 0), ("sendto", -1), ("sendmsg", 3)):
+        wrap(name, pos)
+    orig_gai, orig_cc = socket.getaddrinfo, socket.create_connection
+
+    def getaddrinfo(host, port, *a, **k):
+        if not local(host):
+            try:
+                refuse("getaddrinfo", host, port)
+            except OSError as exc:
+                raise socket.gaierror(socket.EAI_NONAME, str(exc)) from None
+        return orig_gai(host, port, *a, **k)
+
+    def create_connection(address, *a, **k):
+        if not local(address[0]):
+            refuse("create_connection", address[0], address[1])
+        return orig_cc(address, *a, **k)
+    socket.getaddrinfo, socket.create_connection = getaddrinfo, create_connection
+
+
+MIN_BACKLOG_TURNS, MAX_EXTRA_TURNS = 3, 3
+
+
+def backlog_low(cell_dir, last_turn, log):
+    """True when an automatic pass committed within the last MIN_BACKLOG_TURNS turns, so the final forced
+    compaction would find no raw backlog outside the fresh tail (LCM ingests lazily, so lcm.db cannot show the
+    backlog before that compaction). Read from the cell's own ``compaction`` events; every check is recorded."""
+    path = Path(cell_dir) / "transcript.jsonl"
+    events = [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+    passes = [e["turn"] for e in events if e.get("event") == "compaction" and not e.get("final")
+              and e.get("compression_status") in ("compacted", "host_native")]
+    since = last_turn - max(passes) if passes else None
+    log.append({"after_turn": last_turn, "last_pass_turn": max(passes) if passes else None, "turns_since_pass": since})
+    return since is not None and since < MIN_BACKLOG_TURNS
+
+
+def extend_turns(cell, first, low):
+    """The cell's turns from ``first``, then up to MAX_EXTRA_TURNS extra scripted turns (tagged and scored like any
+    turn) while ``low()`` says the final forced compaction has no backlog. Shared by R1 and R2."""
+    turns = int(cell["turns"])
+    yield from range(first, turns + 1)
+    if not cell.get("final_compaction_check", True):
+        return
+    for t in range(max(first, turns + 1), turns + MAX_EXTRA_TURNS + 1):
+        if not low(t - 1):
+            return
+        yield t
 
 
 def session_count():
@@ -641,7 +735,10 @@ def final_check(agent, history, buf):
         from agent.conversation_compression_manual import compress_now, parse_compress_args
         from agent.conversation_compression import finalize_context_engine_compression_notification
         entry = "compress_now"
-    except ImportError:  # older hosts: _cmd_compress calls _compress_context directly
+    except ImportError as exc:  # older hosts (no manual-compression module): _cmd_compress calls _compress_context
+        if not (isinstance(exc, ModuleNotFoundError) and exc.name == "agent.conversation_compression_manual"):
+            return {"entry": "compress_now", "exception": repr(exc)[:500], "engine_calls": 0, "engine_status": None,
+                    "attempts": [], "conflicts": 0, "published": False, "outcome": "failed"}
         from acp_adapter.commands import _estimate_tokens
         entry = "_compress_context(force=True)"
     for _ in range(2):
