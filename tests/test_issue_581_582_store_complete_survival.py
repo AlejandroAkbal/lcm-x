@@ -845,6 +845,33 @@ def test_r4_add_c_a_fit_short_of_budget_says_so(tmp_path, summaries, host_estima
         engine.shutdown()
 
 
+def test_r5_a_fresh_stamped_copy_of_a_projection_is_a_new_occurrence(tmp_path, summaries, host_estimator):
+    """R5-1: a fitted user projection P stays live; after an assistant turn a message byte-equal to P
+    arrives with a FRESH host timestamp. It is not a copy of the projection (a copy keeps the source
+    row's stamp): it is stored as a new occurrence with its own stamp and maps to that row, while the
+    carried P still maps to its source row."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_user_view()
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        fitted = engine.compress(view, current_tokens=host_estimator(view))
+        projected = next(m for m in fitted if m.get("role") == "user" and NOTICE in str(m.get("content")))
+        source = next(int(r["store_id"]) for r in _rows(engine) if r["content"] == view[-2]["content"])
+        again = {**projected, "timestamp": 9999.0}
+        host = [*fitted, {"role": "assistant", "content": "an answer" + PAD}, again]
+        before = len(_rows(engine))
+        engine.ingest(host)
+        added = _rows(engine)[before:]
+        assert [(r["role"], r["content"], r["observed_at"]) for r in added if r["role"] == "user"] == [
+            ("user", again["content"], 9999.0)], [(r["role"], r["observed_at"]) for r in added]
+        mapping = engine._get_store_id_map_for_messages(host)
+        assert mapping.get(id(projected)) == source and mapping.get(id(again)) == added[-1]["store_id"], (
+            mapping.get(id(projected)), mapping.get(id(again)), source)
+    finally:
+        engine.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"

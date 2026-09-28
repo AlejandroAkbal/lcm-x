@@ -28,6 +28,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .message_content import normalize_content_value
+from .store import _normalize_observed_at
 from .tokens import count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -225,8 +226,15 @@ class SurvivalFitMixin:
     def _survival_projection_source(self, message: Dict[str, Any], role: str, content: str) -> Optional[Dict[str, Any]]:
         """The stored row ``message`` is a projection of, else None. Self-verifying: each mark names a store
         id and the projection parameters; the row is loaded and its projection recomputed from its stored
-        bytes, and only an exact match of role, content, tool linkage, tool name and every tool call counts.
-        A genuinely new message can match only by being byte-identical to a projection of a stored row."""
+        bytes, and the message must agree with it on every key the projection defines or the store keeps:
+        role, content, tool_call_id, tool_calls (names and arguments), the tool name (tool rows), and the
+        host timestamp. A copy of a projection keeps the source's stamp (the host copies keep timestamps):
+        a message with a stamp other than the row's observed_at or one of its recorded alias stamps is a
+        new occurrence (R5-1). An unstamped message is judged on the rest. Not compared: ``name`` on other
+        roles (a participant label the store does not keep) and host-private or reasoning keys, which the
+        projection copies from the host message unchanged and the store never holds.
+        A genuinely new message can match only by being byte-identical to a projection of a stored row
+        under that row's own stamp."""
         calls = message.get("tool_calls")
         haystack = content if _PROJECTED_PREFIX in content else ""
         if isinstance(calls, list):
@@ -246,6 +254,8 @@ class SurvivalFitMixin:
                 row = None
             if not row or str(row.get("role") or "") != role:
                 continue
+            if not self._survival_stamp_matches(message, row):
+                continue
             fields = self._survival_projected_fields(row, int(tokens), int(head), int(tail))
             if (content == fields["content"]
                     and str(message.get("tool_call_id") or "") == str(row.get("tool_call_id") or "")
@@ -254,6 +264,20 @@ class SurvivalFitMixin:
                          == str(row.get("tool_name") or ""))):
                 return row
         return None
+
+    def _survival_stamp_matches(self, message: Dict[str, Any], row: Dict[str, Any]) -> bool:
+        """No host stamp, or the source row's own: its observed_at or a recorded alias stamp (normalized as
+        the identity anchor normalizes them)."""
+        stamp = _normalize_observed_at(message.get("timestamp"))
+        if stamp is None:
+            return True
+        if _normalize_observed_at(row.get("observed_at")) == stamp:
+            return True
+        try:
+            aliases = self._store.get_message_relations([int(row["store_id"])], "alt_stamp")
+        except Exception:
+            return False
+        return any(_normalize_observed_at(rel.get("observed_at")) == stamp for rel in aliases)
 
     def _survival_record(self, reason, count, ids, before, after, budget, projected, notice) -> None:
         """Loud: a WARNING line, the doctor counter (metadata only) and one user warning per conversation."""
