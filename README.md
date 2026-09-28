@@ -380,8 +380,10 @@ change the config while Hermes is stopped:
    may still be listed), and the log shows
    `LCM plugin loaded — lossless context management active`.
 5. **Later, by hand:** after verifying, remove a separate old directory (and
-   its `skills/hermes-lcm` link). Keep it until then for rollback. The
-   installer never edits `config.yaml` or deletes anything.
+   its `skills/hermes-lcm` link). Keep it until then for rollback (a rollback
+   also needs the steps in the
+   [operator guide](docs/operator-guide.md#rollback)). The installer never
+   edits `config.yaml` or deletes anything.
 
 **If the config is not updated:** Hermes logs
 `Context engine 'lcm' not found — falling back to built-in compressor` and runs

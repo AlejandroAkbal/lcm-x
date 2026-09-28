@@ -16,6 +16,8 @@ import pytest
 
 import hermes_lcm.compaction as lcm_compaction
 import hermes_lcm.engine as lcm_engine
+import hermes_lcm.store_complete as lcm_store_complete
+import hermes_lcm.survival_fit as lcm_survival_fit
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -664,10 +666,12 @@ def test_r3b_a_projected_row_re_ingests_as_its_source_row(tmp_path, summaries, h
         engine.shutdown()
 
 
-@pytest.mark.parametrize("view_of", [_big_tool_view, _list_system_view], ids=["projected-tool", "list-system"])
+@pytest.mark.parametrize("view_of", [_big_user_view, _big_tool_view, _list_system_view],
+                         ids=["projected-user", "projected-tool", "list-system"])
 def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, host_estimator, view_of):
-    """R3-B (Q3, Q2): the host adopts the fitted list (a projected tool row; a list-content system slot
-    carrying the notice) and a cold process resumes it: only the new turn is stored, never the notice."""
+    """R3-B (Q3, Q2): the host adopts the fitted list (a projected newest user row and the reply after it;
+    a projected tool row; a list-content system slot carrying the notice) and a cold process resumes it:
+    only the new turn is stored, never the notice, never the earlier reply again."""
     engine = _engine(tmp_path, context_length=WINDOW)
     view = view_of()
     try:
@@ -686,6 +690,154 @@ def test_r3b_a_fitted_list_resumes_cold_without_new_rows(tmp_path, summaries, ho
         added = _rows(cold)[before:]
         assert [r["content"] for r in added] == [m["content"] for m in new]
         assert not any(NOTICE in str(r["content"]) for r in _rows(cold))
+    finally:
+        cold.shutdown()
+
+
+@pytest.mark.parametrize("case", ["dropped-only", "projected", "old-record"])
+def test_rc2_survival_counter_records_projections(tmp_path, summaries, host_estimator, case):
+    """The doctor counter counts fits that projected a row (a persisted projection limits rollback, #601);
+    a record written before the key existed stays unknown (no key), never a false zero."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_user_view() if case == "projected" else _long_view()
+    try:
+        if case == "old-record":
+            engine._store.write_metadata_json(["survival_fit:counter"], json.dumps({"count": 1, "last_reason": "x"}))
+        engine.ingest(view)
+        _conflicted(engine)
+        engine.compress(view, current_tokens=host_estimator(view))
+        record = engine._store.read_metadata_json("survival_fit:counter")
+        expected = {"dropped-only": 0, "projected": 1, "old-record": None}[case]
+        assert record["count"] == (2 if case == "old-record" else 1)
+        assert record.get("projected_count") == expected and (expected is not None or "projected_count" not in record)
+    finally:
+        engine.shutdown()
+
+
+def test_rc3_survival_counter_update_is_atomic_across_engines(tmp_path):
+    """R3-2: two engines on one lcm.db. B reads the counter, A records a projecting fit, then B records a
+    drop-only fit: B's stale read never overwrites A's projection (projected_count never decreases)."""
+    import threading
+    import time as _time
+
+    a, b = _engine(tmp_path), _engine(tmp_path)
+    fit_a = threading.Thread(target=a._survival_record, args=("a", 1, [1], 10, 5, 10, True, "n"))
+    real = b._store.read_metadata_json
+
+    def stale_read(key):
+        value = real(key)
+        if key == "survival_fit:counter" and not fit_a.is_alive() and fit_a.ident is None:
+            fit_a.start()  # A records while B holds what it read
+            _time.sleep(0.3)
+        return value
+
+    b._store.read_metadata_json = stale_read
+    try:
+        b._survival_record("b", 1, [2], 10, 5, 10, False, "n")
+        fit_a.join(10)
+        record = a._store.read_metadata_json("survival_fit:counter")
+        assert record["count"] == 2 and record["projected_count"] >= 1, record
+    finally:
+        a.shutdown()
+        b.shutdown()
+
+
+@pytest.mark.parametrize("eligible", [False, True], ids=["nothing-eligible", "one-eligible-row"])
+def test_rc4_projected_count_counts_only_fits_that_replaced_a_row(tmp_path, summaries, host_estimator, caplog,
+                                                                  eligible):
+    """R4-1: the newest turn alone is over budget and older turns are dropped. When no row of that turn can be
+    projected (each under 256 tokens), the fit projected nothing: projected_count 0 and projected=False."""
+    rows = [{"role": "assistant", "content": f"[P{i}] " + "alpha " * 150} for i in range(30)]  # ~230 tokens each
+    if eligible:
+        rows[0] = {"role": "assistant", "content": "[P0] " + "alpha " * 3000}
+    view = [{"role": "system", "content": "system prompt"},
+            *[r for i in range(3) for r in _turn(f"L{i}", 10.0 * i)],
+            {"role": "user", "content": "[N] newest", "timestamp": 99.0}, *rows]
+    engine = _engine(tmp_path, context_length=WINDOW)
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            engine.compress(view, current_tokens=host_estimator(view))
+        record = engine._store.read_metadata_json("survival_fit:counter")
+        assert record["count"] == 1 and record["projected_count"] == int(eligible), record
+        line = next(r.getMessage() for r in caplog.records if "LCM survival fit applied" in r.getMessage())
+        assert f"projected={eligible}" in line, line
+    finally:
+        engine.shutdown()
+
+
+def _projection_of(engine, store_id) -> dict:
+    """The view copy the survival fit makes of stored row ``store_id`` (its host stamp kept)."""
+    row = engine._store.get(store_id)
+    fields = engine._survival_projected_fields(row, 3000, lcm_survival_fit._HEAD, lcm_survival_fit._TAIL)
+    return {"role": row["role"], "timestamp": row["observed_at"], **{k: v for k, v in fields.items() if v is not None}}
+
+
+@pytest.mark.parametrize("foreign", ["ok reply", "another conversation's text"], ids=["identical", "different"])
+def test_rc2_projection_followers_read_only_the_sources_conversation(tmp_path, foreign):
+    """A row of another conversation under the same session, stored between the projected source and its
+    reply, is never taken (byte-identical) and never ends the walk early (different)."""
+    engine = _engine(tmp_path)
+    try:
+        source = engine._store.append("S", {"role": "user", "content": "[N] newest " + "word " * 600,
+                                            "timestamp": 99.0}, conversation_id="conv")
+        engine._store.append("S", {"role": "assistant", "content": foreign}, conversation_id="other")
+        reply = engine._store.append("S", {"role": "assistant", "content": "ok reply"}, conversation_id="conv")
+        view = [_projection_of(engine, source), {"role": "assistant", "content": "ok reply"}]
+        taken = engine._survival_projection_followers(view, 0, engine._store.get(source), {0: 99.0})
+        assert [(k, int(row["store_id"])) for k, row in taken] == [(1, reply)]
+    finally:
+        engine.shutdown()
+
+
+def test_rc3_projection_followers_of_a_blank_conversation_source_stay_in_the_active_conversation(tmp_path):
+    """R3-1: a legacy source row with a blank conversation never widens the read to every conversation of
+    the session: a byte-identical reply of another conversation is not taken, so the active reply is stored."""
+    engine = _engine(tmp_path)
+    try:
+        source = engine._store.append("S", {"role": "user", "content": "[N] newest " + "word " * 600,
+                                            "timestamp": 99.0}, conversation_id="")
+        engine._store.append("S", {"role": "assistant", "content": "ok reply"}, conversation_id="foreign")
+        view = [_projection_of(engine, source), {"role": "assistant", "content": "ok reply"}]
+        assert engine._survival_projection_followers(view, 0, engine._store.get(source), {0: 99.0}) == []
+    finally:
+        engine.shutdown()
+
+
+def test_rc2_projection_followers_bind_to_the_named_source(tmp_path):
+    """Two identical user rows under one stamp; the projection names the later one. Matched to the earlier
+    row, the walk would read the earlier reply as this one: it takes nothing unless the row is the source."""
+    engine = _engine(tmp_path)
+    try:
+        user = {"role": "user", "content": "[N] newest " + "word " * 600, "timestamp": 99.0}
+        earlier = engine._store.append("S", dict(user), conversation_id="conv")
+        engine._store.append("S", {"role": "assistant", "content": "ok reply"}, conversation_id="conv")
+        later = engine._store.append("S", dict(user), conversation_id="conv")
+        view = [_projection_of(engine, later), {"role": "assistant", "content": "ok reply"}]
+        assert engine._survival_projection_followers(view, 0, engine._store.get(earlier), {0: 99.0}) == []
+    finally:
+        engine.shutdown()
+
+
+def test_rc2_a_new_reply_after_a_projected_user_row_is_stored(tmp_path, summaries, host_estimator):
+    """B-ROLL-1 (rc2) control: only the rows stored right after the projection's source are its replies; a
+    different reply in that place is new and is stored."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _big_user_view()
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        fitted = engine.compress(view, current_tokens=host_estimator(view))
+        before = len(_rows(engine))
+        engine.on_session_end("S", fitted)
+    finally:
+        engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        changed = [*fitted[:-1], {"role": "assistant", "content": "a different reply"}]
+        cold.ingest(changed)
+        assert [r["content"] for r in _rows(cold)[before:]] == ["a different reply"]
     finally:
         cold.shutdown()
 
@@ -974,6 +1126,119 @@ def test_r6_5_store_complete_admits_a_tool_group_whole_or_not_at_all(tmp_path, s
         assert (call_id in covered) == first
     finally:
         engine.shutdown()
+
+
+def _scan_cap_store(engine, call_pos, parallel=False, calls=None):
+    """``call_pos - 1`` small hidden rows, an assistant tool-call row at owned position ``call_pos`` (two
+    calls when ``parallel``, ``calls`` when given), its result rows, a reply, then the fresh tail (the only
+    host view)."""
+    hidden = [{"role": "user", "content": f"h{i:05d} q", "timestamp": float(i)} if i % 2 else
+              {"role": "assistant", "content": f"h{i:05d} a"} for i in range(1, call_pos)]
+    ids = ["call_edge", "call_side"] if parallel else ["call_edge"]
+    ids = ids if calls is None else ["call_edge", *[f"call_{k}" for k in range(1, calls)]]
+    calls = [{"id": cid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}} for cid in ids]
+    group = [{"role": "assistant", "content": "", "tool_calls": calls},
+             *[{"role": "tool", "tool_call_id": cid, "content": f"RESULT_OF_{cid}"} for cid in ids],
+             {"role": "assistant", "content": "reply after the edge tool call"}]
+    tail = [{"role": "user", "content": "[T9] fresh tail user", "timestamp": 1e6},
+            {"role": "assistant", "content": "[T9] fresh tail reply"}]
+    engine.ingest([*hidden, *group, *tail])
+    call_id = next(int(r["store_id"]) for r in _rows(engine) if r.get("tool_calls"))
+    return tail, call_id
+
+
+def _unmatched_calls(messages) -> list:
+    answered = {str(m.get("tool_call_id") or "") for m in messages if m.get("role") == "tool"}
+    return [call["id"] for m in messages for call in (m.get("tool_calls") or []) if call["id"] not in answered]
+
+
+def _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, cap, call_pos, parallel=False, calls=None,
+                         covered_before=False):
+    """Two passes over the scan-cap store; returns (call id, covered after pass 1, log lines, serializer inputs)."""
+    if cap is not None:
+        monkeypatch.setattr(lcm_store_complete, "_SCAN_LIMIT", cap)
+    engine = _engine(tmp_path, leaf_chunk_tokens=500_000)
+    serialized: list[list] = []
+    real = engine._serialize_messages
+    monkeypatch.setattr(engine, "_serialize_messages", lambda messages: serialized.append(list(messages)) or real(messages))
+    try:
+        tail, call_id = _scan_cap_store(engine, call_pos, parallel, calls)
+        if covered_before:  # every row before the call is already covered by a summary (excluded, not in the leaf)
+            engine._dag.add_node(SummaryNode(session_id="OTHER", summary="s", token_count=1, source_token_count=1,
+                                             source_ids=list(range(1, call_id))))
+        with caplog.at_level(logging.INFO, logger="hermes_lcm.store_complete"):
+            view = engine.compress(list(tail))
+            assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
+            first = set(_covered(engine))
+            engine.on_session_start("S", boundary_reason="compression", old_session_id="S",
+                                    platform="telegram", conversation_id="conv")
+            view = [*view, *[m for j in range(6) for m in (  # the host continues past the retained tail
+                {"role": "user", "content": f"[G{j}] new user turn " + "pad " * 20, "timestamp": 2e6 + j},
+                {"role": "assistant", "content": f"[G{j}] new reply " + "pad " * 20})]]
+            engine.ingest(view)
+            engine._config.leaf_chunk_tokens = 200  # the next leaf: the rest of the backlog and host rows
+            engine.compress(view)
+            assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
+        every = Counter(int(r[0]) for r in engine._store.connection.execute(
+            "SELECT source.value FROM summary_nodes AS node, json_each(node.source_ids) AS source "
+            "WHERE node.source_type = 'messages'").fetchall())  # any session's summaries
+        below = [int(r["store_id"]) for r in _rows(engine) if int(r["store_id"]) <= _frontier(engine)]
+        assert below and all(every[store_id] == 1 for store_id in below), (_frontier(engine), every)
+        lines = [r.getMessage() for r in caplog.records if "store-complete leaf" in r.getMessage()]
+        return call_id, first, set(_covered(engine)), lines, serialized
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["single-call", "parallel-calls"])
+def test_rc2_b_group_1_scan_cap_ends_the_leaf_before_an_unread_tool_group(tmp_path, summaries, monkeypatch, caplog,
+                                                                         parallel):
+    """B-GROUP-1: the owned-row scan stops at ``_SCAN_LIMIT`` inside a tool group (the call row read, a
+    result not): the leaf ends before the call and says cut=True; the next leaf starts at the call."""
+    cap = 10
+    call_id, first, covered, lines, serialized = _run_scan_cap_leaves(
+        tmp_path, monkeypatch, caplog, cap, cap - 1 if parallel else cap, parallel)
+    assert max(first) == call_id - 1 and call_id not in first, (sorted(first), call_id)
+    assert "cut=True" in lines[0], lines
+    assert {call_id, call_id + 1} <= covered, (sorted(covered), call_id)
+    assert not summaries[1].startswith("[TOOL RESULT"), summaries[1][:200]  # never the orphan result
+    assert -1 < summaries[1].find("read_file") < summaries[1].find("[TOOL RESULT"), summaries[1][:200]
+    assert serialized and not any(_unmatched_calls(messages) for messages in serialized)
+
+
+def test_rc2_b_group_1_group_read_whole_before_the_cap_stays_whole(tmp_path, summaries, monkeypatch, caplog):
+    """Control: the call at cap-1 and its result at the cap: the group is read whole and stays in the leaf."""
+    cap = 10
+    call_id, first, _covered_after, lines, serialized = _run_scan_cap_leaves(
+        tmp_path, monkeypatch, caplog, cap, cap - 1)
+    assert {call_id, call_id + 1} <= first and max(first) == cap, (sorted(first), call_id)
+    assert "cut=False" in lines[0], lines
+    assert "read_file" in summaries[0] and "RESULT_OF_call_edge" in summaries[0]
+    assert not any(_unmatched_calls(messages) for messages in serialized)
+
+
+def test_rc2_b_group_1_product_scan_limit(tmp_path, summaries, monkeypatch, caplog):
+    """The default-cap shape at the real constant: 1,999 hidden rows, the call at 2000, its result at 2001."""
+    cap = lcm_store_complete._SCAN_LIMIT
+    call_id, first, covered, lines, _serialized = _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, None, cap)
+    assert call_id == cap and max(first) == cap - 1 and "cut=True" in lines[0], (call_id, max(first), lines)
+    assert {cap, cap + 1} <= covered
+
+
+@pytest.mark.parametrize("shape", ["covered-before", "first-owned-row"])
+def test_rc2_b_group_1_a_first_group_at_the_scan_cap_is_read_whole(tmp_path, summaries, monkeypatch, caplog, shape):
+    """A first tool group (no covered row before it in the leaf) open at the scan cap: one bounded larger
+    scan reads its results and the group is admitted whole, never a call without its result.
+    covered-before: 1,999 rows an existing summary covers, the call at 2000, its result at 2001.
+    first-owned-row: the call is the first owned row, twelve parallel calls, their results past cap 10."""
+    covered_before = shape == "covered-before"
+    call_id, first, covered, lines, serialized = _run_scan_cap_leaves(
+        tmp_path, monkeypatch, caplog, None if covered_before else 10, lcm_store_complete._SCAN_LIMIT
+        if covered_before else 1, calls=None if covered_before else 12, covered_before=covered_before)
+    results = 1 if covered_before else 12
+    assert set(range(call_id, call_id + results + 1)) <= first, (sorted(first)[-5:], call_id)
+    assert serialized and not any(_unmatched_calls(messages) for messages in serialized)
+    assert "[TOOL RESULT" not in summaries[1].split("\n\n")[0], summaries[1][:200]  # next leaf: no orphan result
 
 
 class _Heartbeat:

@@ -293,6 +293,12 @@ class IdentityAnchorMixin:
                 group = self._identity_anchor_carrier_group(identity_messages[idx], consumed)
                 if group is not None:
                     self._identity_anchor_take(idx, group, consumed, matched, plan)
+        for idx in sorted(plan["replayed"]):  # a replayed survival-fit projection: its stored replies follow it
+            if len(matched.get(idx, ())) == 1 and callable(getattr(self, "_survival_projection_followers", None)):
+                for k, row in self._survival_projection_followers(identity_messages, idx, matched[idx][0], stamps):
+                    if k in plan["replayed"] or int(row["store_id"]) in consumed:
+                        break
+                    self._identity_anchor_take(k, [row], consumed, matched, plan)
         if start < cursor:
             self._identity_anchor_audit(messages, identity_messages, cursor, start, stamps, identity_at, consumed, plan)
         self._identity_anchor_tool_segments(messages, plan["cursor"], plan["replayed"], matched, plan.get("positional", ()))

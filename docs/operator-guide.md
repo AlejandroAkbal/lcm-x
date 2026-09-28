@@ -105,6 +105,38 @@ self-updater. An install pinned with `--ref <sha>` (outside the catalog) refuses
 
 Restart Hermes after updating.
 
+### Rollback
+
+Take an `lcm.db` backup before every upgrade (`/lcm backup`, or a quiescent
+copy as in [Upgrade to v0.23.1](#upgrade-to-v0231)). To roll back to v0.23.3,
+reinstall v0.23.3 with `LCM_NATIVE_RECOVERY=true` and keep `lcm.db` as it is,
+never with native recovery off: v0.23.3 does not recognise the summary carrier
+that v0.24.x puts in the host list, so with native recovery off its
+compactions conflict on every attempt (with it on, v0.23.3 does not attempt a
+publication), and restoring the pre-upgrade backup does not avoid that and
+also drops rows stored since the backup. v0.23.3's native recovery needs a
+Hermes build that installs the compression cancellation check
+(`_compression_cancelled_check`); without it v0.23.3's native path returns the
+list unchanged. The Hermes builds LCM-X is tested against install it: 0.21.5
+(`f97608f1`), 0.21.2 (`2d10969e`) and upstream main (`6f7a7991`). Rolling back
+to v0.23.3 (`hermes-lcm`) also reverts the v0.24.0 config migration before
+Hermes restarts: `plugins.enabled` back to `hermes-lcm` and `context.engine:
+lcm` (restore the `config.yaml` backup taken before the migration); otherwise
+Hermes reports the engine as not found, runs the built-in compressor, and
+those turns never reach `lcm.db`. Within the 0.24.x line a plugin-only
+rollback is supported only while no survival-fit projection was persisted
+(#601); once `/lcm doctor` reports a `survival_fit` `projected_count` above 0
+(or unknown, on a record from before that field), an older plugin re-stores
+rows it cannot compact. Stop Hermes (every process that uses the profile)
+before you move or restore database files. Move the current `lcm.db` (with its
+`-wal` and `-shm` files) aside and keep it: nothing is deleted, and its rows
+are readable again once a version that can read them is installed (#601). Then
+restore the `lcm.db` backup taken before the first v0.24.5 install (no earlier
+version writes a projection, so that backup holds none) together with the
+plugin, accepting that rows stored after that backup leave the LCM store: they
+stay in the `lcm.db` you moved aside, and the host session keeps only the
+turns it still shows.
+
 ## Migrate from hermes-lcm (v0.23.x and earlier)
 
 **BREAKING in v0.24.0** (#471): the plugin manifest is now `hermes-lcm-x` and

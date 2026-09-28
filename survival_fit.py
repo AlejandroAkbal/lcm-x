@@ -134,7 +134,7 @@ class SurvivalFitMixin:
                 logger.warning("LCM survival fit skipped: an over-budget list holds rows not yet stored (reason=%s)", reason)
                 return result
             kept = self._survival_projection(body[cut:], store_ids, budget - self._survival_measure(head))
-            projected = True
+            projected = any(new is not old for new, old in zip(kept, body[cut:]))  # a row was actually replaced
         else:
             kept = body[cut:]
         dropped = body[:cut]
@@ -265,6 +265,31 @@ class SurvivalFitMixin:
                 return row
         return None
 
+    def _survival_projection_followers(self, messages, idx: int, row: Dict[str, Any], stamps) -> list:
+        """B-ROLL-1 (rc2): ``[(index, stored_row), ...]`` for the unstamped non-user rows the view carries
+        right after ``messages[idx]``, a replayed projection of ``row``, that are exactly the rows stored
+        right after ``row``, in order; the first row that differs, is stamped or is a user/system row ends
+        it. A projected newest user row has no positional replay proof, so without this its replies are
+        stored again on a cold resume."""
+        role = str(messages[idx].get("role") or "")
+        source = self._survival_projection_source(messages[idx], role, normalize_content_value(
+            messages[idx].get("content")) or "")
+        if source is None or int(source["store_id"]) != int(row["store_id"]):
+            return []  # the replies follow the row the projection names, never an identical earlier one
+        if not str(self._conversation_id or "").strip():
+            return []  # no active conversation to scope the read by: a blank scope would read every one
+        stored = self._store.get_range(str(row["session_id"]), start_id=int(row["store_id"]) + 1,
+                                       limit=max(len(messages) - idx - 1, 1),  # the active conversation only
+                                       conversation_id=self._conversation_id, include_blank_conversation=True)
+        out = []
+        for k, stored_row in zip(range(idx + 1, len(messages)), stored):
+            if (k in stamps or str(messages[k].get("role") or "") in ("user", "system")
+                    or self._message_replay_identity(messages[k], strip_carrier=False)
+                    != self._message_replay_identity(stored_row, stored_row=True)):
+                break
+            out.append((k, stored_row))
+        return out
+
     def _survival_stamp_matches(self, message: Dict[str, Any], row: Dict[str, Any]) -> bool:
         """No host stamp; or the source row's own: its observed_at or a recorded alias stamp (normalized as
         the identity anchor normalizes them); or any stamp when the source was stored unstamped (R6-1: a
@@ -289,14 +314,19 @@ class SurvivalFitMixin:
         )
         self._last_survival_fit = {"reason": reason, "dropped_rows": count, "notice": notice, "at": time.time(),
                                    "reached_budget": after <= budget}
-        try:
-            record = self._store.read_metadata_json(SURVIVAL_FIT_COUNTER_KEY)
+
+        def counted(record):  # runs inside the store's write transaction: concurrent engines add, never overwrite
             record = record if isinstance(record, dict) else {}
-            record = {"count": int(record.get("count") or 0) + 1, "last_reason": reason, "last_at": time.time(),
-                      "last_conversation": str(self._conversation_id or self._session_id or ""),
-                      "last_reached_budget": after <= budget,
-                      "unreached_budget_count": int(record.get("unreached_budget_count") or 0) + (after > budget)}
-            self._store.write_metadata_json([SURVIVAL_FIT_COUNTER_KEY], json.dumps(record, sort_keys=True))
+            return {"count": int(record.get("count") or 0) + 1, "last_reason": reason, "last_at": time.time(),
+                    "last_conversation": str(self._conversation_id or self._session_id or ""),
+                    "last_reached_budget": after <= budget,
+                    "unreached_budget_count": int(record.get("unreached_budget_count") or 0) + (after > budget),
+                    # fits that projected a row (#601); a record from before the key stays unknown (no key)
+                    **({"projected_count": int(record.get("projected_count") or 0) + bool(projected)}
+                       if "projected_count" in record or not record.get("count") else {})}
+
+        try:
+            self._store.update_metadata_json(SURVIVAL_FIT_COUNTER_KEY, counted)
         except Exception:
             logger.debug("LCM survival-fit counter write failed", exc_info=True)
         key = str(self._conversation_id or self._session_id or "")
