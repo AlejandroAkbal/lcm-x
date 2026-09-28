@@ -205,7 +205,10 @@ def main():
             or "compress" in line.lower() or "orphan" in line)[-2_000_000:])
         print(json.dumps({"exit": exit_kind, **extra}), flush=True)
         tfile.close()
-        if exit_kind in ("crash", "clean_exit", "tip_switch"):  # between turns for the latter two, as _CRASH_PROBE
+        first_commit = log.find("LCM compaction #")  # native-on-off: B3/B8 count from the first publication
+        out["log_counts_after_commit"] = None if first_commit < 0 else {
+            k: log[first_commit:].count(LOG_COUNTS[k]) for k in ("publication_invariant_conflict", "survival_fit")}
+        if exit_kind in ("crash", "clean_exit", "tip_switch", "plugin_switch"):  # between turns, as _CRASH_PROBE
             os._exit(0)  # the host process dies here: no atexit, no flush, no engine shutdown
 
     faults = {f["kind"]: f for f in cell.get("faults", [])}
@@ -587,6 +590,10 @@ def main():
     def low_backlog(last_turn):
         return backlog_low(cell_dir, last_turn, backlog_log)
     for t in extend_turns(cell, first, low_backlog):
+        f = faults.get("plugin_switch")  # native-on-off: exit between turns; run_matrix swaps in the candidate
+        if f and t == f["turn"] and t != first and "plugin_switch" not in fired:
+            fire("plugin_switch", t)
+            finish("plugin_switch", next_turn=t)
         f = faults.get("clean_exit_before_turn")
         if f and phase != "A" and t == f.get("turn", first + f.get("after_restart", 0)) and t != first \
                 and "clean_exit_before_turn" not in fired:

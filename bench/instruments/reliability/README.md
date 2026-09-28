@@ -77,6 +77,10 @@ the host reported `interrupted`. Any other assistant row is surplus.
 - **B8** zero `LCM survival fit applied` log lines across phases (#582): a survival fit keeps an over-window
   session alive, so on a normal cell it marks a compaction that did not bring the list under the window.
   Like B3, it does not apply to the injected publication-failure cells.
+
+`native-on-off/<ref>/<mode>` (#581/#582) runs turns 1-30 on lcm-x `<ref>` (v0.23.3, v0.24.3) with native recovery ON;
+the `plugin_switch` fault then exits between turns and the candidate takes over the same HERMES_HOME and store with
+native OFF. B3 and B8 count only the candidate's phases, from its first publication; B4 asks it to publish. R1 only.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
   (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
   re-invoked once after a cleanup-only `sanitized`) does not end in error, conflict or exception; an

@@ -157,6 +157,21 @@ def test_b8_survival_fit_is_a_normal_cell_failure_and_not_scored_on_injected_fai
     assert clean["verdict"] == "PASS" and clean["numbers"]["B8"] == {"survival_fit": 0}
 
 
+def test_native_on_off_counts_b3_b8_from_the_candidate_first_publication():
+    """native-on-off: the older ref's phase and the candidate's lines before its first publication are not
+    counted; after it, every conflict or fit is."""
+    old = {"exit": "plugin_switch", "log_counts": {"publication_invariant_conflict": 5}}
+    before = {"exit": "crash", "log_counts": {"publication_invariant_conflict": 2}, "log_counts_after_commit": None}
+    first = {"exit": "done", "log_counts": {"publication_invariant_conflict": 3, "survival_fit": 2},
+             "log_counts_after_commit": {"publication_invariant_conflict": 1, "survival_fit": 0}}
+    cell = {"from_ref": "v0.24.3"}
+    assert bars.counted(cell, [old, before, first], "publication_invariant_conflict") == 1
+    assert bars.counted(cell, [old, before, first, first], "survival_fit") == 2
+    assert bars.counted({}, [old, before, first], "publication_invariant_conflict") == 10
+    assert all(c["faults"] == [{"kind": "plugin_switch", "turn": 31}] and c["native_recovery"]
+               for c in cells.select("native-on-off/*"))
+
+
 def test_compact_transcript_fields_mean_held_equals_persist(tmp_path):
     events = clean_events()
     for e in events:

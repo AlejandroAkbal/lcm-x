@@ -12,7 +12,7 @@ BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8")
 TRANSPORTS = ("acp", "gateway")
 FAULTS = {"crash_after_compaction_before_reply", "clean_exit_before_turn", "crash_mid_tool_call",
           "crash_after_rotation_before_child_row", "crash_between_session_end_and_start", "cancel_then_retry",
-          "publication_failure"}
+          "publication_failure", "plugin_switch"}
 # issue -> (the bars that decide it, what an uncovered issue would need)
 ISSUES = {
     553: (("B1", "B2", "B3", "B4"), ""), 561: (("B1", "B2"), ""), 563: (("B4",), ""),
@@ -27,6 +27,7 @@ ISSUES = {
     546: (("B1", "B2", "B3", "B4"), ""), 547: (("B1", "B2", "B3", "B4"), ""), 549: (("B1", "B2"), ""),
     485: (("B2",), "upgrade from a pre-fix DB (R2)"), 542: (("B4",), "upgrade from a pre-#535 wedged DB (R2)"),
     559: (("B6", "B4"), ""), 566: (("B1", "B2", "B5"), ""),  # B5: a cross-lineage summary is recorded only there
+    581: (("B3", "B4"), ""), 582: (("B8",), ""),  # native-on-off: counted from the candidate's first publication
 }
 
 
@@ -96,6 +97,12 @@ def registry() -> list[dict]:
                  doc="A chat session S0 and a fresh platform='cron' agent every 5 S0 turns in ONE host process "
                      "(cron/scheduler.py); cron turns are tagged K."),
         ]
+        for ref in ("v0.23.3", "v0.24.3"):  # #581/#582: a native-ON store handed to the candidate with native OFF
+            cells.append(cell(f"native-on-off/{ref}/{m}", [581, 582], in_place=ip, native=True, from_ref=ref,
+                              faults=[{"kind": "plugin_switch", "turn": 31}],
+                              doc=f"Turns 1-30 run lcm-x {ref} with native recovery ON; the candidate then takes over the "
+                                  "same HERMES_HOME and store with native OFF. B3/B8 count from the candidate's first "
+                                  "publication; B4 asks it to publish."))
         for tr in ("acp-history", "gateway-reload"):
             cells.append(cell(f"crash-after-compaction/{m}/{tr}", [553, 561], in_place=ip,
                               transport="acp" if tr == "acp-history" else "gateway", faults=[crash],

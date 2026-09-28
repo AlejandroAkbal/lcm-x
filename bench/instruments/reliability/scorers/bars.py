@@ -25,6 +25,17 @@ from . import chronology, host_parity, multiset, summary, tool_calls, tool_group
 ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8")
 
 
+def counted(cell: dict, phases: list[dict], key: str) -> int:
+    """A log count over the cell's phases; a native-on-off cell (``from_ref``) counts only the candidate's
+    phases, from its first publication (the older ref's native-ON store may conflict until then)."""
+    if not cell.get("from_ref"):
+        return sum(p.get("log_counts", {}).get(key, 0) for p in phases)
+    post = phases[next((i + 1 for i, p in enumerate(phases) if p.get("exit") == "plugin_switch"), len(phases)):]
+    first = next((i for i, p in enumerate(post) if p.get("log_counts_after_commit") is not None), len(post))
+    return sum((p["log_counts_after_commit"] if i == first else p.get("log_counts", {})).get(key, 0)
+               for i, p in enumerate(post) if i >= first)
+
+
 def load(cell_dir: Path):
     events = [json.loads(x) for x in (cell_dir / "transcript.jsonl").read_text().splitlines() if x.strip()]
     phases = [json.loads(p.read_text()) for p in sorted(cell_dir.glob("phase-*.json"), key=lambda p: (len(p.name), p.name))]
@@ -223,11 +234,11 @@ def score(cell: dict, cell_dir: Path) -> dict:
         failed["B2"] = {**numbers["B2"], "missing": [dict(e, session=g) for g, m in bad.items() for e in m["missing"]][:5],
                         "duplicated": [dict(e, session=g) for g, m in bad.items() for e in m["duplicated"]][:5],
                         "extra": [dict(e, session=g) for g, m in bad.items() for e in m["extra"]][:5]}
-    conflicts = sum(p.get("log_counts", {}).get("publication_invariant_conflict", 0) for p in phases)
+    conflicts = counted(cell, phases, "publication_invariant_conflict")
     numbers["B3"] = {"publication_invariant_conflict": conflicts}
     if conflicts:
         failed["B3"] = numbers["B3"]
-    fits = sum(p.get("log_counts", {}).get("survival_fit", 0) for p in phases)  # #582: a fit is a compaction miss
+    fits = counted(cell, phases, "survival_fit")  # #582: a fit is a compaction miss
     numbers["B8"] = {"survival_fit": fits}
     if fits:
         failed["B8"] = numbers["B8"]
