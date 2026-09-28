@@ -16,6 +16,7 @@ import pytest
 
 import hermes_lcm.compaction as lcm_compaction
 import hermes_lcm.engine as lcm_engine
+import hermes_lcm.store_complete as lcm_store_complete
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -974,6 +975,93 @@ def test_r6_5_store_complete_admits_a_tool_group_whole_or_not_at_all(tmp_path, s
         assert (call_id in covered) == first
     finally:
         engine.shutdown()
+
+
+def _scan_cap_store(engine, call_pos, parallel=False):
+    """``call_pos - 1`` small hidden rows, an assistant tool-call row at owned position ``call_pos`` (two
+    calls when ``parallel``), its result rows, a reply, then the fresh tail (the only host view)."""
+    hidden = [{"role": "user", "content": f"h{i:05d} q", "timestamp": float(i)} if i % 2 else
+              {"role": "assistant", "content": f"h{i:05d} a"} for i in range(1, call_pos)]
+    ids = ["call_edge", "call_side"] if parallel else ["call_edge"]
+    calls = [{"id": cid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}} for cid in ids]
+    group = [{"role": "assistant", "content": "", "tool_calls": calls},
+             *[{"role": "tool", "tool_call_id": cid, "content": f"RESULT_OF_{cid}"} for cid in ids],
+             {"role": "assistant", "content": "reply after the edge tool call"}]
+    tail = [{"role": "user", "content": "[T9] fresh tail user", "timestamp": 1e6},
+            {"role": "assistant", "content": "[T9] fresh tail reply"}]
+    engine.ingest([*hidden, *group, *tail])
+    call_id = next(int(r["store_id"]) for r in _rows(engine) if r.get("tool_calls"))
+    return tail, call_id
+
+
+def _unmatched_calls(messages) -> list:
+    answered = {str(m.get("tool_call_id") or "") for m in messages if m.get("role") == "tool"}
+    return [call["id"] for m in messages for call in (m.get("tool_calls") or []) if call["id"] not in answered]
+
+
+def _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, cap, call_pos, parallel=False):
+    """Two passes over the scan-cap store; returns (call id, covered after pass 1, log lines, serializer inputs)."""
+    if cap is not None:
+        monkeypatch.setattr(lcm_store_complete, "_SCAN_LIMIT", cap)
+    engine = _engine(tmp_path, leaf_chunk_tokens=500_000)
+    serialized: list[list] = []
+    real = engine._serialize_messages
+    monkeypatch.setattr(engine, "_serialize_messages", lambda messages: serialized.append(list(messages)) or real(messages))
+    try:
+        tail, call_id = _scan_cap_store(engine, call_pos, parallel)
+        with caplog.at_level(logging.INFO, logger="hermes_lcm.store_complete"):
+            view = engine.compress(list(tail))
+            assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
+            first = set(_covered(engine))
+            engine.on_session_start("S", boundary_reason="compression", old_session_id="S",
+                                    platform="telegram", conversation_id="conv")
+            view = [*view, *[m for j in range(6) for m in (  # the host continues past the retained tail
+                {"role": "user", "content": f"[G{j}] new user turn " + "pad " * 20, "timestamp": 2e6 + j},
+                {"role": "assistant", "content": f"[G{j}] new reply " + "pad " * 20})]]
+            engine.ingest(view)
+            engine._config.leaf_chunk_tokens = 200  # the next leaf: the rest of the backlog and host rows
+            engine.compress(view)
+            assert engine._last_compression_status == "compacted", engine._last_compression_noop_reason
+        _assert_contiguous(engine)
+        lines = [r.getMessage() for r in caplog.records if "store-complete leaf" in r.getMessage()]
+        return call_id, first, set(_covered(engine)), lines, serialized
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["single-call", "parallel-calls"])
+def test_rc2_b_group_1_scan_cap_ends_the_leaf_before_an_unread_tool_group(tmp_path, summaries, monkeypatch, caplog,
+                                                                         parallel):
+    """B-GROUP-1: the owned-row scan stops at ``_SCAN_LIMIT`` inside a tool group (the call row read, a
+    result not): the leaf ends before the call and says cut=True; the next leaf starts at the call."""
+    cap = 10
+    call_id, first, covered, lines, serialized = _run_scan_cap_leaves(
+        tmp_path, monkeypatch, caplog, cap, cap - 1 if parallel else cap, parallel)
+    assert max(first) == call_id - 1 and call_id not in first, (sorted(first), call_id)
+    assert "cut=True" in lines[0], lines
+    assert {call_id, call_id + 1} <= covered, (sorted(covered), call_id)
+    assert not summaries[1].startswith("[TOOL RESULT"), summaries[1][:200]  # never the orphan result
+    assert -1 < summaries[1].find("read_file") < summaries[1].find("[TOOL RESULT"), summaries[1][:200]
+    assert serialized and not any(_unmatched_calls(messages) for messages in serialized)
+
+
+def test_rc2_b_group_1_group_read_whole_before_the_cap_stays_whole(tmp_path, summaries, monkeypatch, caplog):
+    """Control: the call at cap-1 and its result at the cap: the group is read whole and stays in the leaf."""
+    cap = 10
+    call_id, first, _covered_after, lines, serialized = _run_scan_cap_leaves(
+        tmp_path, monkeypatch, caplog, cap, cap - 1)
+    assert {call_id, call_id + 1} <= first and max(first) == cap, (sorted(first), call_id)
+    assert "cut=False" in lines[0], lines
+    assert "read_file" in summaries[0] and "RESULT_OF_call_edge" in summaries[0]
+    assert not any(_unmatched_calls(messages) for messages in serialized)
+
+
+def test_rc2_b_group_1_product_scan_limit(tmp_path, summaries, monkeypatch, caplog):
+    """The default-cap shape at the real constant: 1,999 hidden rows, the call at 2000, its result at 2001."""
+    cap = lcm_store_complete._SCAN_LIMIT
+    call_id, first, covered, lines, _serialized = _run_scan_cap_leaves(tmp_path, monkeypatch, caplog, None, cap)
+    assert call_id == cap and max(first) == cap - 1 and "cut=True" in lines[0], (call_id, max(first), lines)
+    assert {cap, cap + 1} <= covered
 
 
 class _Heartbeat:

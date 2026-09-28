@@ -146,7 +146,7 @@ class StoreCompleteMixin:
             return max(ids_of(message, claims.get(id(message), ())), default=0)
 
         out, used, excluded, dependent, index = [], 0, [], False, 0
-        group: list = []  # the open tool group: [call ids, its index in out, used before it]
+        group: list = []  # the open tool group: [call ids, its index in out, used before it, answered ids]
 
         def take(message, ids) -> bool:  # the budget cuts only at a group boundary, never before the first
             nonlocal used, group          # row that carries a store id (the leaf's coverage)
@@ -158,7 +158,7 @@ class StoreCompleteMixin:
                 if used + tokens > budget and any(ids_of(m, i) for m, i in out):
                     return False
                 if message.get("tool_calls"):
-                    group = [{_tool_call_id(call) for call in message["tool_calls"]}, len(out), used]
+                    group = [{_tool_call_id(call) for call in message["tool_calls"]}, len(out), used, set()]
             elif answers and used + tokens > budget and any(ids_of(m, i) for m, i in out[:group[1]]):
                 # R6-5: a group is admitted whole or not at all, as _select_oldest_leaf_chunk and
                 # tool_group_safe_end admit it: its results cross the budget and the leaf already
@@ -166,6 +166,8 @@ class StoreCompleteMixin:
                 del out[group[1]:]
                 used, group = group[2], []
                 return False
+            if answers:
+                group[3].add(str(message.get("tool_call_id") or "").strip())
             out.append((message, ids))
             used += tokens
             return True
@@ -201,6 +203,11 @@ class StoreCompleteMixin:
             dependent = dependent and role not in ("user", "system")
         if complete and not truncated:
             complete = emit_chunk(None)
+        elif complete and group and group[0] - group[3] and any(ids_of(m, i) for m, i in out[:group[1]]):
+            # B-GROUP-1: the scan stopped at _SCAN_LIMIT inside a tool group (a result not read): as R6-5,
+            # the leaf ends before the call; the next leaf starts at it (a first group is admitted whole).
+            del out[group[1]:]
+            complete = False
         # Contiguity: every owned row up to the leaf's last row is accounted for, else the leaf ends
         # before the first one that is not (a chunk row the budget cut, a claim left behind).
         while out:
