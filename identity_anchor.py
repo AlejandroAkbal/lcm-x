@@ -520,7 +520,8 @@ class IdentityAnchorMixin:
 
     def _identity_anchor_pool(self, donors, consumed) -> list:
         """Candidate constituents: unconsumed user rows of the lineage near each stamp donor, plus the
-        bound session's recent rows (bounded); never a row stored before every donor (B-ID-1)."""
+        bound session's recent rows (bounded). The caller drops rows the host view shows as their own
+        occurrences (B-ID-1) before it decomposes."""
         rows: dict[int, dict] = {}
         for donor in donors:
             store_id = int(donor["store_id"])
@@ -533,8 +534,8 @@ class IdentityAnchorMixin:
                 if row.get("role") == "user" and store_id not in consumed]
 
     def _identity_anchor_assign(self, parts, pool, donors, consumed) -> Optional[list]:
-        """Bind each part to one stored occurrence (a donor for a donor's text first), each used once:
-        a donor first, then rows stored after it, in store order (B-ID-1)."""
+        """Bind each part to one stored occurrence (a donor for a donor's text first), each used once;
+        ``pool`` holds no row the host view shows as its own occurrence (B-ID-1)."""
         taken: set[int] = set(consumed)
         donor_ids = {int(row["store_id"]) for row in donors}
         group = []
