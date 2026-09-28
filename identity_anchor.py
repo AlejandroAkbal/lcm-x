@@ -874,7 +874,7 @@ def _match_occurrences(rows, keys_of, occurrences) -> dict:
     kinds = {sid: tuple(sorted((k for k in ks if k in slots), key=repr)) for sid, ks in merged.items()}
     load: Counter = Counter()
     units: dict = defaultdict(Counter)  # type -> key -> its rows on that key
-    members: dict = defaultdict(list)  # type -> its matched rows, store order
+    matched: set = set()
     movable: dict = defaultdict(dict)  # key -> multi-key types with a unit on it (ordered set); nothing else moves
     dead: set = set()  # never an endpoint or a waypoint again (load never falls; Kuhn's lemma for failed searches)
     budget, work, spent = _MATCH_WORK_PER_ITEM * (len(kinds) + len(occurrences) + len(slots)) + _MATCH_WORK_FLOOR, 0, False
@@ -932,22 +932,23 @@ def _match_occurrences(rows, keys_of, occurrences) -> dict:
             movable[found][kind] = None
             found = previous
             kind, previous = parent[found]
-        members[own].append(sid)
+        matched.add(sid)
         units[own][found] += 1
         if len(own) > 1:
             movable[found][own] = None
-    order = {sid: i for i, sid in enumerate(kinds)}
-    on: dict = defaultdict(list)
-    for kind, sids in members.items():  # a type's rows spread over its keys by units, keys in order
-        spread = iter(sids)
-        for k in kind:
-            on[k].extend(next(spread) for _ in range(units[kind][k]))
-    result = {sid: occurrence for k, sids in on.items()
-              for sid, occurrence in zip(sorted(sids, key=order.__getitem__), slots[k])}
+    given: dict = defaultdict(Counter)  # type -> key -> its rows given that key so far
+    taken: Counter = Counter()
+    result = {}
+    for sid, kind in kinds.items():  # store order: a type's rows fill its keys by units, keys in order
+        if sid in matched:
+            k = next(k for k in kind if given[kind][k] < units[kind][k])
+            given[kind][k] += 1
+            result[sid] = slots[k][taken[k]]
+            taken[k] += 1
     if spent:
         logger.warning("LCM identity-anchor matching spent its work budget %d: rows=%d occurrences=%d keys=%d matched=%d",
                        budget, len(kinds), len(occurrences), len(slots), len(result))
-    return {sid: result[sid] for sid in kinds if sid in result}
+    return result
 
 
 def _composite_relation(group, stamp) -> list:
