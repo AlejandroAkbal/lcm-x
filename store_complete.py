@@ -88,7 +88,9 @@ class StoreCompleteMixin:
         if end is not None and end <= frontier:
             return False
         rows, _truncated = self._store_complete_owned_rows(frontier, end, self._load_compression_carry_ranges())
+        conversation = {"", str(self._conversation_id or "")}
         loose = [int(row["store_id"]) for row in rows if int(row["store_id"]) not in mapped and row.get("role") != "system"
+                 and str(row.get("conversation_id") or "").strip() in conversation
                  and not self._matches_ignore_message_patterns(row, stored_row=True)]
         if not set(loose) - self._store_complete_node_covered(loose):
             return False
@@ -167,6 +169,9 @@ class StoreCompleteMixin:
                 continue
             if store_id in taken or store_id in passive:
                 continue
+            if str(row.get("conversation_id") or "").strip() not in {"", str(self._conversation_id or "")}:
+                complete = False  # another conversation's row under this session id: publication cannot own it
+                break
             if store_id in covered or role == "system" or (dependent and role in ("assistant", "tool")):
                 excluded.append(store_id)
                 continue

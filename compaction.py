@@ -540,6 +540,7 @@ class CompactionMixin:
         try:
             self._pending_emission_candidates = []
             self._compress_occurrences = None
+            self._survival_fit_reason = None
             with self._fresh_tail_pressure_yield_invocation():
                 result = self._compress_impl(
                     messages,
@@ -560,6 +561,8 @@ class CompactionMixin:
                 )
             ):
                 result = messages
+            result = self._survival_fit(messages, result, current_tokens, reason=self._survival_fit_reason
+                                        or str(self._last_compression_status or "unknown"))
             self._record_compress_commit_proof(messages, result)
             logger.debug("LCM compaction emission descriptor count=%d",
                          len((self._compress_commit_proof or {}).get("emissions") or ()))
@@ -569,10 +572,22 @@ class CompactionMixin:
                 self._ingest_cursor_needs_reconcile = True
             self._rekey_host_rewrite_watch(messages, result)
             return result
-        except BaseException:
+        except BaseException as exc:
             self._compress_occurrences = None
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
+            if isinstance(exc, Exception):  # #582: an over-window list survives the failure, fitted
+                try:
+                    self._store.rollback_pending_write()
+                    fitted = self._survival_fit(messages, messages, current_tokens,
+                                                reason=f"exception:{type(exc).__name__}", after_exception=True)
+                except Exception:
+                    logger.debug("LCM survival fit after a compress exception failed", exc_info=True)
+                    fitted = messages
+                if fitted is not messages:
+                    logger.warning("LCM compress failed (%s); returning the survival-fitted list",
+                                   type(exc).__name__, exc_info=True)
+                    return fitted
             raise
 
     @staticmethod
@@ -802,6 +817,7 @@ class CompactionMixin:
                 "summary publication blocked by SQLite lock"
             )
         self._last_compression_noop_reason = noop_reason
+        self._survival_fit_reason = failure_reason
         self._ingest_cursor = len(fallback)
         self._ingest_cursor_needs_reconcile = False
         self._last_compaction_duration_ms = (

@@ -8,15 +8,17 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import sys
+import types
 from collections import Counter
 
 import pytest
 
+import hermes_lcm.compaction as lcm_compaction
 import hermes_lcm.engine as lcm_engine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.lifecycle_state import LifecyclePublicationConflictError
-from hermes_lcm.tokens import count_messages_tokens
 
 PAD = " alpha beta gamma delta" * 30
 
@@ -33,11 +35,11 @@ def summaries(monkeypatch):
     return captured
 
 
-def _engine(tmp_path, session="S", **config) -> LCMEngine:
+def _engine(tmp_path, session="S", context_length=200_000, **config) -> LCMEngine:
     settings = {"fresh_tail_count": 2, "leaf_chunk_tokens": 400, "context_threshold": 0.001,
                 "database_path": str(tmp_path / "lcm.db"), **config}
     engine = LCMEngine(config=LCMConfig(**settings))
-    engine.on_session_start(session, platform="telegram", context_length=200_000, conversation_id="conv")
+    engine.on_session_start(session, platform="telegram", context_length=context_length, conversation_id="conv")
     return engine
 
 
@@ -205,14 +207,168 @@ def test_d_owned_rows_are_the_session_plus_the_publication_carry_set(tmp_path, s
         engine.shutdown()
 
 
+# -- (e)-(g) the survival fit ------------------------------------------------------------------------------
+
+WINDOW = 6000
+TARGET = int(WINDOW * 0.85)
+NOTICE = "[LCM survival fit:"
+
+
+def _host_rough(messages) -> int:
+    """A stand-in for the host's rough request estimator (chars / 4 over content and tool calls)."""
+    return sum(4 + (len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or ""))) // 4
+               for m in messages)
+
+
+@pytest.fixture
+def host_estimator(monkeypatch):
+    module = types.ModuleType("agent.model_metadata")
+    module.estimate_messages_tokens_rough = _host_rough
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", module)
+    return _host_rough
+
+
+def _long_view(turns=24) -> list[dict]:
+    """A system prompt and ``turns`` stored turns (every third with a tool call): ~2x the window."""
+    rows = [row for i in range(turns) for row in _turn(f"L{i}", 10.0 * i, tool=i % 3 == 0)]
+    return [{"role": "system", "content": "system prompt"}, *rows]
+
+
+def _assert_fitted(engine, view, result, host) -> None:
+    """(e): the fitted list is under target by the host estimator, starts at a user turn after the
+    system slot, carries the notice there (never as a row) and raised exactly one warning."""
+    assert host(view) > TARGET and host(result) <= TARGET, (host(view), host(result))
+    assert result[0]["role"] == "system" and NOTICE in result[0]["content"]
+    assert result[1]["role"] == "user" and not any(NOTICE in str(m.get("content")) for m in result[1:])
+    assert [m for m in result[1:]] == view[-len(result) + 1:]  # the newest whole turns, unchanged
+    first = engine.get_automatic_compaction_status_message(phase="compress", default_message="Compacting")
+    second = engine.get_automatic_compaction_status_message(phase="compress", default_message="Compacting")
+    assert first and "LCM" in first and second is None and engine.emit_automatic_compaction_status is False
+
+
+def test_e_survival_fit_after_an_injected_publication_conflict(tmp_path, summaries, host_estimator, caplog):
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _long_view()
+    try:
+        engine.ingest(view)
+
+        def conflict(*args, **kwargs):
+            raise LifecyclePublicationConflictError("injected conflict (ids only)")
+
+        engine._lifecycle.stage_compaction_publication = conflict
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            result = engine.compress(view, current_tokens=host_estimator(view))
+        assert engine._last_compression_status == "error"
+        _assert_fitted(engine, view, result, host_estimator)
+        assert sum("LCM survival fit applied" in r.getMessage() for r in caplog.records) == 1
+        assert "publication_invariant_conflict" in caplog.text
+        counter = engine._store.read_metadata_json("survival_fit:counter")
+        assert counter["count"] == 1 and counter["last_reason"] == "publication_invariant_conflict"
+    finally:
+        engine.shutdown()
+
+
+def test_e_survival_fit_after_a_sweep_deadline(tmp_path, summaries, host_estimator, monkeypatch):
+    monkeypatch.setattr(lcm_compaction, "_THRESHOLD_FULL_SWEEP_MAX_SECONDS", 0.0)
+    engine = _engine(tmp_path, context_length=WINDOW, context_threshold=0.5, threshold_full_sweep_enabled=True)
+    view = _long_view()
+    try:
+        engine.ingest(view)
+        result = engine.compress(view, current_tokens=host_estimator(view))
+        _assert_fitted(engine, view, result, host_estimator)
+    finally:
+        engine.shutdown()
+
+
+def test_e_survival_fit_after_a_lock_after_commit(tmp_path, summaries, host_estimator, monkeypatch):
+    """One leaf publishes, condensation then hits a SQLite lock: the committed list is fitted."""
+    engine = _engine(tmp_path, context_length=WINDOW, fresh_tail_count=60)  # a long retained tail
+    view = _long_view()
+    try:
+        engine.ingest(view)
+
+        def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine, "_maybe_condense", locked)
+        result = engine.compress(view, current_tokens=100)  # below the list: one bounded leaf, no overflow
+        assert _frontier(engine) > 0 and engine._last_compression_noop_reason == \
+            "summary publication blocked by SQLite lock"
+        assert host_estimator(result) <= TARGET and NOTICE in result[0]["content"]
+        assert result[1]["role"] == "user" and not any(NOTICE in str(m.get("content")) for m in result[1:])
+        assert engine.get_automatic_compaction_status_message(phase="compress", default_message="x")
+    finally:
+        engine.shutdown()
+
+
+def test_f_newest_turn_over_budget_is_projected(tmp_path, summaries, host_estimator):
+    """The newest user turn alone is over the window: a bounded projection, never empty, raw rows intact."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    call = {"id": "call_big", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    big = {"role": "tool", "tool_call_id": "call_big", "content": "row " * 12_000}
+    view = [*_long_view(4), {"role": "user", "content": "[N] newest", "timestamp": 99.0},
+            {"role": "assistant", "content": "", "tool_calls": [call]}, big]
+    try:
+        engine.ingest(view)
+        engine._lifecycle.stage_compaction_publication = lambda *a, **k: (_ for _ in ()).throw(
+            LifecyclePublicationConflictError("injected"))
+        result = engine.compress(view, current_tokens=host_estimator(view))
+        assert result and host_estimator(result) <= TARGET, host_estimator(result)
+        assert result[1]["content"] == "[N] newest" and result[-1]["role"] == "tool"
+        assert result[-1]["content"] != big["content"] and result[-1]["tool_call_id"] == "call_big"
+        stored = [r for r in _rows(engine) if r["role"] == "tool" and r["content"] == big["content"]]
+        assert len(stored) == 1  # the raw row stays stored verbatim
+    finally:
+        engine.shutdown()
+
+
+def test_g_fitted_list_re_ingests_without_new_rows(tmp_path, summaries, host_estimator):
+    """The host adopts the fitted list, archives the session, and a cold process resumes it: only a
+    genuinely new turn adds rows."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _long_view()
+    try:
+        engine.ingest(view)
+        engine._lifecycle.stage_compaction_publication = lambda *a, **k: (_ for _ in ()).throw(
+            LifecyclePublicationConflictError("injected"))
+        fitted = engine.compress(view, current_tokens=host_estimator(view))
+        assert len(fitted) < len(view)
+        before = len(_rows(engine))
+        engine.on_session_end("S", fitted)
+        assert len(_rows(engine)) == before
+    finally:
+        engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        new = _turn("NEW", 500.0)
+        cold.ingest([*fitted, *new])
+        added = _rows(cold)[before:]
+        assert len(added) == len(new), [(r["role"], r["store_id"]) for r in added]
+    finally:
+        cold.shutdown()
+
+
+def test_h_survival_fit_off_leaves_the_result_unchanged(tmp_path, summaries, host_estimator):
+    engine = _engine(tmp_path, context_length=WINDOW, survival_fit=False)
+    view = _long_view()
+    try:
+        engine.ingest(view)
+        engine._lifecycle.stage_compaction_publication = lambda *a, **k: (_ for _ in ()).throw(
+            LifecyclePublicationConflictError("injected"))
+        result = engine.compress(view, current_tokens=host_estimator(view))
+        assert result == view and engine.emit_automatic_compaction_status is False
+        assert engine._store.read_metadata_json("survival_fit:counter") is None
+    finally:
+        engine.shutdown()
+
+
 # -- (h) flag off: unchanged --------------------------------------------------------------------------
 
 def test_h_identity_anchor_off_leaves_the_eva_shape_unchanged(tmp_path, summaries, monkeypatch):
     """With LCM_IDENTITY_ANCHOR=false no row is read from the store: the eva shape fails open as before."""
     view = _eva_store(tmp_path)
     monkeypatch.setenv("LCM_IDENTITY_ANCHOR", "false")
-    monkeypatch.setenv("LCM_SURVIVAL_FIT", "false")
-    engine = _engine(tmp_path)
+    engine = _engine(tmp_path, survival_fit=False)
     try:
         result = engine.compress(view)
         assert engine._last_compression_status == "error"

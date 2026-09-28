@@ -138,6 +138,7 @@ from .reconcile import _has_lossy_redacted_identity, _merge_append_cut, _proof_u
 from .compaction import CompactionMixin
 from .identity_anchor import IdentityAnchorMixin, _raw_remainder, identity_anchor_enabled
 from .store_complete import StoreCompleteMixin
+from .survival_fit import SurvivalFitMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .prefix_matching import PrefixMatchingMixin
@@ -399,6 +400,7 @@ class LCMEngine(
     ReconcileMixin,
     IdentityAnchorMixin,
     StoreCompleteMixin,
+    SurvivalFitMixin,
     AuxiliarySessionMixin,
     PlaceholderLedgerMixin,
     BypassMixin,
@@ -596,6 +598,11 @@ class LCMEngine(
         # silent maintenance. Manual /lcm diagnostics and warning/error paths
         # remain explicit.
         self.emit_automatic_compaction_status = False
+        # #582 survival fit: the failure reason of this compress(), the last fit, and the one-shot warning.
+        self._survival_fit_reason: Optional[str] = None
+        self._last_survival_fit: Optional[Dict[str, Any]] = None
+        self._survival_fit_pending_warning: Optional[str] = None
+        self._survival_fit_warned: set = set()
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
@@ -4443,6 +4450,7 @@ class LCMEngine(
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "last_survival_fit": dict(self._last_survival_fit) if self._last_survival_fit else None,
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
@@ -5066,7 +5074,7 @@ class LCMEngine(
             return (
                 "[Note: This conversation uses Lossless Context Management (LCM)." in content
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
-            )
+            ) or "\n\n[LCM survival fit: " in content  # #582: the fit's notice in the system slot
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
         if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):

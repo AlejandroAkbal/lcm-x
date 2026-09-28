@@ -60,6 +60,7 @@ from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec, delete_message_relations
+from .survival_fit import SURVIVAL_FIT_COUNTER_KEY
 from .chunking import (
     VALID_CONTENT_POLICIES,
     chunk_message,
@@ -1698,6 +1699,15 @@ def _doctor_text(engine) -> str:
     if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
         lifecycle_status = "fail" if lifecycle_stats.get("error") else "warn"
         triage_checks.append({"check": "lifecycle_fragmentation", "status": lifecycle_status, "detail": lifecycle_stats})
+    try:  # #582: the survival fit kept a session alive by dropping stored turns from live context
+        survival_fit = engine._store.read_metadata_json(SURVIVAL_FIT_COUNTER_KEY)
+    except Exception:
+        survival_fit = None
+    survival_fit = survival_fit if isinstance(survival_fit, dict) else {}
+    if int(survival_fit.get("count") or 0):
+        observations.append(f"survival_fit: applied {int(survival_fit['count'])} time(s); last reason "
+                            f"{survival_fit.get('last_reason') or '(unknown)'}")
+        triage_checks.append({"check": "survival_fit", "status": "warn", "detail": survival_fit})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 
     doctor_status = "issues-found" if integrity != "ok" or issues else (
@@ -1754,6 +1764,7 @@ def _doctor_text(engine) -> str:
         f"externalized_payload_files_unreferenced: {externalized_integrity['externalized_payload_files_unreferenced']}",
         f"missing_externalized_payload_refs: {externalized_integrity['missing_externalized_payload_refs']}",
         f"unreferenced_externalized_payload_files: {externalized_integrity['unreferenced_externalized_payload_files']}",
+        f"survival_fit_count: {int(survival_fit.get('count') or 0)}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")
