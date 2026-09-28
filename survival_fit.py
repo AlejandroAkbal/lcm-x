@@ -266,12 +266,12 @@ class SurvivalFitMixin:
         return None
 
     def _survival_stamp_matches(self, message: Dict[str, Any], row: Dict[str, Any]) -> bool:
-        """No host stamp, or the source row's own: its observed_at or a recorded alias stamp (normalized as
-        the identity anchor normalizes them)."""
+        """No host stamp; or the source row's own: its observed_at or a recorded alias stamp (normalized as
+        the identity anchor normalizes them); or any stamp when the source was stored unstamped (R6-1: a
+        host that re-inserts the copy with a fresh stamp, Hermes 0.21.2; the byte rule still decides)."""
         stamp = _normalize_observed_at(message.get("timestamp"))
-        if stamp is None:
-            return True
-        if _normalize_observed_at(row.get("observed_at")) == stamp:
+        observed = _normalize_observed_at(row.get("observed_at"))
+        if stamp is None or observed is None or observed == stamp:
             return True
         try:
             aliases = self._store.get_message_relations([int(row["store_id"])], "alt_stamp")

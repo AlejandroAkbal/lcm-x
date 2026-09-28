@@ -872,6 +872,28 @@ def test_r5_a_fresh_stamped_copy_of_a_projection_is_a_new_occurrence(tmp_path, s
         engine.shutdown()
 
 
+def test_r6_1_a_restamped_copy_of_an_unstamped_sources_projection_is_that_row(tmp_path, summaries, host_estimator):
+    """R6-1 (Hermes 0.21.2): the projected tool row's source was stored unstamped; the host re-inserts the
+    projection copy with a FRESH stamp. A cold resume still recognises it (byte equality holds): 0 new rows.
+    (A stamped source with another stamp stays a new occurrence: R5-1's test.)"""
+    engine, fitted, projected = _projected_tool_fit(tmp_path, host_estimator)
+    source = [r for r in _rows(engine) if r["role"] == "tool"][-1]  # call_big's result: stored unstamped
+    assert source["observed_at"] is None
+    before = len(_rows(engine))
+    engine.on_session_end("S", fitted)
+    engine.shutdown()
+    cold = _engine(tmp_path, context_length=WINDOW)
+    try:
+        restamped = [{**m, "timestamp": 500.0} if m is projected else m for m in fitted]
+        full = [*restamped, *_turn("NEW", 900.0)]
+        cold.ingest(full)
+        assert [r["content"] for r in _rows(cold)[before:]] == [m["content"] for m in full[len(restamped):]]
+        assert cold._get_store_id_map_for_messages(full).get(id(full[fitted.index(projected)])) == \
+            int(source["store_id"])
+    finally:
+        cold.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"
