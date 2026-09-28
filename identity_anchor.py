@@ -268,17 +268,15 @@ class IdentityAnchorMixin:
         consumed: set[int] = set()
         matched: dict[int, list] = {}
         # R1: per key, the host view's occurrences consume the stored ones in order; the rest are new.
-        for idx in sorted(i for i, stamp in stamps.items() if stamp in wanted):
-            identity = identity_at(idx)
-            if identity is None:
-                continue
-            row = next((r for r, forms in by_stamp[stamps[idx]]
-                        if int(r["store_id"]) not in consumed and identity in forms), None)
-            if row is not None:
-                consumed.add(int(row["store_id"]))
-                matched[idx] = [row]
-                if idx >= start:
-                    plan["replayed"].add(idx)
+        forms_of = {id(r): forms for pairs in by_stamp.values() for r, forms in pairs}
+        occurrences = [(idx, (stamps[idx], identity_at(idx))) for idx in sorted(stamps)
+                       if stamps[idx] in wanted and identity_at(idx) is not None]
+        for store_id, idx in _match_occurrences(
+                rows, lambda r: {(float(r["observed_at"]), form) for form in forms_of[id(r)]}, occurrences).items():
+            consumed.add(store_id)
+            matched[idx] = [next(r for r, _forms in by_stamp[stamps[idx]] if int(r["store_id"]) == store_id)]
+            if idx >= start:
+                plan["replayed"].add(idx)
         for idx in range(start, n):
             identity = identity_at(idx) if idx in stamps and idx not in plan["replayed"] else None
             if identity is not None and identity[0] == "user":
@@ -389,13 +387,10 @@ class IdentityAnchorMixin:
         # B-ID-1: a row the host view shows as its own occurrence is reserved by it, never a constituent.
         # A stamped row answers only its own stamp, a NULL-stamped (legacy) row only an unstamped occurrence.
         pool, reserved = self._identity_anchor_pool(donors, consumed), set()
-        view = shown(idx) if pool else Counter()
-        for row in pool:
-            row_stamp = _normalize_observed_at(row.get("observed_at"))
-            form = next((form for form in self._stored_row_forms(row) if view[(row_stamp, form)] > 0), None)
-            if form is not None:
-                view[(row_stamp, form)] -= 1
-                reserved.add(int(row["store_id"]))
+        if pool:
+            reserved = set(_match_occurrences(pool, lambda row: {(_normalize_observed_at(row.get("observed_at")), form)
+                                                                for form in self._stored_row_forms(row)},
+                                              list(enumerate(shown(idx).elements()))))
         pool = [row for row in pool if int(row["store_id"]) not in reserved]
         donors = [row for row in donors if int(row["store_id"]) not in reserved]
         texts = {self._identity_text(row) for row in pool}
@@ -633,6 +628,7 @@ class IdentityAnchorMixin:
         claims: dict[int, list] = {}
         self._identity_anchor_text_memo = {}
         scope = [str(self._session_id), *self._identity_anchor_chain()]
+        keyed = self._identity_anchor_key_occurrences([m for m in chunk if id(m) not in full_map], mapped, carry)
         for message in chunk:
             stamp = _normalize_observed_at(message.get("timestamp"))
             if id(message) in full_map:
@@ -647,8 +643,8 @@ class IdentityAnchorMixin:
                 continue
             # #563: a live row the ordered mapper left unmapped (the host put it after a row stored
             # later) claims its R1-key occurrence; its own bytes are this input row.
-            store_id = self._identity_anchor_key_occurrence(message, mapped | claimed, carry)
-            if store_id is not None:
+            store_id = keyed.get(id(message))
+            if store_id is not None and store_id not in claimed:
                 claimed.add(store_id)
                 claims[id(message)] = [store_id]
                 continue
@@ -686,12 +682,6 @@ class IdentityAnchorMixin:
             shown = Counter(self._message_replay_identity(message, strip_carrier=False)  # a retained anchor, ...
                             for message in view if id(message) not in full_map)
 
-            def unshown(row) -> bool:
-                form = next((form for form in self._stored_row_forms(row) if shown[form] > 0), None)
-                if form is not None:
-                    shown[form] -= 1
-                return form is None
-
             rows = self._store.get_range(str(self._session_id), start_id=frontier + 1, end_id=last - 1, limit=100000)
             for source, start, end in carry:
                 if end > frontier and start < last:
@@ -700,8 +690,9 @@ class IdentityAnchorMixin:
                     if row.get("role") == "user" and owned(row)
                     and row.get("observed_at") is not None
                     and int(row["store_id"]) not in mapped | claimed
-                    and not self._matches_ignore_message_patterns(row, stored_row=True)
-                    and unshown(row)]
+                    and not self._matches_ignore_message_patterns(row, stored_row=True)]
+            shown_rows = _match_occurrences(gaps, self._stored_row_forms, list(enumerate(shown.elements())))
+            gaps = [row for row in gaps if int(row["store_id"]) not in shown_rows]
         if not gaps and not claims:
             return None
         out, pending = [], list(gaps)
@@ -717,22 +708,26 @@ class IdentityAnchorMixin:
         store_id, owner = int(row["store_id"]), str(row.get("session_id") or "")
         return owner == self._session_id or any(owner == s and a < store_id <= b for s, a, b in carry)
 
-    def _identity_anchor_key_occurrence(self, message, taken, carry) -> Optional[int]:
-        """#563: the owned occurrence above the frontier, in store order, that carries ``message``'s R1
-        key (host stamp + full payload identity) and that is not ``taken`` (mapped or claimed)."""
-        stamp = _normalize_observed_at(message.get("timestamp"))
-        identity = self._message_replay_identity(message, strip_carrier=False) if stamp is not None else None
-        if identity is None or _lossy(identity):
-            return None
+    def _identity_anchor_key_occurrences(self, messages, taken, carry) -> dict:
+        """#563: ``{id(message): store_id}``: each message's owned occurrence above the frontier that carries
+        its R1 key (host stamp + full payload identity) and is not ``taken`` (mapped or claimed), in view and
+        store order, as one matching (a stored row answers its exact and its host-rewrite form)."""
+        occurrences = []
+        for message in messages:
+            stamp = _normalize_observed_at(message.get("timestamp"))
+            identity = self._message_replay_identity(message, strip_carrier=False) if stamp is not None else None
+            if identity is not None and not _lossy(identity):
+                occurrences.append((id(message), (stamp, identity)))
+        if not occurrences:
+            return {}
         frontier = int(self._last_compacted_store_id or 0)
-        for row in self._store.find_rows_by_observed_at(
-            str(self._conversation_id or ""), [str(self._session_id), *self._identity_anchor_chain()], [stamp]
-        ):
-            store_id = int(row["store_id"])
-            if (store_id > frontier and store_id not in taken and self._identity_anchor_owned(row, carry)
-                    and identity in self._stored_row_forms(row)):
-                return store_id
-        return None
+        rows = [row for row in self._store.find_rows_by_observed_at(
+            str(self._conversation_id or ""), [str(self._session_id), *self._identity_anchor_chain()],
+            sorted({key[0] for _o, key in occurrences}))
+            if int(row["store_id"]) > frontier and int(row["store_id"]) not in taken and self._identity_anchor_owned(row, carry)]
+        found = _match_occurrences(
+            rows, lambda row: {(float(row["observed_at"]), form) for form in self._stored_row_forms(row)}, occurrences)
+        return {occurrence: store_id for store_id, occurrence in found.items()}
 
     def _identity_anchor_covered_view(self, message, full_map) -> bool:
         """#563: a live user row that no store row maps and whose text is exactly a recorded composite
@@ -775,11 +770,9 @@ class IdentityAnchorMixin:
             end += len(self._select_oldest_leaf_chunk(list(candidates[end:]), 1))
         taken, carry = set(full_map.values()), self._load_compression_carry_ranges()
         top = max((full_map[id(message)] for message in candidates[:end] if id(message) in full_map), default=0)
+        keyed = self._identity_anchor_key_occurrences([m for m in candidates[end:] if id(m) not in full_map], taken, carry)
         while end < len(candidates):
-            store_id = full_map.get(id(candidates[end]))
-            if store_id is None:
-                store_id = self._identity_anchor_key_occurrence(candidates[end], taken, carry)
-                taken.add(store_id or 0)
+            store_id = full_map.get(id(candidates[end]), keyed.get(id(candidates[end])))
             if store_id is None or store_id >= top:
                 break
             end += 1
@@ -863,6 +856,46 @@ class IdentityAnchorMixin:
             if identity is not None and identity[0] == "user":
                 recent.append((self._session_id, identity, int(store_id), _normalize_observed_at(message.get("timestamp"))))
         self._identity_anchor_recent = recent[-_RECENT_CAP:]
+
+
+def _match_occurrences(rows, keys_of, occurrences) -> dict:
+    """``{store_id: occurrence}``: a maximum matching of stored ``rows`` (store order; a row listed twice, e.g.
+    under an alternate stamp, is one row) to view ``occurrences`` ``[(occurrence, key)]`` (view order) by any key
+    of ``keys_of(row)``, each side once. A row takes its first free occurrence, else an augmenting path frees
+    one: a row with one admissible key gets what an in-order walk gave it. Deterministic."""
+    slots: dict = defaultdict(list)
+    for occurrence, key in occurrences:
+        slots[key].append(occurrence)
+    merged: dict = {}
+    for row in rows:
+        merged.setdefault(int(row["store_id"]), set()).update(keys_of(row))
+    ids = list(merged)
+    options = [[o for key in sorted(merged[store_id], key=repr) for o in slots.get(key, ())] for store_id in ids]
+    owner: dict = {}  # occurrence -> row index
+    held: dict = {}  # row index -> occurrence
+    for i in range(len(ids)):
+        parent: dict = {}
+        level, found = [i], None
+        while found is None and level:  # BFS over alternating paths; level 0 is row i's own options, in order
+            following = []
+            for r in level:
+                for o in options[r]:
+                    if o in parent:
+                        continue
+                    parent[o] = r
+                    if o not in owner:
+                        found = o
+                        break
+                    following.append(owner[o])
+                if found is not None:
+                    break
+            level = following
+        while found is not None:  # flip the path back to row i
+            r = parent[found]
+            previous = held.get(r)
+            owner[found], held[r] = r, found
+            found = previous
+    return {ids[r]: o for o, r in owner.items()}
 
 
 def _composite_relation(group, stamp) -> list:
