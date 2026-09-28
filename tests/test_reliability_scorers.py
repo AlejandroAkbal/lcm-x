@@ -168,6 +168,14 @@ def test_native_on_off_counts_b3_b8_from_the_candidate_first_publication():
     assert bars.counted(cell, [old, before, first], "publication_invariant_conflict") == 1
     assert bars.counted(cell, [old, before, first, first], "survival_fit") == 2
     assert bars.counted({}, [old, before, first], "publication_invariant_conflict") == 10
+    # the candidate never published: all its lines count (a never-publishing candidate is not a B3/B8 PASS)
+    assert bars.counted(cell, [old, before, before], "publication_invariant_conflict") == 4
+    # R3 F4 addendum: phases that do not record the post-publication counts are an ERROR, never 0
+    stale = {"exit": "done", "log_counts": {"publication_invariant_conflict": 3}}
+    with pytest.raises(ValueError, match="log_counts_after_commit"):
+        bars.counted(cell, [old, stale], "publication_invariant_conflict")
+    with pytest.raises(ValueError):
+        bars.counted(cell, [dict(old, exit="done")], "survival_fit")  # no candidate phase at all
     assert all(c["faults"] == [{"kind": "plugin_switch", "turn": 31}] and c["native_recovery"]
                for c in cells.select("native-on-off/*"))
 
@@ -184,7 +192,7 @@ def test_r3_probe_phase_json_carries_post_publication_counts_so_b3_b8_fail(tmp_p
     source = inspect.getsource(probe.main)
     assert source.index("phase_log_fields(") < source.index('phase-{phase}.json')
     cell = {"from_ref": "v0.24.3", "bars": ["B3", "B4", "B8"]}
-    make(tmp_path, rows=clean_rows(), events=clean_events(), phase={"exit": "plugin_switch"}, **cell)
+    make(tmp_path, rows=clean_rows(), events=clean_events(), phase={"exit": "plugin_switch"}, bars=cell["bars"])
     (tmp_path / "cell" / "phase-B.json").write_text(json.dumps(
         {"phase": "B", "exit": "done", "counters": {"failed": []}, "final_check": {"published": True}, **fields}))
     out = bars.score({"id": "t", "tool_plan": [], "native_recovery": False, "min_compactions": 2,

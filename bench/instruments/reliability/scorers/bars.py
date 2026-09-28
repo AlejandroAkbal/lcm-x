@@ -27,11 +27,17 @@ ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8")
 
 def counted(cell: dict, phases: list[dict], key: str) -> int:
     """A log count over the cell's phases; a native-on-off cell (``from_ref``) counts only the candidate's
-    phases, from its first publication (the older ref's native-ON store may conflict until then)."""
+    phases, from its first publication (the older ref's native-ON store may conflict until then), and all
+    of them when the candidate never published. A candidate phase list that does not record the
+    post-publication counts is a harness error (raises), never a count of 0."""
     if not cell.get("from_ref"):
         return sum(p.get("log_counts", {}).get(key, 0) for p in phases)
     post = phases[next((i + 1 for i, p in enumerate(phases) if p.get("exit") == "plugin_switch"), len(phases)):]
-    first = next((i for i, p in enumerate(post) if p.get("log_counts_after_commit") is not None), len(post))
+    if not any("log_counts_after_commit" in p for p in post):
+        raise ValueError(f"{key}: no candidate phase records log_counts_after_commit (probe output predates it)")
+    first = next((i for i, p in enumerate(post) if p.get("log_counts_after_commit") is not None), None)
+    if first is None:  # the candidate never published: nothing before a publication to forgive
+        return sum(p.get("log_counts", {}).get(key, 0) for p in post)
     return sum((p["log_counts_after_commit"] if i == first else p.get("log_counts", {})).get(key, 0)
                for i, p in enumerate(post) if i >= first)
 
