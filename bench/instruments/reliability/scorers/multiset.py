@@ -8,7 +8,9 @@ normalisation is applied: neither host nor plugin performs one on message conten
 stored row count must equal the expected (transcript) count: fewer = loss (deficit), more = duplicates
 (surplus). Repeated identical items are fine as long as the multiplicity matches. A stored-only key is
 surplus and fails; a split assistant answer (one reply stored as two adjacent rows) is reported apart, as in
-the source, and fails too (its fragments are stored-only keys).
+the source, and fails too (its fragments are stored-only keys). ``host`` (D-A, scorers/host_parity.py) licenses a
+user-row surplus only up to what the host's own state.db holds in the lineage; ``None`` (no host evidence) licenses
+nothing.
 """
 from __future__ import annotations
 
@@ -24,8 +26,18 @@ def h(text: str) -> str:
     return hashlib.sha256(norm(text).encode()).hexdigest()
 
 
-def score(expected: list[tuple[str, str]], stored_rows: list[tuple]) -> dict:
-    """``expected``: (role, text) items; ``stored_rows``: (store_id, session_id, role, content)."""
+def licence(key: tuple, surplus: int, expected: int, host: dict | None, store_ids: list) -> dict | None:
+    """D-A: licensed = min(surplus, host_count(k) - expected(k)), floored at 0; user rows only, never a deficit."""
+    held = (host or {}).get(key) if key[0] == "user" else None
+    n = min(surplus, held["n"] - expected) if held else 0
+    return {"role": key[0], "sha256": key[1], "expected": expected, "stored": expected + surplus, "host": held["n"],
+            "licensed": n, "store_ids": store_ids[:10], "host_row_ids": held["ids"][:10], "tags": held.get("tags", [])} \
+        if n > 0 else None
+
+
+def score(expected: list[tuple[str, str]], stored_rows: list[tuple], host: dict | None = None) -> dict:
+    """``expected``: (role, text) items; ``stored_rows``: (store_id, session_id, role, content); ``host``: the
+    lineage's host occurrences (key -> {"n", "ids"}), or None."""
     stored, by_session = defaultdict(list), defaultdict(list)
     for sid, session, role, content in stored_rows:
         if role not in ("user", "assistant") or not norm(content or ""):
@@ -35,7 +47,7 @@ def score(expected: list[tuple[str, str]], stored_rows: list[tuple]) -> dict:
             by_session[session].append((sid, content or ""))
     want = Counter((role, h(text)) for role, text in expected if norm(text))
     texts = {(role, h(text)): text for role, text in expected}
-    missing, duplicated, split = [], [], []
+    missing, duplicated, split, licensed = [], [], [], []
     for key, n in want.items():
         have = len(stored.get(key, []))
         entry = {"role": key[0], "expected": n, "stored": have, "store_ids": stored.get(key, [])[:20],
@@ -52,8 +64,18 @@ def score(expected: list[tuple[str, str]], stored_rows: list[tuple]) -> dict:
                     continue
             missing.append(entry)
         elif have > n:
-            duplicated.append(entry)
-    extra = [{"role": k[0], "copies": len(v), "store_ids": v[:6]} for k, v in stored.items() if k not in want]
+            if lic := licence(key, have - n, n, host, stored[key]):
+                licensed.append(lic)
+                entry["licensed"] = lic["licensed"]
+            if have - n > entry.get("licensed", 0):
+                duplicated.append(entry)
+    extra = []
+    for k, v in stored.items():
+        if k not in want:
+            lic = licence(k, len(v), 0, host, v)
+            licensed += [lic] if lic else []
+            if len(v) > (lic or {}).get("licensed", 0):
+                extra.append({"role": k[0], "copies": len(v) - (lic or {}).get("licensed", 0), "store_ids": v[:6]})
     # Every stored-only key and every split reply is surplus: no host transform licenses them.
     return {
         "instrument": "multiset-v1",
@@ -63,7 +85,8 @@ def score(expected: list[tuple[str, str]], stored_rows: list[tuple]) -> dict:
         "missing_keys": len(missing),
         "deficit_rows": sum(e["expected"] - e["stored"] for e in missing),
         "duplicated_keys": len(duplicated),
-        "surplus_rows": sum(e["stored"] - e["expected"] for e in duplicated) + sum(e["copies"] for e in extra),
+        "surplus_rows": sum(e["stored"] - e["expected"] - e.get("licensed", 0) for e in duplicated) + sum(e["copies"] for e in extra),
+        "host_parity_licensed": licensed,
         "missing": missing[:40],
         "duplicated": duplicated[:40],
         "split_assistant_turns": split,

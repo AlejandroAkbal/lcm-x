@@ -65,6 +65,14 @@ the host reported `interrupted`. Any other assistant row is surplus.
   stored-only key and every split reply is surplus and fails. Expected =
   what the host held per attempt after its ACP strip and consecutive-user merge (a crashed prompt folded
   into the next composite counts once).
+- **Host-parity licence (D-A, DESIGN-436 REVISION 2 P-HOST; `scorers/host_parity.py`).** A stored USER-row surplus
+  of a B2 key (or a B1 user tag) in lineage L is licensed only up to what the cell's own host state.db holds in L:
+  `min(surplus, host_count - expected)`, floored at 0. host_count is what one host view holds: the most ACTIVE rows
+  one session of L holds at once, else 1 if L holds it only on inactive rows; rotation copies, in-place generation
+  copies and H1's fresh-stamp re-issues never add up. Deficits, assistant and tool rows are never licensed. No
+  readable state.db, no licence (`unavailable` records why). Every licence is reported: `host_parity_licensed`
+  under `numbers.B1`/`numbers.B2` (count + up to 10 records: LCM store ids, host row ids, content sha256, tags), the
+  MATRIX `host-dup` column and "PASS with host-parity licences" section, and the ISSUE-MAP licence list.
 - **B3** zero `publication_invariant_conflict` log lines across phases.
 - **B4** no failed turn, and the final forced compaction through the host's ACP `/compress` entry point
   (`compress_now`, or `_compress_context(force=True)` on hosts without it, selected once before invoking;
@@ -87,6 +95,11 @@ the host reported `interrupted`. Any other assistant row is surplus.
   UNSUPPORTED.
 - **B7** (native cells) no `native recovery did not produce a usable summary`, no host
   `summary_generation_aborted`, at most one native attempt per turn.
+
+`publication-failure/rotation-child` (G-REL-1, #541's bar) injects ONE publication failure, on the first rotation-child
+publication; the next child compaction must commit. `publication-failure/rotation-child-persistent` fails every
+rotation-child publication: a data cell (no target, `ci.NON_GATE`) for the degraded mode where no child compaction can
+ever publish, a product question outside stabilization.
 
 Native cells: `native-short-prefix/*` are rejected before the host summary call (`prefix_too_short`) and are
 data; `native-long-prefix/*` (default tuning, 1M window) run the host ContextCompressor summary (stubbed aux
