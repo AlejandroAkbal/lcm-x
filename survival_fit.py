@@ -38,6 +38,8 @@ _NOTICE = ("[LCM survival fit: {n} earlier messages (store ids {first}..{last}) 
 _WARNING = ("LCM could not summarise part of this conversation in time. To keep the session alive, {n} older "
             "messages left live context; they stay stored verbatim and searchable (lcm_grep, lcm_load_session). "
             "/lcm doctor reports it.")
+_NOTICE_RE = re.compile(r"(?:\n\n)?\[LCM survival fit: \d+ earlier messages \(store ids [^()\]]*\) are stored verbatim "
+                        r"but not in live context; lcm_grep / lcm_load_session reach them\.\]")
 _PROJECTED = ("[LCM survival fit: this {role} message ({tokens} tokens) is stored verbatim as store id {store_id}; "
               "lcm_expand / lcm_grep reach the full text. (projection {head}/{tail})]")
 _PROJECTED_RE = re.compile(r"\[LCM survival fit: this ([a-z_]+) message \((\d+) tokens\) is stored verbatim as store id "
@@ -109,7 +111,10 @@ class SurvivalFitMixin:
         store_ids = self._get_store_id_map_for_messages(body)
         # The ingest cursor indexes this list with nothing to reconcile: every row of it is persisted,
         # including rows the identity mapper cannot pin to one stored copy (duplicates, stubbed tools).
-        persisted = not self._ingest_cursor_needs_reconcile and self._ingest_cursor == len(result)
+        # After an exception the cursor proves nothing (this call's writes may have failed or been rolled
+        # back): durability is then the store-id map and DAG-verified scaffold only.
+        persisted = (not after_exception and not self._ingest_cursor_needs_reconcile
+                     and self._ingest_cursor == len(result))
 
         def durable(message) -> bool:  # unproven rows: only DAG-verified scaffold, never a phrase match
             return persisted or id(message) in store_ids or self._is_verified_replay_scaffold_message(message)
@@ -145,14 +150,21 @@ class SurvivalFitMixin:
             self._ingest_cursor, self._ingest_cursor_needs_reconcile = 0, True
         else:
             self._ingest_cursor = len(fitted)
+        if after > budget:  # still the best list available: returned, but never reported as within budget
+            logger.warning("LCM survival fit could not reach budget (after=%d, budget=%d, reason=%s)", after, budget, reason)
         self._survival_record(reason, count, ids, before, after, budget, projected, notice)
         return fitted
 
     @staticmethod
     def _survival_with_notice(content: Any, notice: str) -> Any:
+        """The system slot with ``notice``, replacing an earlier fit's notice (one notice, the newest)."""
         if isinstance(content, list):
-            return list(content) + [{"type": "text", "text": notice}]
-        return f"{normalize_content_value(content) or ''}\n\n{notice}"
+            kept = [part for part in content if not (isinstance(part, dict) and part.get("type") == "text"
+                                                     and _NOTICE_RE.fullmatch(str(part.get("text") or "")))]
+            return kept + [{"type": "text", "text": notice}]
+        text = _NOTICE_RE.sub("", "\n\n" + (normalize_content_value(content) or ""))[2:] \
+            if content is not None else ""
+        return f"{text}\n\n{notice}"
 
     def _survival_projection(self, turn: List[Dict[str, Any]], store_ids, limit: int) -> List[Dict[str, Any]]:
         """The newest turn, its largest stored rows projected until it fits (tool outputs first, then
@@ -251,12 +263,15 @@ class SurvivalFitMixin:
             reason, self._conversation_id or self._session_id, count, ids[0] if ids else "-", ids[-1] if ids else "-",
             projected, before, after, budget,
         )
-        self._last_survival_fit = {"reason": reason, "dropped_rows": count, "notice": notice, "at": time.time()}
+        self._last_survival_fit = {"reason": reason, "dropped_rows": count, "notice": notice, "at": time.time(),
+                                   "reached_budget": after <= budget}
         try:
             record = self._store.read_metadata_json(SURVIVAL_FIT_COUNTER_KEY)
             record = record if isinstance(record, dict) else {}
             record = {"count": int(record.get("count") or 0) + 1, "last_reason": reason, "last_at": time.time(),
-                      "last_conversation": str(self._conversation_id or self._session_id or "")}
+                      "last_conversation": str(self._conversation_id or self._session_id or ""),
+                      "last_reached_budget": after <= budget,
+                      "unreached_budget_count": int(record.get("unreached_budget_count") or 0) + (after > budget)}
             self._store.write_metadata_json([SURVIVAL_FIT_COUNTER_KEY], json.dumps(record, sort_keys=True))
         except Exception:
             logger.debug("LCM survival-fit counter write failed", exc_info=True)

@@ -726,6 +726,77 @@ def test_r4_b_seventy_projections_then_a_cold_resume_store_no_stub(tmp_path, sum
         cold.shutdown()
 
 
+def test_r4_add_a_exception_path_never_trusts_a_stale_cursor(tmp_path, summaries, host_estimator, monkeypatch):
+    """R4 addendum (a) LOSSLESS: the host rewrites an older user row (same list length, so the cursor
+    still equals the length) and compress()'s ingest raises: the rewritten row is not stored, so the fit
+    never cuts past it, and it is stored once the store recovers."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = _long_view()
+    try:
+        engine.ingest(view)
+        index = next(i for i, m in enumerate(view) if m["role"] == "user" and i > 3)  # a stamped host row
+        rewritten = {**view[index], "content": view[index]["content"] + " (edited by the host)"}
+        view2 = [rewritten if i == index else m for i, m in enumerate(view)]
+        assert engine._ingest_cursor == len(view2) and not engine._ingest_cursor_needs_reconcile
+
+        def failing(*args, **kwargs):  # compress()'s ingest raises before it can move the cursor
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine, "_ingest_messages", failing)
+        try:
+            kept = engine.compress(view2, current_tokens=host_estimator(view2))
+        except sqlite3.OperationalError:
+            kept = view2  # compress() re-raised: the host keeps its list
+        assert any(m is rewritten for m in kept), "an unstored row left the view"
+        monkeypatch.undo()
+        engine.ingest([*kept, {"role": "assistant", "content": "answer"}])
+        assert any(r["content"] == rewritten["content"] for r in _rows(engine))
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("view_of", [_long_view, _list_system_view], ids=["str-system", "list-system"])
+def test_r4_add_b_consecutive_fits_keep_one_notice(tmp_path, summaries, host_estimator, view_of):
+    """R4 addendum (b): a second fit replaces the first fit's notice in the system slot (one notice,
+    carrying the newest counts), for string and list content."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = view_of()
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        first = engine.compress(view, current_tokens=host_estimator(view))
+        notice1 = engine._last_survival_fit["notice"]
+        view2 = [*first, *[r for i in range(24) for r in _turn(f"M{i}", 1000.0 + i, tool=i % 3 == 0)]]
+        engine.ingest(view2)
+        second = engine.compress(view2, current_tokens=host_estimator(view2))
+        notice2 = engine._last_survival_fit["notice"]
+        system = json.dumps(second[0]["content"]) if isinstance(second[0]["content"], list) else second[0]["content"]
+        assert notice2 != notice1 and system.count(NOTICE) == 1 and notice2 in system, system[-400:]
+        assert "system prompt" in system
+    finally:
+        engine.shutdown()
+
+
+def test_r4_add_c_a_fit_short_of_budget_says_so(tmp_path, summaries, host_estimator, caplog):
+    """R4 addendum (c): the newest turn is many small rows (none projectable) over the budget: the smaller
+    list is still returned, with one WARNING and reached_budget=false in the fit record and the counter."""
+    engine = _engine(tmp_path, context_length=WINDOW)
+    view = [*_long_view(), {"role": "user", "content": "[N] newest", "timestamp": 999.0},
+            *[{"role": "assistant", "content": f"part {i}" + PAD} for i in range(40)]]
+    try:
+        engine.ingest(view)
+        _conflicted(engine)
+        with caplog.at_level(logging.WARNING):
+            result = engine.compress(view, current_tokens=host_estimator(view))
+        assert len(result) < len(view) and host_estimator(result) > TARGET
+        assert engine._last_survival_fit["reached_budget"] is False
+        assert sum("could not reach budget" in r.getMessage() for r in caplog.records) == 1
+        counter = engine._store.read_metadata_json("survival_fit:counter")
+        assert counter["last_reached_budget"] is False and counter["unreached_budget_count"] == 1
+    finally:
+        engine.shutdown()
+
+
 class _Heartbeat:
     """An ignore pattern without the optional ``regex`` engine (CI does not install it)."""
     pattern = "HEARTBEAT_PING"
