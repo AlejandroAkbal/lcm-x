@@ -158,11 +158,24 @@ class SurvivalFitMixin:
                 )
                 if externalized:
                     stub = self._active_tool_stub_content(message.get("content"), externalized["placeholder"])
-            if stub is None:
-                marker = _PROJECTED.format(role=message.get("role"), tokens=tokens, store_id=store_ids.get(id(source), "(unmapped)"))
+            marker = _PROJECTED.format(role=message.get("role"), tokens=tokens, store_id=store_ids.get(id(source), "(unmapped)"))
+            if stub is None and text:
                 stub = f"{text[:1200]}\n...\n{marker}\n...\n{text[-600:]}" if len(text) > 2400 else marker
-            out[index] = {**message, "content": stub}
+            out[index] = {**message, "content": message.get("content") if stub is None else stub}
+            if message.get("tool_calls"):  # R3 F1: arguments count too; ids, names and pairing stay
+                out[index]["tool_calls"] = [self._survival_bounded_call(call, marker) for call in message["tool_calls"]]
         return out
+
+    @staticmethod
+    def _survival_bounded_call(call: Any, marker: str) -> Any:
+        """A view copy of a tool call whose arguments are over 1,200 characters: valid JSON carrying the
+        provenance notice. The stored row keeps the verbatim arguments; the call stays data."""
+        function = call.get("function") if isinstance(call, dict) else None
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+        if not isinstance(arguments, str) or len(arguments) <= 1200:
+            return call
+        notice = f"{marker} Its tool-call arguments ({len(arguments)} characters) are not in live context."
+        return {**call, "function": {**function, "arguments": json.dumps({"lcm_survival_fit": notice})}}
 
     def _survival_record(self, reason, count, ids, before, after, budget, projected, notice) -> None:
         """Loud: a WARNING line, the doctor counter (metadata only) and one user warning per conversation."""

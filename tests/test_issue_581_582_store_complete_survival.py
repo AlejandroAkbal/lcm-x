@@ -429,6 +429,34 @@ def test_f_newest_turn_over_budget_is_projected(tmp_path, summaries, host_estima
         engine.shutdown()
 
 
+def test_f_projection_bounds_huge_tool_call_arguments_in_the_view(tmp_path, summaries, host_estimator):
+    """R3 F1: the newest turn is over budget because of an assistant row's tool-call ARGUMENTS. The
+    projection bounds them in the view copy (valid JSON with the provenance notice); ids and the
+    call/result pairing stay intact; the stored row keeps its arguments verbatim."""
+    engine = _engine(tmp_path, context_length=1000)  # budget 850
+    args = json.dumps({"path": "notes.txt", "text": "arg " * 10_000})
+    call = {"id": "call_huge", "type": "function", "function": {"name": "write_file", "arguments": args}}
+    view = [{"role": "user", "content": "[N] newest", "timestamp": 99.0},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_huge", "content": "ok"}]
+    try:
+        engine.ingest(view)
+        assert host_estimator(view) > 10_000
+        engine._lifecycle.stage_compaction_publication = lambda *a, **k: (_ for _ in ()).throw(
+            LifecyclePublicationConflictError("injected"))
+        result = engine.compress(view, current_tokens=host_estimator(view))
+        assert host_estimator(result) <= 850, host_estimator(result)
+        assert [m["role"] for m in result] == ["user", "assistant", "tool"]
+        (projected,) = result[1]["tool_calls"]
+        assert projected["id"] == "call_huge" and projected["function"]["name"] == "write_file"
+        assert "LCM survival fit" in json.loads(projected["function"]["arguments"])["lcm_survival_fit"]
+        assert result[2]["tool_call_id"] == "call_huge"
+        stored = [r for r in _rows(engine) if r["role"] == "assistant" and args in str(r.get("tool_calls"))]
+        assert len(stored) == 1  # the raw row keeps its arguments
+    finally:
+        engine.shutdown()
+
+
 def test_g_fitted_list_re_ingests_without_new_rows(tmp_path, summaries, host_estimator):
     """The host adopts the fitted list, archives the session, and a cold process resumes it: only a
     genuinely new turn adds rows."""
