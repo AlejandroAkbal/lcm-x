@@ -132,6 +132,15 @@ def expected_items(atts: list[dict], notices=()) -> list[tuple[str, str]]:
     return items
 
 
+def source_ids(src) -> list:
+    """A summary node's ``source_ids`` JSON list; unparseable or non-list values are an empty source."""
+    try:
+        ids = json.loads(src) if src else []
+    except ValueError:
+        return []
+    return ids if isinstance(ids, list) else []
+
+
 def tag_counts(texts, pattern):
     counts = Counter()
     for text in texts:
@@ -162,7 +171,7 @@ def score(cell: dict, cell_dir: Path) -> dict:
                   and (b != "B5" or cell.get("min_compactions", 5) > 0)]
     failed, numbers = {}, {}
 
-    user_pat, reply_pat = r"\[([A-Z]\d\d)\] user turn", r"reply to ([A-Z]\d\d)\b"
+    user_pat, reply_pat = r"\[([A-Z]\d{2,3})\] user turn", r"reply to ([A-Z]\d{2,3})\b"
     b1, b1_tags, b1_per, b2_parts = {}, [0, 0], {}, {}
     for g, (items, rows) in per.items():
         label = "" if g == "chat" else f"{g}:"
@@ -216,11 +225,17 @@ def score(cell: dict, cell_dir: Path) -> dict:
                              f"{[c.get('turns_since_pass') for c in final.get('backlog_checks') or []]}"
     grow = summary.growth(events, sum(p.get("compactions_logged", 0) for p in phases), cell.get("min_compactions", 5))
     session_of = {r[0]: r[1] for r in full}
-    crossing = [nid for nid, sid, src in nodes  # a summary must only cover rows of its own session lineage
-                if any(group(session_of.get(i, f"missing:{i}")) != group(sid) for i in json.loads(src or "[]"))]
-    grow["cross_lineage_nodes"] = crossing[:10]
+    crossing, empty = [], []
+    for nid, sid, src in nodes:  # a summary must cover >= 1 stored row, and only rows of its own session lineage
+        ids = source_ids(src)
+        if not any(type(i) is int and i in session_of for i in ids):  # a JSON true is not store id 1
+            empty.append(nid)  # counted toward depth-0 growth, yet it summarises no stored message
+        if any(group(session_of.get(i, f"missing:{i}") if type(i) is int else f"invalid:{i}") != group(sid)
+               for i in ids):
+            crossing.append(nid)
+    grow["cross_lineage_nodes"], grow["empty_source_nodes"] = crossing[:10], empty[:10]
     numbers["B5"] = grow
-    if not grow["ok"] or crossing:
+    if not grow["ok"] or crossing or empty:
         failed["B5"] = {k: v for k, v in grow.items() if k != "depth0_sequence"} | {"depth0_tail": grow["depth0_sequence"][-8:]}
     tg = tool_groups.split_groups(db)
     hooked = all("orphan_hook" not in p for p in phases)

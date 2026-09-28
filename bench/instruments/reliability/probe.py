@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import inspect
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -274,7 +275,7 @@ def main():
     def summarise(*args, **kw):  # tag-preserving; "U05" never collides with a "[T05]" user tag
         n_summ["c"] += 1
         text = kw.get("text") if "text" in kw else (args[0] if args else "")
-        tags = sorted(set(re.findall(r"\[([A-Z]\d\d)\] user", text or "")))
+        tags = sorted(set(re.findall(r"\[([A-Z]\d{2,3})\] user", text or "")))
         return f"Stub summary #{n_summ['c']} covers " + " ".join("U" + x for x in tags) + ".\nExpand for details about: stub", 1
 
     window = int(cell["window"])
@@ -513,7 +514,7 @@ def main():
         tags = {}
         for m in msgs:
             if m.get("role") == "user" and isinstance(m.get("content"), str):
-                for x in set(re.findall(r"\[([A-Z]\d\d)\] user turn", m["content"])):
+                for x in set(re.findall(r"\[([A-Z]\d{2,3})\] user turn", m["content"])):
                     tags[x] = tags.get(x, 0) + 1
         if not idx:
             return None, False, [], tags, []
@@ -613,7 +614,19 @@ def main():
     finish("done", next_turn=None)
 
 
-LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost")
+LOCAL_HOSTS = ("::1", "localhost")
+
+
+def is_loopback(host) -> bool:
+    """Only the exact names in LOCAL_HOSTS, or an IP literal that is loopback: ``127.attacker.example`` is a name
+    the real resolver would look up, so it is not local."""
+    host = host.decode() if isinstance(host, bytes) else host
+    if str(host) in LOCAL_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(str(host)).is_loopback
+    except ValueError:
+        return False
 
 
 def guard_sockets(local_ok, on_refuse=None):
@@ -621,8 +634,7 @@ def guard_sockets(local_ok, on_refuse=None):
     literal addresses included), create_connection and name resolution. ``local_ok`` lets loopback through (the
     R2 host observer); R1's in-process probe needs no network at all. ``on_refuse(what, host, port)`` records."""
     def local(host):
-        host = host.decode() if isinstance(host, bytes) else host
-        return local_ok and (host is None or str(host) in LOCAL_HOSTS or str(host).startswith("127."))
+        return local_ok and (host is None or is_loopback(host))
 
     def refuse(what, host, port):
         if on_refuse:
