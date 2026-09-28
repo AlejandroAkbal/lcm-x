@@ -634,6 +634,7 @@ class IdentityAnchorMixin:
         claimed: set[int] = set()
         claims: dict[int, list] = {}
         shown: Optional[Counter] = None  # the view's unmapped occurrences, built once on first need
+        in_view: set[int] = set()  # id() of the view objects, built with ``shown``
         self._identity_anchor_text_memo = {}
         scope = [str(self._session_id), *self._identity_anchor_chain()]
         for message in chunk:
@@ -669,8 +670,11 @@ class IdentityAnchorMixin:
                 if shown is None:
                     shown = Counter(self._identity_anchor_view_key(m) for m in view if id(m) not in full_map)
                     shown.pop(None, None)
+                    in_view = {id(m) for m in view}
                 pool = self._identity_anchor_pool(donors, mapped)
-                own = self._identity_anchor_view_key(message)
+                # Only a view object's own occurrence is in ``shown``: a row that is not one (a stored row the
+                # #581 input carries) subtracting its key would release another view row's reservation.
+                own = self._identity_anchor_view_key(message) if id(message) in in_view else None
                 reserved = self._identity_anchor_reserved(pool, shown - Counter([own] if own else []))
                 pool = [row for row in pool if int(row["store_id"]) not in reserved]
                 donors = [row for row in donors if int(row["store_id"]) not in mapped | reserved]

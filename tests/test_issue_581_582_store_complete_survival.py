@@ -342,6 +342,34 @@ def test_r4_a_the_bind_probe_finds_legacy_ids_with_or_without_the_index(tmp_path
     conn.close()
 
 
+def test_r4i_a_stored_row_outside_the_view_never_releases_a_view_reservation(tmp_path):
+    """Integration guard (#590 form i x #581): a hidden stored composite row in the summarizer input whose
+    (stamp, form) equals an unmapped view occurrence is not that occurrence, so it never subtracts the
+    occurrence's key from the view's reservations: the stored row the view occurrence holds stays reserved."""
+    u_text, r_text = "[U] please go on" + PAD, "[R] failed turn" + PAD
+    c_text = r_text + "\n\n" + u_text
+    engine = _engine(tmp_path)
+    try:
+        engine.ingest([{"role": "user", "content": u_text, "timestamp": 10.0}])
+        engine.ingest([{"role": "user", "content": u_text, "timestamp": 10.0},
+                       {"role": "user", "content": c_text, "timestamp": 30.0}])
+        engine.ingest([{"role": "user", "content": u_text, "timestamp": 10.0},
+                       {"role": "user", "content": c_text, "timestamp": 30.0},
+                       {"role": "user", "content": r_text, "timestamp": 30.0}])
+        stored = {row["content"]: int(row["store_id"]) for row in _rows(engine)}
+        composite_row = stored[c_text]
+        shown_u = {"role": "user", "content": u_text, "timestamp": 10.0}
+        shown_c = {"role": "user", "content": c_text, "timestamp": 30.0}
+        hidden = {"role": "user", "content": c_text, "timestamp": 30.0}  # the stored composite, not a view row
+        seen = []
+        reserve = engine._identity_anchor_reserved
+        engine._identity_anchor_reserved = lambda pool, shown: seen.append(reserve(pool, shown)) or seen[-1]
+        engine._identity_anchor_summary_input([shown_c, hidden], {}, view=[shown_u, shown_c])
+        assert seen and all(composite_row in reserved for reserved in seen), (composite_row, seen)
+    finally:
+        engine.shutdown()
+
+
 def test_proof_rejects_covering_another_conversations_row(tmp_path):
     """A leaf that claims another conversation's row as coverage is still refused."""
     engine = _engine(tmp_path)
