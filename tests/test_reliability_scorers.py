@@ -157,25 +157,25 @@ def test_b8_survival_fit_is_a_normal_cell_failure_and_not_scored_on_injected_fai
     assert clean["verdict"] == "PASS" and clean["numbers"]["B8"] == {"survival_fit": 0}
 
 
-def test_native_on_off_counts_b3_b8_from_the_candidate_first_publication():
-    """native-on-off: the older ref's phase and the candidate's lines before its first publication are not
-    counted; after it, every conflict or fit is."""
+def test_native_on_off_counts_every_candidate_event_and_reports_the_pre_publication_split():
+    """native-on-off (R4 addendum d): the older ref's phase is not counted; EVERY candidate-phase conflict
+    or fit is, before its first publication too; the pre-publication share is a diagnostic only."""
     old = {"exit": "plugin_switch", "log_counts": {"publication_invariant_conflict": 5}}
     before = {"exit": "crash", "log_counts": {"publication_invariant_conflict": 2}, "log_counts_after_commit": None}
     first = {"exit": "done", "log_counts": {"publication_invariant_conflict": 3, "survival_fit": 2},
              "log_counts_after_commit": {"publication_invariant_conflict": 1, "survival_fit": 0}}
     cell = {"from_ref": "v0.24.3"}
-    assert bars.counted(cell, [old, before, first], "publication_invariant_conflict") == 1
-    assert bars.counted(cell, [old, before, first, first], "survival_fit") == 2
+    assert bars.counted(cell, [old, before, first], "publication_invariant_conflict") == 5
+    assert bars.counted(cell, [old, before, first, first], "survival_fit") == 4
     assert bars.counted({}, [old, before, first], "publication_invariant_conflict") == 10
-    # the candidate never published: all its lines count (a never-publishing candidate is not a B3/B8 PASS)
-    assert bars.counted(cell, [old, before, before], "publication_invariant_conflict") == 4
-    # R3 F4 addendum: phases that do not record the post-publication counts are an ERROR, never 0
+    assert bars.pre_publication(cell, [old, before, first], "publication_invariant_conflict") == 4
+    assert bars.pre_publication(cell, [old, before, first], "survival_fit") == 2
+    assert bars.pre_publication(cell, [old, before, before], "publication_invariant_conflict") == 4  # never published
     stale = {"exit": "done", "log_counts": {"publication_invariant_conflict": 3}}
-    with pytest.raises(ValueError, match="log_counts_after_commit"):
-        bars.counted(cell, [old, stale], "publication_invariant_conflict")
-    with pytest.raises(ValueError):
-        bars.counted(cell, [dict(old, exit="done")], "survival_fit")  # no candidate phase at all
+    assert bars.counted(cell, [old, stale], "publication_invariant_conflict") == 3  # counted without the diagnostic
+    assert bars.pre_publication(cell, [old, stale], "publication_invariant_conflict") is None
+    with pytest.raises(ValueError, match="no candidate phase"):
+        bars.counted(cell, [dict(old, exit="done")], "survival_fit")  # no candidate phase at all: never 0
     assert all(c["faults"] == [{"kind": "plugin_switch", "turn": 31}] and c["native_recovery"]
                for c in cells.select("native-on-off/*"))
 
@@ -199,6 +199,25 @@ def test_r3_probe_phase_json_carries_post_publication_counts_so_b3_b8_fail(tmp_p
                       "final_compaction_check": True, **cell}, tmp_path / "cell")
     assert out["verdict"] == "FAIL" and out["failed_bars"] == {
         "B3": {"publication_invariant_conflict": 3}, "B8": {"survival_fit": 5}}, out["failed_bars"]
+    assert out["numbers"]["pre_publication_counts"] == {"publication_invariant_conflict": 0, "survival_fit": 0}
+
+
+def test_r4_native_on_off_pre_publication_conflicts_and_fits_fail_b3_b8(tmp_path):
+    """R4 addendum (d): a candidate phase whose 12 conflicts and 1 fit all precede its first publication
+    fails B3 and B8 (they used to be forgiven: a false green); the split stays visible as a diagnostic."""
+    log = ("reason=publication_invariant_conflict\n" * 12 + "LCM survival fit applied (reason=x)\n"
+           + "LCM compaction #1: ...\n")
+    fields = probe.phase_log_fields(log)
+    assert fields["log_counts_after_commit"] == {"publication_invariant_conflict": 0, "survival_fit": 0}
+    cell = {"from_ref": "v0.23.3", "bars": ["B3", "B4", "B8"]}
+    make(tmp_path, rows=clean_rows(), events=clean_events(), phase={"exit": "plugin_switch"}, bars=cell["bars"])
+    (tmp_path / "cell" / "phase-B.json").write_text(json.dumps(
+        {"phase": "B", "exit": "done", "counters": {"failed": []}, "final_check": {"published": True}, **fields}))
+    out = bars.score({"id": "t", "tool_plan": [], "native_recovery": False, "min_compactions": 2,
+                      "final_compaction_check": True, **cell}, tmp_path / "cell")
+    assert out["verdict"] == "FAIL" and out["failed_bars"] == {
+        "B3": {"publication_invariant_conflict": 12}, "B8": {"survival_fit": 1}}, out["failed_bars"]
+    assert out["numbers"]["pre_publication_counts"] == {"publication_invariant_conflict": 12, "survival_fit": 1}
 
 
 def test_compact_transcript_fields_mean_held_equals_persist(tmp_path):

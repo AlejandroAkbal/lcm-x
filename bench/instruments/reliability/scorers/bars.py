@@ -25,21 +25,36 @@ from . import chronology, host_parity, multiset, summary, tool_calls, tool_group
 ALL_BARS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8")
 
 
+def _candidate_phases(cell: dict, phases: list[dict]) -> list[dict]:
+    """A native-on-off cell's (``from_ref``) candidate phases: every phase after the plugin switch."""
+    post = phases[next((i + 1 for i, p in enumerate(phases) if p.get("exit") == "plugin_switch"), len(phases)):]
+    if not post:
+        raise ValueError("native-on-off cell has no candidate phase after plugin_switch (never scored as 0)")
+    return post
+
+
 def counted(cell: dict, phases: list[dict], key: str) -> int:
-    """A log count over the cell's phases; a native-on-off cell (``from_ref``) counts only the candidate's
-    phases, from its first publication (the older ref's native-ON store may conflict until then), and all
-    of them when the candidate never published. A candidate phase list that does not record the
-    post-publication counts is a harness error (raises), never a count of 0."""
+    """A log count over the cell's phases; a native-on-off cell (``from_ref``) counts EVERY event of the
+    candidate's phases, before its first publication too (the D2 bar: 0 conflicts on the migration path);
+    the older ref's phase is not the candidate's. See :func:`pre_publication` for the diagnostic split."""
     if not cell.get("from_ref"):
         return sum(p.get("log_counts", {}).get(key, 0) for p in phases)
-    post = phases[next((i + 1 for i, p in enumerate(phases) if p.get("exit") == "plugin_switch"), len(phases)):]
+    return sum(p.get("log_counts", {}).get(key, 0) for p in _candidate_phases(cell, phases))
+
+
+def pre_publication(cell: dict, phases: list[dict], key: str) -> int | None:
+    """Diagnostic (native-on-off): the candidate's ``key`` events before its first publication, from the
+    probe's ``log_counts_after_commit``; None when no candidate phase records it."""
+    post = _candidate_phases(cell, phases)
     if not any("log_counts_after_commit" in p for p in post):
-        raise ValueError(f"{key}: no candidate phase records log_counts_after_commit (probe output predates it)")
+        return None
     first = next((i for i, p in enumerate(post) if p.get("log_counts_after_commit") is not None), None)
-    if first is None:  # the candidate never published: nothing before a publication to forgive
-        return sum(p.get("log_counts", {}).get(key, 0) for p in post)
-    return sum((p["log_counts_after_commit"] if i == first else p.get("log_counts", {})).get(key, 0)
-               for i, p in enumerate(post) if i >= first)
+    total = sum(p.get("log_counts", {}).get(key, 0) for p in post)
+    if first is None:
+        return total
+    after = sum((p["log_counts_after_commit"] if i == first else p.get("log_counts", {})).get(key, 0)
+                for i, p in enumerate(post) if i >= first)
+    return total - after
 
 
 def load(cell_dir: Path):
@@ -248,6 +263,9 @@ def score(cell: dict, cell_dir: Path) -> dict:
     numbers["B8"] = {"survival_fit": fits}
     if fits:
         failed["B8"] = numbers["B8"]
+    if cell.get("from_ref"):  # diagnostic only: how many of those came before the candidate first published
+        numbers["pre_publication_counts"] = {key: pre_publication(cell, phases, key)
+                                             for key in ("publication_invariant_conflict", "survival_fit")}
     failed_turns = [t for p in phases for t in p.get("counters", {}).get("failed", [])]
     final = next((p["final_check"] for p in reversed(phases) if "final_check" in p), None)
     numbers["B4"] = {"failed_turns": failed_turns, "final_check": final}
