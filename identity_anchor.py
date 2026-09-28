@@ -42,6 +42,7 @@ _POOL_WINDOW = 256  # store ids either side of a stamp donor searched for a comp
 _MAX_DECOMPOSITIONS = 3
 _DECOMPOSE_BUDGET = 2048  # T3: prefixes visited per decomposition (ingest thread)
 _DECOMPOSE_MAX_PARTS = 64
+_MATCH_WORK_PER_ITEM, _MATCH_WORK_FLOOR = 32, 4096  # matching search budget per row + occurrence + key (see below)
 
 
 def identity_anchor_enabled() -> bool:
@@ -860,55 +861,93 @@ def _match_occurrences(rows, keys_of, occurrences) -> dict:
     under an alternate stamp, is one row) to view ``occurrences`` ``[(occurrence, key)]`` (view order) by any key
     of ``keys_of(row)``, each side once. A row takes its first key with a free occurrence, else an augmenting
     path frees one; each key's rows then take its occurrences in store order <-> view order, so rows with one
-    admissible key get what an in-order walk gave them. Deterministic; O(rows + occurrences + keys) memory."""
+    admissible key get what an in-order walk gave them. Deterministic; O(rows + occurrences + keys) memory.
+    Rows with the same keys are one type and a search walks types, not rows. The searches of one call share a
+    work budget (key and type visits); once it is spent the remaining rows take only a free key of their own, the
+    result stays a valid deterministic matching that may fall short of maximum, and one WARNING (counts) is logged."""
     slots: dict = defaultdict(list)
     for occurrence, key in occurrences:
         slots[key].append(occurrence)
     merged: dict = {}
     for row in rows:
         merged.setdefault(int(row["store_id"]), set()).update(keys_of(row))
-    keys = {sid: sorted((k for k in ks if k in slots), key=repr) for sid, ks in merged.items()}
+    kinds = {sid: tuple(sorted((k for k in ks if k in slots), key=repr)) for sid, ks in merged.items()}
     load: Counter = Counter()
-    at: dict = {}  # store_id -> key
-    movable: dict = defaultdict(dict)  # key -> its assigned rows with >= 2 keys (ordered set); others never move
-    dead: set = set()  # Kuhn: a key a failed search reached never reaches a free slot after later augmentations
-    for sid, own in keys.items():
+    units: dict = defaultdict(Counter)  # type -> key -> its rows on that key
+    members: dict = defaultdict(list)  # type -> its matched rows, store order
+    movable: dict = defaultdict(dict)  # key -> multi-key types with a unit on it (ordered set); nothing else moves
+    dead: set = set()  # never an endpoint or a waypoint again (load never falls; Kuhn's lemma for failed searches)
+    budget, work, spent = _MATCH_WORK_PER_ITEM * (len(kinds) + len(occurrences) + len(slots)) + _MATCH_WORK_FLOOR, 0, False
+    for sid, own in kinds.items():
         found = next((k for k in own if load[k] < len(slots[k])), None)
-        parent = {} if found is not None else {k: (sid, None) for k in own if k not in dead}
-        seen, queue = {sid}, list(parent)
-        for k in queue:  # BFS over keys; the queue grows while it is walked
-            if load[k] < len(slots[k]):
-                found = k
-                break
-            for r in movable[k]:
-                if r not in seen:
-                    seen.add(r)
-                    for nxt in keys[r]:
-                        if nxt not in dead and nxt not in parent:
-                            parent[nxt] = (r, k)
-                            queue.append(nxt)
+        parent: dict = {}
+        if found is None and own and not spent:
+            queue = []
+            for k in own:
+                if k not in dead:
+                    parent[k] = (None, None)
+                    (queue.append if movable[k] else dead.add)(k)  # full with nothing that can leave: dead
+            seen: set = set()
+            for k in queue:  # BFS over keys; the queue grows while it is walked
+                gone = []
+                for kind in movable[k]:
+                    spent = work == budget
+                    if spent:
+                        break
+                    work += 1
+                    others = [other for other in kind if other != k and other not in dead]
+                    if not others:
+                        gone.append(kind)  # stuck on k for good
+                    elif kind not in seen:
+                        seen.add(kind)
+                        for other in others:
+                            if other in parent:
+                                continue
+                            spent = work == budget
+                            if spent:
+                                break
+                            work += 1
+                            parent[other] = (kind, k)
+                            if load[other] < len(slots[other]):
+                                found = other
+                                break
+                            (queue.append if movable[other] else dead.add)(other)
+                    if found is not None or spent:
+                        break
+                for kind in gone:
+                    del movable[k][kind]
+                if found is not None or spent:
+                    break
+            if found is None and not spent:
+                dead.update(parent)
         if found is None:
-            dead.update(parent)
             continue
         load[found] += 1
-        r, previous = parent.get(found, (sid, None))
-        while True:  # re-point each row on the path to its next key
-            if previous is not None:
-                del movable[previous][r]
-            at[r] = found
-            if len(keys[r]) > 1:
-                movable[found][r] = None
-            if previous is None:
-                break
+        kind, previous = parent.get(found, (None, None))
+        while previous is not None:  # one unit of each type on the path moves one key along
+            units[kind][previous] -= 1
+            if not units[kind][previous]:
+                movable[previous].pop(kind, None)
+            units[kind][found] += 1
+            movable[found][kind] = None
             found = previous
-            r, previous = parent[found]
-    taken: Counter = Counter()
-    result = {}
-    for sid in keys:
-        if sid in at:
-            result[sid] = slots[at[sid]][taken[at[sid]]]
-            taken[at[sid]] += 1
-    return result
+            kind, previous = parent[found]
+        members[own].append(sid)
+        units[own][found] += 1
+        if len(own) > 1:
+            movable[found][own] = None
+    order = {sid: i for i, sid in enumerate(kinds)}
+    on: dict = defaultdict(list)
+    for kind, sids in members.items():  # a type's rows spread over its keys by units, keys in order
+        spread = iter(sids)
+        for k in kind:
+            on[k].extend(next(spread) for _ in range(units[kind][k]))
+    result = {sid: occurrence for k, sids in on.items()
+              for sid, occurrence in zip(sorted(sids, key=order.__getitem__), slots[k])}
+    if spent:
+        logger.warning("LCM identity-anchor matching spent its work budget %d: rows=%d occurrences=%d keys=%d matched=%d",
+                       budget, len(kinds), len(occurrences), len(slots), len(result))
+    return {sid: result[sid] for sid in kinds if sid in result}
 
 
 def _composite_relation(group, stamp) -> list:
