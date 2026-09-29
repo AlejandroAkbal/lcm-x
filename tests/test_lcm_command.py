@@ -538,10 +538,10 @@ def test_lcm_doctor_reports_health_checks(engine):
 
 @pytest.mark.parametrize("projected", [2, None, 0], ids=["projected", "unknown", "none-projected"])
 def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engine, projected):
-    """A persisted survival fit (#601, #603): within the 0.24.x line, while a projection may be persisted
-    (projected_count > 0, or unknown on an older record), the current lcm.db is moved aside and the backup
-    taken before the first v0.24.5 install is restored with the plugin; with none projected a plugin-only
-    rollback within 0.24.x is supported. A rollback to v0.23.3 keeps lcm.db and needs native recovery on."""
+    """A persisted survival fit (#601, #603, #620): within the 0.24.x line, with or without a projection
+    (projected_count > 0, 0, or unknown on an older record), the current lcm.db is moved aside and the backup
+    taken before the first v0.24.5 install is restored with the plugin; a plugin-only rollback is never
+    endorsed. A rollback to v0.23.3 keeps lcm.db and needs native recovery on."""
     record = {"count": 2, "last_reason": "publication_invariant_conflict"}
     if projected is not None:
         record["projected_count"] = projected
@@ -560,18 +560,13 @@ def test_lcm_doctor_survival_fit_guidance_names_the_backup_restore_rollback(engi
         assert phrase in line, phrase
     restore = "restore the lcm.db backup taken before the first v0.24.5 install together with the plugin"
     assert not any("remain in the host session" in text for text in (observation, line))
-    if projected == 0:
-        assert "plugin-only rollback within the 0.24.x line is supported for this store" in observation
-        assert "plugin-only rollback within the 0.24.x line is supported for this store" in line
-        assert restore not in line and "lcm.db backup" not in observation
-        assert not any(phrase in observation for phrase in ("stop Hermes", "-wal and -shm", "keep it"))
-    else:
-        assert "stop Hermes, move the current lcm.db (with its -wal and -shm files) aside and keep it" in line
-        assert restore in line and "stay in the file you moved aside" in line
-        for phrase in ("stop Hermes", "-wal and -shm", "keep it"):  # the observation alone is the whole procedure
-            assert phrase in observation, phrase
-        assert "restore the lcm.db backup taken before the first v0.24.5 install with the plugin" in observation
-        assert "rows stored after that backup leave the LCM store" in line
+    assert not any("plugin-only" in text for text in (observation, line))
+    assert "stop Hermes, move the current lcm.db (with its -wal and -shm files) aside and keep it" in line
+    assert restore in line and "stay in the file you moved aside" in line
+    for phrase in ("stop Hermes", "-wal and -shm", "keep it"):  # the observation alone is the whole procedure
+        assert phrase in observation, phrase
+    assert "restore the lcm.db backup taken before the first v0.24.5 install with the plugin" in observation
+    assert "rows stored after that backup leave the LCM store" in line
 
 
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):
