@@ -6,7 +6,7 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
-## v0.24.5 - (unreleased; rc1) (#581, #582, #594: summaries sourced from the store, and a survival fit)
+## v0.24.5 - (unreleased; rc2) (#581, #582, #594: summaries sourced from the store, and a survival fit)
 
 - Fix: a leaf summary can cover stored rows the host no longer shows (rows the host compacted in place while native
   recovery was ON, older duplicate copies); the leaf input is a bounded, contiguous run of the conversation's stored
@@ -17,13 +17,23 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
   #599) (`LCM_SURVIVAL_FIT`, default on; nothing is deleted). (#582, #591)
 - Fix: a compaction the host refused, or another agent's session end on the shared lifecycle row, no longer leaves the
   next compaction conflicting at frontier 0. (#594, #591)
-- Fix: a threshold sweep whose 120 s budget is spent stops instead of raising `TimeoutError` to the host (which some
+- Fix (rc2): a store-complete leaf no longer ends on an assistant tool call when the owned-row scan stops at its
+  2,000-row cap inside a tool group; the leaf ends before the call and the next leaf starts with it, so no summary
+  covers a call without its result. (#600, #604)
+- Fix (rc2): on a cold resume after a survival fit that projected the newest user row, the replies stored right
+  after the source row are recognised as replays instead of being stored again. (#602, #604)
+- Docs (rc2): the operator guide states the supported rollbacks (to v0.23.3 only with native recovery ON, keeping
+  lcm.db; within 0.24.x a plugin reinstall alone only while no survival-fit projection was persisted, else stop
+  Hermes, move the current lcm.db aside and restore the backup taken before the first v0.24.5 install with the
+  plugin), and `/lcm doctor` scopes that advice to fits that projected a row (`projected_count`); rolling back
+  to v0.23.3 also reverts the v0.24.0 config migration. (#601, #603, #604)
+- Fix (rc2): a threshold sweep whose 120 s budget is spent stops instead of raising `TimeoutError` to the host (which some
   Hermes versions treat as a stall and reset the session): the input list comes back unchanged with status `noop` and
   stop reason `time_budget_exhausted`, and no summariser call starts with less than 15 s left. After a stop before the
   first leaf, one WARNING names the step timings and the threshold answer is no for 10 minutes while the request is
   below the survival ceiling (the window minus the survival reserve); overflow recovery is not held. A recovery
   attempt for a request the provider rejected comes back under the compaction threshold even when no leaf could be
-  stored. (#608)
+  stored. (#608, #617)
 
 ## v0.24.4 - 2026-09-28 (#436: message identity anchored on the host timestamp)
 
