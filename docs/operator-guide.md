@@ -129,7 +129,10 @@ checks establish that, and both must hold: `/lcm doctor` reports no
 `survival_fit` entry, and the logs hold no `LCM survival fit applied` line for
 that store. The doctor's entry alone can miss a fit, because the counter write
 behind it can fail; the `LCM survival fit applied` WARNING is logged before
-that write. From v0.24.6 a failed write also logs a WARNING that starts
+that write. The log check counts only when the logs cover the whole time since
+the store's first v0.24.5 start: if log files were rotated away or are missing
+for part of that time, treat the check as not established. From v0.24.6 a
+failed write also logs a WARNING that starts
 `LCM survival-fit counter write failed`; v0.24.5 logs it at DEBUG. If you
 cannot establish both checks, use the backup restore. Once a fit was applied,
 with or without a projection, an older plugin cannot compact the stored rows
