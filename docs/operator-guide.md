@@ -124,11 +124,21 @@ Hermes restarts: `plugins.enabled` back to `hermes-lcm` and `context.engine:
 lcm` (restore the `config.yaml` backup taken before the migration); otherwise
 Hermes reports the engine as not found, runs the built-in compressor, and
 those turns never reach `lcm.db`. Within the 0.24.x line a plugin-only
-rollback is supported only while no survival-fit projection was persisted
-(#601); once `/lcm doctor` reports a `survival_fit` `projected_count` above 0
-(or unknown, on a record from before that field), an older plugin re-stores
-rows it cannot compact. Stop Hermes (every process that uses the profile)
-before you move or restore database files. Move the current `lcm.db` (with its
+rollback is supported only for a store that no survival fit has touched. Two
+checks establish that, and both must hold: `/lcm doctor` reports no
+`survival_fit` entry, and the logs hold no `LCM survival fit applied` line for
+that store. The doctor's entry alone can miss a fit, because the counter write
+behind it can fail; the `LCM survival fit applied` WARNING is logged before
+that write. The log check counts only when the logs cover the whole time since
+the store's first v0.24.5 start: if log files were rotated away or are missing
+for part of that time, treat the check as not established. From v0.24.6 a
+failed write also logs a WARNING that starts
+`LCM survival-fit counter write failed`; v0.24.5 logs it at DEBUG. If you
+cannot establish both checks, use the backup restore. Once a fit was applied,
+with or without a projection, an older plugin cannot compact the stored rows
+that the fit removed from the live context, and its compaction fails on every
+pass (#620, #601). Stop Hermes (every process that uses the
+profile) before you move or restore database files. Move the current `lcm.db` (with its
 `-wal` and `-shm` files) aside and keep it: nothing is deleted, and its rows
 are readable again once a version that can read them is installed (#601). Then
 restore the `lcm.db` backup taken before the first v0.24.5 install (no earlier

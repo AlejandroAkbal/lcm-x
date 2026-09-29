@@ -350,7 +350,8 @@ class SurvivalFitMixin:
         try:
             self._store.update_metadata_json(SURVIVAL_FIT_COUNTER_KEY, counted)
         except Exception:
-            logger.debug("LCM survival-fit counter write failed", exc_info=True)
+            logger.warning("LCM survival-fit counter write failed (projected=%s); /lcm doctor under-counts survival fits "
+                           "for this store", projected, exc_info=True)
         key = str(self._conversation_id or self._session_id or "")
         if key not in self._survival_fit_warned:
             self._survival_fit_warned.add(key)
