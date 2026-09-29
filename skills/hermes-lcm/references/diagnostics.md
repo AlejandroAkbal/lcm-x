@@ -56,15 +56,20 @@ distinct log line:
    a plain probe finished in 10-21 s while the same model through the envelope needed 65-90 s
    for one large leaf chunk.
 3. **Integrity-contract rejection.** A summary is kept only when the reply is exactly one
-   `<lcm-summary nonce="...">…</lcm-summary>` envelope, carries no text outside it, and its
-   final body line matches `Expand for details about: <...>`. Models mirror the contract
-   template and add a nested `<summary>…</summary>`, which made the closing tag the last line
-   and discarded an otherwise perfect summary. Log:
+   `<lcm-summary nonce="...">…</lcm-summary>` envelope and carries no text outside it, and its
+   body is long enough. Two shapes are tolerated, so do not read them as violations: a body may
+   omit the trailing `Expand for details about:` line (an absent hint simply becomes an empty DAG
+   `expand_hint`), and one model-added structural wrapper such as a matching
+   `<summary>…</summary>` pair around the body is stripped. A quoted tag line that is real
+   summary content — including a lone `</lcm-summary>` from a transcript that discussed this
+   contract — is preserved, per #245. Still rejected: a wrong nonce, text outside the envelope,
+   a repeated nonce-bearing opening tag, and a too-short body. Log:
    `LCM summary discarded output that violated the integrity contract (model=...); escalating`.
-   Two consecutive rejections open the route circuit breaker for 300 s
+   The log line reports envelope shape only (start/end, opening count, length) and never the
+   summary text. Two consecutive rejections open the route circuit breaker for 300 s
    (`LCM summary route circuit opened ... cooldown=300s`), after which compaction silently
    no-ops until the cooldown expires.
-3. **Publication coverage.** Only after a summary survives (1) and (2) does the DAG write.
+4. **Publication coverage.** Only after a summary survives (1) and (2) does the DAG write.
    `Compaction publication has no durable source coverage` means the covered message-to-row
    mapping came back empty. `Compaction publication source coverage is not contiguous
    (expected_frontier=N, authoritative=[...])` means `lcm_lifecycle_state.current_frontier_store_id`
@@ -77,9 +82,13 @@ Capture the raw reply instead of guessing: monkeypatch `agent.auxiliary_client.c
 ## Session stuck at "No changes from compression" (the re-ingest loop)
 
 The worst failure mode: `/compress` returns "No changes from compression: N messages" forever, the
-session eventually exceeds the model window, and the LCM store keeps *growing*. Verify with
-`SELECT count(*), count(DISTINCT ...) FROM messages WHERE session_id=?` — 40-60% redundant rows is
-the signature.
+session eventually exceeds the model window, and the LCM store keeps *growing*. A store holding
+far more rows than the session has live messages is the signature; to count it, compare
+`SELECT count(*) FROM messages WHERE session_id=?` against the host's active message count in
+`state.db` (`SELECT count(*) FROM messages WHERE session_id=? AND active=1`). Forty to sixty
+percent surplus rows is typical. Do not try to identify duplicates with `COUNT(DISTINCT ...)`
+unless you spell out the full identity tuple — an under-specified identity expression silently
+counts legitimately repeated messages as duplicates.
 
 Root cause: the ingest-cursor reconciliation drifts from the host's real history, so every attempt
 re-appends the whole conversation and then fails publication.
@@ -123,8 +132,12 @@ Repair (the approach that worked in production):
 - Point the engine at the copy, then set `engine._ingest_cursor = len(messages)` and
   `engine._ingest_cursor_needs_reconcile = False` so the reconstructed history counts as already
   persisted. Without it, ingest appends duplicates that break publication contiguity.
-- Recovering an accidental live write: `DELETE FROM messages WHERE session_id=? AND source='unknown'`.
-  Legitimate rows carry `desktop`/`ios`/`tui`; test-written rows are `unknown`.
+- Recovering an accidental live write: `source` is a coarse hint, not a verdict. Normal rows carry
+  `desktop`/`ios`/`tui`, but a bare `DELETE ... WHERE source='unknown'` can remove real rows if any
+  writer path ever omits the field. Inspect first — list the candidates with
+  `SELECT store_id, role, substr(content,1,80), ingested_at FROM messages WHERE session_id=? AND
+  source='unknown' ORDER BY store_id`, confirm each is a test artifact, then delete by explicit
+  `store_id` (or a bounded `store_id BETWEEN` range you have verified), never by source alone.
 - `escalation.py` and `LCMConfig.from_env()` are read once at engine construction, so a patched
   plugin or changed timeout only applies after the session/TUI restarts; there is no plugin-reload
   slash command (only `reload-mcp`).

@@ -525,6 +525,77 @@ class TestProviderPrefixedAuxiliaryCalls:
 
         assert result == body
 
+    def test_summary_unwrap_preserves_lone_trailing_tag_line(self, monkeypatch):
+        """A bare ``</summary>`` closing line that is real content is preserved.
+
+        The wrapper strip only removes a matched pair. A summary that *quotes* a
+        tag as content -- which happens whenever the transcript discussed the
+        envelope contract itself -- must keep it. Dropping it would silently
+        discard summary text, which is the loss mode #245 fixed for the
+        envelope tags themselves.
+        """
+        from hermes_lcm.escalation import _build_l1_prompt, _call_llm_for_summary
+
+        body = (
+            "- Decision: the transcript discussed the envelope, quoting "
+            "`</lcm-summary>` and `<summary>` as content.\n"
+            "- Current state: those quoted tags are summary content here.\n"
+            "Expand for details about: the summary envelope contract"
+        )
+        # Trailing lone `</summary>` with no matching leading opening tag.
+        quoted = f"{body}\n</summary>"
+
+        def fake_call_llm(**kwargs):
+            system_content = kwargs["messages"][0]["content"]
+            match = re.search(r'<lcm-summary nonce="([0-9a-f]{32})">', system_content)
+            assert match is not None
+            nonce = match.group(1)
+            return self._fake_response(
+                f'<lcm-summary nonce="{nonce}">\n{quoted}\n</lcm-summary>'
+            )
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = _call_llm_for_summary(
+            _build_l1_prompt("transcript discussing the envelope " * 30, token_budget=80, depth=0),
+            160,
+        )
+
+        assert result == quoted
+
+    def test_summary_unwrap_preserves_mismatched_wrapper_pair(self, monkeypatch):
+        """An opening tag and a closing tag for *different* elements are content.
+
+        Only a same-element pair is treated as a model-added wrapper; mismatched
+        names are left untouched so no summary text is dropped on a guess.
+        """
+        from hermes_lcm.escalation import _build_l1_prompt, _call_llm_for_summary
+
+        body = (
+            "- Decision: the summary opens one element and closes a different one.\n"
+            "- Current state: both tag lines are reported content, not a wrapper.\n"
+            "Expand for details about: the mismatched tag pair"
+        )
+        mismatched = f"<notes>\n{body}\n</summary>"
+
+        def fake_call_llm(**kwargs):
+            system_content = kwargs["messages"][0]["content"]
+            match = re.search(r'<lcm-summary nonce="([0-9a-f]{32})">', system_content)
+            assert match is not None
+            nonce = match.group(1)
+            return self._fake_response(
+                f'<lcm-summary nonce="{nonce}">\n{mismatched}\n</lcm-summary>'
+            )
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = _call_llm_for_summary(
+            _build_l1_prompt("ordinary historical transcript " * 30, token_budget=80, depth=0),
+            160,
+        )
+
+        assert result == mismatched
+
     @pytest.mark.parametrize("variant", ["wrong_nonce", "outside_text", "duplicate_opening"])
     def test_summary_call_rejects_malformed_integrity_contract(self, monkeypatch, variant):
         from hermes_lcm.escalation import _build_l1_prompt, _call_llm_for_summary

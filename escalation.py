@@ -231,7 +231,8 @@ _SUMMARY_CONTENT_SEPARATOR = "\n\nCONTENT:\n"
 _SUMMARY_EXPAND_HINT_RE = re.compile(r"(?i)^Expand for details about:\s+\S.*$")
 
 # A line that is nothing but one structural tag, e.g. ``<summary>`` or ``</summary>``.
-_STRUCTURAL_TAG_LINE_RE = re.compile(r"^</?[A-Za-z][\w:.-]*(?:\s[^>]*)?>$")
+# Group 1 captures the element name so a pair can be matched.
+_STRUCTURAL_TAG_LINE_RE = re.compile(r"^</?([A-Za-z][\w:.-]*)(?:\s[^>]*)?>$")
 
 
 def _strip_structural_wrapper(body: str) -> str:
@@ -239,20 +240,34 @@ def _strip_structural_wrapper(body: str) -> str:
 
     The contract tells the model what the envelope looks like, and models
     routinely mirror that sketch by wrapping the body in a literal element such
-    as ``<summary>``. The wrapper carries no summary content, but its closing
-    tag became the body's last line, which failed the mandatory trailing
-    ``Expand for details about:`` check and discarded the whole summary.
+    as ``<summary>``. The wrapper carries no summary content, so it is removed.
+
+    Removal is deliberately conservative: the body's first and last non-blank
+    lines must be an opening and a closing tag naming the *same* element, with
+    at least one line between them. A lone bare tag line is preserved, because a
+    summary may legitimately quote a tag as content -- for example when the
+    transcript discussed this very contract, which is exactly the case #245
+    covers -- and dropping it would silently discard real summary text. An
+    unpaired opening tag is likewise left in place rather than guessed at.
     """
     lines = body.splitlines()
-    # Trailing bare structural closing tags carry no summary content.
-    while len(lines) > 1 and lines[-1].strip().startswith("</") \
-            and _STRUCTURAL_TAG_LINE_RE.fullmatch(lines[-1].strip()):
-        lines.pop()
-    # Then the matching leading opening tag, if the model emitted one.
-    if len(lines) > 1 and not lines[0].strip().startswith("</") \
-            and _STRUCTURAL_TAG_LINE_RE.fullmatch(lines[0].strip()):
-        lines.pop(0)
-    return "\n".join(lines).strip()
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    # opening + content + closing is the shortest strippable shape.
+    if end - start < 3:
+        return body
+    first = _STRUCTURAL_TAG_LINE_RE.fullmatch(lines[start].strip())
+    last = _STRUCTURAL_TAG_LINE_RE.fullmatch(lines[end - 1].strip())
+    if not first or not last:
+        return body
+    if lines[start].strip().startswith("</") or not lines[end - 1].strip().startswith("</"):
+        return body
+    if first.group(1) != last.group(1):
+        return body
+    return "\n".join(lines[start + 1 : end - 1]).strip()
 
 
 def _summary_contract_messages(prompt: str) -> tuple[list[dict[str, str]], str]:
@@ -362,17 +377,19 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         validated = _unwrap_summary_contract(sanitized, contract_nonce, max_tokens)
         if sanitized and contract_nonce and not validated:
             opening = f'<lcm-summary nonce="{contract_nonce}">'
+            # Shape-only diagnostics: envelope position, tag counts, and length.
+            # Never log the summary text itself -- it is private conversation
+            # content, and a rejected reply is still private conversation
+            # content.
             logger.warning(
                 "LCM summary discarded output that violated the integrity contract "
                 "(model=%s); escalating | starts_with_envelope=%s ends_with_envelope=%s "
-                "opening_count=%d len=%d head=%r tail=%r",
+                "opening_count=%d len=%d",
                 model or "<default>",
                 sanitized.lstrip().startswith(opening),
                 sanitized.rstrip().endswith("</lcm-summary>"),
                 sanitized.count(opening),
                 len(sanitized),
-                sanitized.strip()[:120],
-                sanitized.strip()[-120:],
             )
         return validated
     except Exception as e:
