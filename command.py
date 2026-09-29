@@ -1704,13 +1704,19 @@ def _doctor_text(engine) -> str:
     except Exception:
         survival_fit = None
     survival_fit = survival_fit if isinstance(survival_fit, dict) else {}
-    if int(survival_fit.get("count") or 0):
+    try:
+        fit_count = int(survival_fit.get("count") or 0)
+    except (TypeError, ValueError):  # a damaged record: a fit with an unknown count
+        fit_count = None
+    if fit_count != 0:
         projected = survival_fit.get("projected_count")  # absent on a record from before the key: unknown
         within = ("rollback within the 0.24.x line: an older plugin cannot compact stored rows that a survival fit "
                   "removed from the live context; stop Hermes, move the current lcm.db (with its -wal and -shm files) "
                   "aside and keep it, then restore the lcm.db backup taken before the first v0.24.5 install with the "
                   "plugin")
-        observations.append(f"survival_fit: applied {int(survival_fit['count'])} time(s); last reason "
+        applied = ("applied an unknown number of times (the stored count is unreadable)" if fit_count is None
+                   else f"applied {fit_count} time(s)")
+        observations.append(f"survival_fit: {applied}; last reason "
                             f"{survival_fit.get('last_reason') or '(unknown)'}; projected_count "
                             f"{'unknown' if projected is None else projected}; {within}; a rollback to v0.23.3 "
                             "keeps lcm.db and needs native recovery ON (see triage_guidance)")
@@ -1771,7 +1777,7 @@ def _doctor_text(engine) -> str:
         f"externalized_payload_files_unreferenced: {externalized_integrity['externalized_payload_files_unreferenced']}",
         f"missing_externalized_payload_refs: {externalized_integrity['missing_externalized_payload_refs']}",
         f"unreferenced_externalized_payload_files: {externalized_integrity['unreferenced_externalized_payload_files']}",
-        f"survival_fit_count: {int(survival_fit.get('count') or 0)}",
+        f"survival_fit_count: {'unknown' if fit_count is None else fit_count}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")

@@ -154,3 +154,32 @@ def test_a_failed_counter_write_logs_one_warning_and_returns_the_fitted_list(tmp
         assert engine._store.read_metadata_json(SURVIVAL_FIT_COUNTER_KEY) is None
     finally:
         engine.shutdown()
+
+
+def _doctor_with_record(tmp_path, record) -> str:
+    engine = _engine(tmp_path)
+    try:
+        engine._store.write_metadata_json([SURVIVAL_FIT_COUNTER_KEY], json.dumps(record, sort_keys=True))
+        return handle_lcm_command("doctor", engine)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("count", ["bad", [1], {"a": 1}], ids=["text", "list", "dict"])
+def test_an_unreadable_stored_count_is_a_fit_with_an_unknown_count(tmp_path, count):
+    """A damaged record whose count is not a number: the doctor does not raise and gives the backup restore."""
+    observation, guidance = _survival_lines(_doctor_with_record(tmp_path, {"count": count, "last_reason": "noop"}))
+    assert "unknown number of times" in observation and RESTORE in observation
+    assert "plugin-only" not in observation and "plugin-only" not in guidance
+
+
+@pytest.mark.parametrize("record", [{"count": []}, {"count": ""}, {"count": None}, {}, [1, 2]],
+                         ids=["empty-list", "empty-text", "none", "no-count", "not-a-dict"])
+def test_an_empty_or_missing_stored_count_prints_no_observation_and_no_check(tmp_path, record):
+    lines = [line.strip() for line in _doctor_with_record(tmp_path, record).splitlines()]
+    assert not any(line.startswith("- survival_fit") or "survival_fit: applied" in line for line in lines)
+
+
+def test_a_numeric_text_count_is_read_as_its_number(tmp_path):
+    observation, _ = _survival_lines(_doctor_with_record(tmp_path, {"count": "3", "last_reason": "noop"}))
+    assert "survival_fit: applied 3 time(s); last reason noop" in observation
