@@ -455,7 +455,77 @@ class TestProviderPrefixedAuxiliaryCalls:
 
         assert result == body
 
-    @pytest.mark.parametrize("variant", ["wrong_nonce", "outside_text", "missing_footer"])
+    def test_summary_unwrap_strips_nested_structural_wrapper(self, monkeypatch):
+        """A model-added ``<summary>...</summary>`` wrapper must not discard the body.
+
+        Models mirror the envelope sketch in the contract prompt by wrapping the
+        body in a literal element. Its closing tag then becomes the body's last
+        line, which previously failed the mandatory trailing ``Expand for
+        details about:`` check and discarded an otherwise valid summary -- two
+        rejections in a row opened the route circuit breaker and stalled
+        compaction.
+        """
+        from hermes_lcm.escalation import _build_l1_prompt, _call_llm_for_summary
+
+        body = (
+            "- Decision: retain the migration approval gate and owner sign-off.\n"
+            "- Current state: raw history remains available for exact recovery.\n"
+            "Expand for details about: migration gate and owner sign-off"
+        )
+
+        def fake_call_llm(**kwargs):
+            system_content = kwargs["messages"][0]["content"]
+            match = re.search(r'<lcm-summary nonce="([0-9a-f]{32})">', system_content)
+            assert match is not None
+            nonce = match.group(1)
+            return self._fake_response(
+                f'<lcm-summary nonce="{nonce}">\n<summary>\n{body}\n</summary>\n</lcm-summary>'
+            )
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = _call_llm_for_summary(
+            _build_l1_prompt("ordinary historical transcript " * 30, token_budget=80, depth=0),
+            160,
+        )
+
+        assert result == body
+
+    def test_summary_unwrap_accepts_missing_expand_hint_line(self, monkeypatch):
+        """A body without the trailing ``Expand for details about:`` line is valid.
+
+        The hint is a recall convenience, not an integrity property: the
+        nonce-bearing envelope and the minimum-body check bind the reply. Models
+        routinely omit the line, and requiring it discarded otherwise-valid
+        summaries and stalled compaction entirely. An absent hint degrades to an
+        empty DAG ``expand_hint``, which downstream already tolerates.
+        """
+        from hermes_lcm.escalation import _build_l1_prompt, _call_llm_for_summary
+
+        body = (
+            "- Decision: retain the migration approval gate and owner sign-off.\n"
+            "- Current state: raw history remains available for exact recovery."
+        )
+
+        def fake_call_llm(**kwargs):
+            system_content = kwargs["messages"][0]["content"]
+            match = re.search(r'<lcm-summary nonce="([0-9a-f]{32})">', system_content)
+            assert match is not None
+            nonce = match.group(1)
+            return self._fake_response(
+                f'<lcm-summary nonce="{nonce}">\n{body}\n</lcm-summary>'
+            )
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        result = _call_llm_for_summary(
+            _build_l1_prompt("ordinary historical transcript " * 30, token_budget=80, depth=0),
+            160,
+        )
+
+        assert result == body
+
+    @pytest.mark.parametrize("variant", ["wrong_nonce", "outside_text", "duplicate_opening"])
     def test_summary_call_rejects_malformed_integrity_contract(self, monkeypatch, variant):
         from hermes_lcm.escalation import _build_l1_prompt, _call_llm_for_summary
 
@@ -478,12 +548,15 @@ class TestProviderPrefixedAuxiliaryCalls:
                     f'preamble\n<lcm-summary nonce="{nonce}">\n'
                     f'{valid_body}\n</lcm-summary>'
                 )
-            else:
+            elif variant == "duplicate_opening":
                 content = (
                     f'<lcm-summary nonce="{nonce}">\n'
-                    "A long but footer-free body preserving decisions, blockers, files, and state.\n"
+                    f'<lcm-summary nonce="{nonce}">\n'
+                    f"{valid_body}\n"
                     "</lcm-summary>"
                 )
+            else:
+                raise AssertionError(f"unexpected variant: {variant}")
             return self._fake_response(content)
 
         self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
