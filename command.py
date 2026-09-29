@@ -1706,7 +1706,7 @@ def _doctor_text(engine) -> str:
     survival_fit = survival_fit if isinstance(survival_fit, dict) else {}
     try:
         fit_count = int(survival_fit.get("count") or 0)
-    except (TypeError, ValueError):  # a damaged record: a fit with an unknown count
+    except (TypeError, ValueError, OverflowError):  # a damaged record: a fit with an unknown count
         fit_count = None
     if fit_count != 0:
         projected = survival_fit.get("projected_count")  # absent on a record from before the key: unknown

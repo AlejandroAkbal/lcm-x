@@ -173,6 +173,20 @@ def test_an_unreadable_stored_count_is_a_fit_with_an_unknown_count(tmp_path, cou
     assert "plugin-only" not in observation and "plugin-only" not in guidance
 
 
+def test_a_stored_count_too_large_for_a_number_is_a_fit_with_an_unknown_count(tmp_path):
+    """The stored JSON number 1e400 decodes to infinity: the doctor does not raise and prints the count as unknown."""
+    engine = _engine(tmp_path)
+    try:
+        engine._store.write_metadata_json([SURVIVAL_FIT_COUNTER_KEY], '{"count": 1e400, "last_reason": "noop"}')
+        text = handle_lcm_command("doctor", engine)
+    finally:
+        engine.shutdown()
+    observation, guidance = _survival_lines(text)
+    assert "unknown number of times" in observation and RESTORE in observation
+    assert "plugin-only" not in observation and "plugin-only" not in guidance
+    assert "survival_fit_count: unknown" in text
+
+
 @pytest.mark.parametrize("record", [{"count": []}, {"count": ""}, {"count": None}, {}, [1, 2]],
                          ids=["empty-list", "empty-text", "none", "no-count", "not-a-dict"])
 def test_an_empty_or_missing_stored_count_prints_no_observation_and_no_check(tmp_path, record):
