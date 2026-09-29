@@ -6,6 +6,13 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
+- Fix: `/lcm doctor` and the operator guide no longer call a plugin-only rollback within 0.24.x supported after a
+  survival fit that dropped turns without a projection. Every store with a survival fit gets the backup restore. (#620)
+- Fix: a failed survival-fit counter write is logged at WARNING instead of DEBUG. (#618)
+- Docs: the exception of the #600 fix counts rows that an earlier summary already covers toward the 8,000 owned rows.
+  (#621)
+- Tests: the #608 tests no longer depend on which token counter is importable. (#615)
+
 ## v0.24.5 - (unreleased; rc2) (#581, #582, #594: summaries sourced from the store, and a survival fit)
 
 - Fix: a leaf summary can cover stored rows the host no longer shows (rows the host compacted in place while native
