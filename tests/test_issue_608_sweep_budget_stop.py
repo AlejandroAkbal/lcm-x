@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import time
 
 import pytest
 
 import hermes_lcm.compaction as lcm_compaction
 import hermes_lcm.engine as lcm_engine
+import hermes_lcm.survival_fit as survival_fit
+import hermes_lcm.tokens as tokens
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -22,6 +25,15 @@ PAD = " alpha beta gamma delta" * 30
 RETRY_LINE = "retrying with smaller oldest chunk"
 BUDGET_LINE = "spent its time budget before the first leaf"
 CONDENSATION_LINE = "condensation stopped"
+
+
+@pytest.fixture(autouse=True)
+def _pin_lcm_char_counter(monkeypatch):
+    """The token literals in this file were computed with LCM's character estimate and no host estimator;
+    pin that counter so a host tree or tiktoken on the path does not change them (#615)."""
+    monkeypatch.setattr(survival_fit, "_host_estimate", lambda messages: None)
+    monkeypatch.setattr(tokens, "count_tokens", lambda text: 0 if not text else (
+        tokens._fallback_token_estimate(text) if isinstance(text, str) else len(text) // 4 + 1))
 
 
 class _Clock:
@@ -791,5 +803,50 @@ def test_the_next_ingest_after_an_over_ceiling_recovery_fit_stores_only_the_new_
         for row in before:
             added.remove(row)
         assert sorted(added) == sorted((m["role"], m["content"]) for m in new)
+    finally:
+        engine.shutdown()
+
+
+# -- 11. the recovery budget rule holds for any request estimator (#615) ------------------------------------------
+
+def _dict_text_estimate(messages) -> int:
+    """A counter unlike LCM's: every message's whole dict as text, (len + 3) // 4."""
+    return sum((len(str(m)) + 3) // 4 for m in messages)
+
+
+def _real_host_estimate(messages) -> int:
+    from agent.model_metadata import estimate_messages_tokens_rough
+    return int(estimate_messages_tokens_rough(messages))
+
+
+@pytest.mark.parametrize("estimate", [_dict_text_estimate, _real_host_estimate], ids=["dict-text", "real-host"])
+def test_the_recovery_budget_rule_does_not_depend_on_the_counter(tmp_path, summaries, clock, monkeypatch, caplog,
+                                                                  estimate):
+    """One marked recovery call (bypass_cooldown=True): the logged budget is min(int(min(window, R) * (1 -
+    reserve)), int(threshold * 0.95)) minus the overhead R - estimate(view), and the returned list measured by
+    the same estimator is inside it. Every number is computed here from that estimator."""
+    if estimate is _real_host_estimate:
+        pytest.importorskip("agent.model_metadata")
+    monkeypatch.setattr(survival_fit, "_host_estimate", lambda messages: int(estimate(messages)))
+    engine, view = _rejected_state(tmp_path, monkeypatch, clock)
+    request = estimate(view) + HOST_TOKENS
+    if not 0 < THRESHOLD <= request:
+        def no_leaf(messages, **kwargs):
+            engine._last_compression_status = "noop"
+            return messages
+
+        monkeypatch.setattr(engine, "_compress_impl", no_leaf)
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm"):
+            result = engine.compress(view, current_tokens=request, bypass_cooldown=True)
+        window = min(engine.context_length, request)
+        reserve = engine._config.survival_reserve
+        overhead = min(window // 2, max(0, request - estimate(view)))
+        expected = min(int(window * (1 - reserve)), int(engine.threshold_tokens * 0.95)) - overhead
+        logged = [int(m.group(1)) for r in caplog.records
+                  if (m := re.search(r"LCM survival fit applied .*budget=(\d+)\)$", r.getMessage()))]
+        assert logged == [expected]
+        assert estimate(result) <= expected
+        assert engine._last_survival_fit["reason"].startswith("recovery_attempt:")
     finally:
         engine.shutdown()
